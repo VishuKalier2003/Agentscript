@@ -18,6 +18,7 @@ pub(crate) fn run() -> Result<(), String> {
     let rest: Vec<String> = arguments.collect();
     match command.as_str() {
         "help" => help(),
+        "--version" | "-V" | "version" => version(),
         "init" => init::run(),
         "checkpoint" => checkpoint::run(&rest),
         "protect" => protect::run(&rest),
@@ -31,6 +32,11 @@ pub(crate) fn run() -> Result<(), String> {
         "status" => status::run(),
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
     }
+}
+
+fn version() -> Result<(), String> {
+    println!("crane {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
 }
 
 fn help() -> Result<(), String> {

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Crane: a tiny contract language and verifier for AI-assisted code changes."
 license = "Apache-2.0"
+repository = "https://github.com/VishuKalier2003/Agentscript"
+homepage = "https://github.com/VishuKalier2003/Agentscript"
 
 [dependencies]
 tree-sitter = "0.20"

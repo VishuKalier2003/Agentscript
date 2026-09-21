@@ -93,6 +93,40 @@ For a compact LLM-facing context:
 crane context
 ```
 
+## Installation
+
+Prebuilt binaries for Linux, macOS (Intel and Apple Silicon), and Windows are
+published on the [GitHub Releases page](https://github.com/VishuKalier2003/Agentscript/releases).
+Download the archive for your platform, extract it, and put the `crane` binary
+(`crane.exe` on Windows) somewhere on your `PATH`.
+
+Verify the installation:
+
+```bash
+crane --version
+```
+
+Rust users can install directly from the repository:
+
+```bash
+cargo install --git https://github.com/VishuKalier2003/Agentscript.git --bin crane
+```
+
+## Publishing a release
+
+Create and push a semantic-version tag after merging the desired changes:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The [release workflow](./.github/workflows/release.yml) builds archives for
+Linux, macOS Intel, macOS Apple Silicon, and Windows, publishes SHA-256
+checksums, and creates a GitHub Release with generated release notes. The
+workflow can also be started manually from GitHub Actions by supplying an
+existing tag.
+
 ## GitHub Actions CI
 
 Crane includes a GitHub Actions workflow at
