@@ -2,7 +2,7 @@ use std::fs;
 
 use crate::model::{Rule, Violation};
 use crate::policy::parse_file;
-use crate::repository::{ensure_initialized, load_checkpoint, root};
+use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root};
 use crate::resolver::{resolve_git, resolve_worktree};
 use crate::util::{escape_json, io_error};
 
@@ -24,6 +24,7 @@ pub(crate) fn run(json: bool) -> Result<(), String> {
             match rule {
                 Rule::PreserveFunction { target } => {
                     let checkpoint = load_checkpoint(&policy.checkpoint)?;
+                    ensure_commit(&checkpoint.commit)?;
                     let baseline = resolve_git(&checkpoint.commit, &target)?.ok_or_else(|| {
                         format!("cannot locate {target} in checkpoint {}", checkpoint.name)
                     })?;

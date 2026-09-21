@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::repository::{ensure_initialized, load_checkpoint, root};
+use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root};
 use crate::resolver::{resolve_git, resolve_worktree};
 use crate::util::{io_error, option, sanitize, validate_function_target};
 
@@ -12,6 +12,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| format!("preserve_{}", sanitize(&target).to_lowercase()));
     let checkpoint_name = option(args, "--checkpoint").unwrap_or_else(|| "baseline".into());
     let checkpoint = load_checkpoint(&checkpoint_name)?;
+    ensure_commit(&checkpoint.commit)?;
     let current = resolve_worktree(&target)?
         .ok_or_else(|| format!("could not resolve '{target}' in current working tree"))?;
     let baseline = resolve_git(&checkpoint.commit, &target)?.ok_or_else(|| {
@@ -32,16 +33,6 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         format!(
             "policy {policy_name} {{\n    checkpoint {checkpoint_name}\n    preserve --function {target}\n}}\n"
         ),
-    )
-    .map_err(io_error)?;
-    let snapshot = root
-        .join("checkpoints")
-        .join(&checkpoint_name)
-        .join("targets");
-    fs::create_dir_all(&snapshot).map_err(io_error)?;
-    fs::write(
-        snapshot.join(format!("{}.txt", sanitize(&target))),
-        current.snippet,
     )
     .map_err(io_error)?;
     println!("Created policy '{policy_name}' for {target}");

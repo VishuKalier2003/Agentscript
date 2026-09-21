@@ -5,7 +5,7 @@ use std::path::Path;
 use tree_sitter::{Node, Parser};
 
 use crate::model::SourceTarget;
-use crate::repository::git;
+use crate::repository::{ensure_commit, git};
 use crate::util::io_error;
 
 pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
@@ -28,10 +28,23 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
     let mut parser = Parser::new();
     parser.set_language(language).ok()?;
     let tree = parser.parse(source, None)?;
-    let wanted = target.rsplit('.').next()?;
+    let wanted = target
+        .rsplit("::")
+        .next()
+        .unwrap_or(target)
+        .rsplit('.')
+        .next()?;
+    let separator = if target.contains("::") { "::" } else { "." };
     let bytes = source.as_bytes();
 
-    fn visit(node: Node, wanted: &str, target: &str, bytes: &[u8], output: &mut Option<String>) {
+    fn visit(
+        node: Node,
+        wanted: &str,
+        target: &str,
+        separator: &str,
+        bytes: &[u8],
+        output: &mut Option<String>,
+    ) {
         if output.is_some() {
             return;
         }
@@ -62,7 +75,7 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
                     }
                     qualified.reverse();
                     qualified.push(wanted.into());
-                    if target.split('.').count() == 1 || qualified.join(".") == target {
+                    if target.split(separator).count() == 1 || qualified.join(separator) == target {
                         *output = Some(
                             String::from_utf8_lossy(&bytes[node.byte_range()])
                                 .replace("\r\n", "\n")
@@ -75,12 +88,19 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            visit(child, wanted, target, bytes, output);
+            visit(child, wanted, target, separator, bytes, output);
         }
     }
 
     let mut output = None;
-    visit(tree.root_node(), wanted, target, bytes, &mut output);
+    visit(
+        tree.root_node(),
+        wanted,
+        target,
+        separator,
+        bytes,
+        &mut output,
+    );
     output
 }
 
@@ -113,6 +133,7 @@ pub(crate) fn resolve_worktree(target: &str) -> Result<Option<SourceTarget>, Str
 }
 
 pub(crate) fn resolve_git(commit: &str, target: &str) -> Result<Option<SourceTarget>, String> {
+    ensure_commit(commit)?;
     let files = git(&["ls-tree", "-r", "--name-only", commit])?;
     for path in files.lines().filter(|path| supported(path)) {
         let source = git(&["show", &format!("{commit}:{path}")])?;

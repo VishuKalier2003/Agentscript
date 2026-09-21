@@ -72,6 +72,19 @@ pub(crate) fn load_checkpoint(name: &str) -> Result<Checkpoint, String> {
     })
 }
 
+pub(crate) fn ensure_commit(commit: &str) -> Result<(), String> {
+    if commit.trim().is_empty() {
+        return Err("checkpoint has an empty Git commit reference".into());
+    }
+    let reference = format!("{commit}^{{commit}}");
+    git(&["rev-parse", "--verify", &reference]).map_err(|_| {
+        format!(
+            "checkpoint commit '{commit}' is missing or invalid; restore the commit locally before running Crane"
+        )
+    })?;
+    Ok(())
+}
+
 pub(crate) fn checkpoint_json(checkpoint: &Checkpoint) -> String {
     format!(
         "{{\n  \"name\":\"{}\",\n  \"commit\":\"{}\",\n  \"branch\":\"{}\",\n  \"created_at_unix\":{}\n}}\n",

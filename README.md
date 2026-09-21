@@ -147,6 +147,15 @@ The MVP includes tree-sitter grammars for Java (`.java`), JavaScript/JSX
 extensions are ignored during source target resolution and produce an explicit
 resolution error when they are the only match.
 
+Rust targets may use Rust's qualified `Type::method` spelling. Rust source is
+always parsed by the Rust tree-sitter grammar during resolution; only `.crane`
+files are parsed as Crane policies.
+
+Checkpoints are metadata-only JSON files containing a Git commit reference.
+Crane reads baseline source with `git show` and current source from the
+worktree; it never creates copied target snapshots. Missing commits produce an
+error and are not fetched automatically.
+
 ## Current limitations
 
 This MVP intentionally keeps the implementation narrow:

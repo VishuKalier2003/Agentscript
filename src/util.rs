@@ -14,7 +14,8 @@ pub(crate) fn validate_identifier(value: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_function_target(value: &str) -> Result<(), String> {
-    let parts: Vec<_> = value.split('.').collect();
+    let normalized = value.replace("::", ".");
+    let parts: Vec<_> = normalized.split('.').collect();
     if parts.is_empty()
         || parts.iter().any(|part| {
             part.is_empty()
