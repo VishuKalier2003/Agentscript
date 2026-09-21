@@ -40,9 +40,11 @@ impl Gateway {
     fn call(&self) { println!("payment"); }
 }
 "#;
-    let extracted =
-        crate::resolver::extract_function(rust, "payment.rs", "Gateway::call").expect("method");
-    assert!(extracted.contains("fn call"));
+    let extracted = crate::resolver::extract_functions(rust, "payment.rs", "Gateway::call")
+        .expect("method")
+        .pop()
+        .expect("one method");
+    assert!(extracted.contains("fn\0call"));
 }
 
 #[test]
@@ -50,4 +52,46 @@ fn reports_missing_checkpoint_commit_without_fetching() {
     let error = crate::repository::ensure_commit("0000000000000000000000000000000000000000")
         .expect_err("missing commit");
     assert!(error.contains("missing or invalid"));
+}
+
+#[test]
+fn resolves_supported_source_languages() {
+    let cases = [
+        (
+            "class Payment { void charge() { return; } }",
+            "Payment.java",
+            "Payment.charge",
+        ),
+        (
+            "class Payment { charge() { return 1; } }",
+            "payment.js",
+            "Payment.charge",
+        ),
+        (
+            "class PaymentService:\n    def charge(self):\n        return 1\n",
+            "payment.py",
+            "PaymentService.charge",
+        ),
+        (
+            "struct Payment;\nimpl Payment { fn charge(&self) {} }",
+            "payment.rs",
+            "Payment::charge",
+        ),
+    ];
+    for (source, path, target) in cases {
+        let result = crate::resolver::extract_functions(source, path, target)
+            .expect("supported source should parse");
+        assert_eq!(result.len(), 1, "{path}");
+    }
+}
+
+#[test]
+fn reports_parser_failure() {
+    let error = crate::resolver::extract_functions(
+        "class Payment { void charge( { return; } }",
+        "Payment.java",
+        "Payment.charge",
+    )
+    .expect_err("malformed source must fail");
+    assert!(error.contains("parser error"));
 }

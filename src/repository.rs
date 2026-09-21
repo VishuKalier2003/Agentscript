@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::model::Checkpoint;
@@ -39,8 +39,26 @@ pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn ensure_initialized() -> Result<(), String> {
-    let _ = root()?;
-    ensure_repo()
+    let crane_root = root()?;
+    ensure_repo().and_then(|()| validate_config(&crane_root))
+}
+
+fn validate_config(crane_root: &Path) -> Result<(), String> {
+    let path = crane_root.join("config.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&path).map_err(io_error)?;
+    if content.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#')
+    }) {
+        return Err(format!(
+            "invalid Crane configuration at {}; v0.1 config accepts only blank lines and comments",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_repo() -> Result<(), String> {

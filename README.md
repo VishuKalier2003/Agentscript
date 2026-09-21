@@ -15,6 +15,7 @@ It also implements the Git-backed workflow discussed during design:
 - `crane check`
 - `crane test-all`
 - `crane context`
+- `crane check --agent`
 - `crane status`
 
 ## Core idea
@@ -32,54 +33,56 @@ policy payment_gateway {
 
 The verifier compares the protected function in the checkpoint commit with the current working tree. The model is never the authority that decides whether the contract passed.
 
+## Trust model
+
+The developer creates a reviewed Git commit and explicitly records it as a
+checkpoint. Crane then independently compares protected source nodes in that
+commit and the current worktree. An agent may edit files, but it cannot create
+or move a checkpoint through `crane check`, and it cannot turn an uncertain
+resolution into a pass.
+
+`preserve` guarantees equality of the protected function's canonical parsed
+token stream: formatting and comments may change, while code tokens,
+identifiers, literals, operators, modifiers, annotations, and structure remain
+protected. It does not guarantee semantic equivalence, runtime behavior,
+security, protection of unrelated code, or protection against changes outside
+the resolved function.
+
 ## Quick start
 
-Build:
+Install a release binary as described below, then run Crane in an existing Git
+repository. This complete example takes less than five minutes:
 
 ```bash
-cargo build --release
-```
-
-Create a test repository:
-
-```bash
-mkdir demo
-cd demo
-git init
-git config user.email "crane@example.com"
-git config user.name "Crane Demo"
-```
-
-Create `GatewayService.java`:
-
-```java
-class GatewayService {
-    public void call() {
-        System.out.println("payment");
-    }
-}
-```
-
-Then:
-
-```bash
-git add GatewayService.java
-git commit -m "trusted baseline"
-
 crane init
+git add .
+git commit -m "trusted baseline"
 crane checkpoint --name baseline
-crane protect --function GatewayService.call --policy payment_gateway
+crane protect --function PaymentService.charge --policy payment_service
 crane check
 ```
 
-Expected:
+`crane protect` creates the preserve policy under `.crane/policies/`; commit
+`.crane/config.toml` and `.crane/policies/` so repository policy is reviewable
+and reproducible. Checkpoint metadata under `.crane/checkpoints/` is local
+metadata and is ignored by default; create it only from a trusted Git commit
+and never accept an agent-generated checkpoint without review.
+The v0.1 configuration file is reserved for future use and accepts only blank
+lines and comments; other content is rejected as invalid configuration.
 
-```text
-PASS payment_gateway: preserve --function GatewayService.call
-Crane check: PASS
+After changing the protected function, run:
+
+```bash
+crane check
 ```
 
-Now modify the function and run `crane check` again. It will report the policy violation.
+Crane reports a failure. Restore the function to its checkpoint version and
+run `crane check` again to see `Crane check: PASS`. Checkpoints are metadata
+that point to an existing Git commit; Crane never trusts an agent-generated
+checkpoint automatically.
+
+For a fresh local demo, create a Git repository containing a source function
+such as `PaymentService.charge` before running the commands above.
 
 For machine consumption:
 
@@ -87,18 +90,95 @@ For machine consumption:
 crane check --json
 ```
 
+For agent verification, use the same deterministic JSON contract with a
+non-zero exit status on violations:
+
+```bash
+crane check --agent
+```
+
+`crane check --json` and `crane check --agent` return `status` plus a
+`violations` array. Each violation has `policy_id`, `rule`, `target`,
+`checkpoint`, `violation_type`, and `message`. Ambiguous targets, parser
+failures, unsupported languages, missing checkpoints, and malformed policies
+are failures, never passes.
+
 For a compact LLM-facing context:
 
 ```bash
 crane context
 ```
 
+## Agent integration contract
+
+Crane remains an external verifier; the coding agent is an untrusted actor and
+must not decide whether a protected change is acceptable. An integration may
+invoke Crane around any agent edit session:
+
+```text
+session start
+  -> crane context
+  -> agent edits repository
+  -> crane check --agent
+  -> structured violation returned to agent
+  -> agent repairs repository
+  -> crane check --agent
+  -> success
+```
+
+`crane context` emits deterministic active policy records. `crane check
+--agent` emits JSON on stdout, never changes source or checkpoints, exits zero
+when every policy passes, and exits non-zero when a policy fails or cannot be
+verified. Claude Code, Codex, GitHub Copilot, or another external agent can
+run these commands through its existing terminal/tool integration; no custom
+agent runtime is required.
+
+The agent-check JSON contract is:
+
+```json
+{
+  "status": "passed",
+  "violations": [
+    {
+      "policy_id": "payment_service",
+      "rule": "preserve",
+      "target": "PaymentService.charge",
+      "checkpoint": "baseline",
+      "message": "Protected function was modified."
+    }
+  ]
+}
+```
+
+`status` is `passed` or `failed`; `violations` is always present and is
+deterministically ordered by policy and rule. A failed resolution, missing
+checkpoint, missing commit, or missing protected function is also reported as
+a violation, so verification fails closed.
+
 ## Installation
 
 Prebuilt binaries for Linux, macOS (Intel and Apple Silicon), and Windows are
 published on the [GitHub Releases page](https://github.com/VishuKalier2003/Agentscript/releases).
-Download the archive for your platform, extract it, and put the `crane` binary
-(`crane.exe` on Windows) somewhere on your `PATH`.
+Download the archive for your platform, extract it, and put the binary in a
+directory on your `PATH`.
+
+### Windows
+
+Download `crane-v0.1.0-x86_64-pc-windows-msvc.zip`, extract `crane.exe`, and
+add its directory to the user `PATH` through **System Properties → Environment
+Variables**. Open a new PowerShell window afterward.
+
+### macOS
+
+Download the `x86_64-apple-darwin` archive for Intel Macs or the
+`aarch64-apple-darwin` archive for Apple Silicon Macs. Extract `crane`, move it
+to `~/.local/bin` or `/usr/local/bin`, and ensure that directory is on `PATH`.
+
+### Linux
+
+Download `crane-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, extract `crane`, move
+it to `~/.local/bin` or `/usr/local/bin`, and ensure that directory is on
+`PATH`.
 
 Verify the installation:
 
@@ -106,11 +186,16 @@ Verify the installation:
 crane --version
 ```
 
-Rust users can install directly from the repository:
+### Build from source
+
+Install the stable Rust toolchain, then run:
 
 ```bash
 cargo install --git https://github.com/VishuKalier2003/Agentscript.git --bin crane
 ```
+
+Alternatively, clone the repository and run `cargo build --release`; the
+binary is written to `target/release/crane` (or `crane.exe` on Windows).
 
 ## Publishing a release
 
@@ -160,6 +245,10 @@ policy
 
 Policies do not import, inherit, invoke, extend, or depend on other policies.
 
+Supported source languages are Java, JavaScript/JSX, Python, and Rust. The
+comparison model and all failure cases are specified in
+[`LANGUAGE.md`](./LANGUAGE.md).
+
 ## Why Rust?
 
 Rust is used for the core because Crane needs to become a portable, deterministic CLI that can run locally, inside CI, Git hooks, editors, and agent lifecycle hooks without requiring a language runtime. Rust also gives strong static typing and explicit ownership, which are useful as the parser, AST, IR, code model, and evaluator grow.
@@ -196,8 +285,9 @@ This MVP intentionally keeps the implementation narrow:
 
 - Function resolution is source-based and conservative; overloaded functions
   are not disambiguated by parameters.
-- The check is exact source comparison of the extracted tree-sitter function
-  region.
+- The check compares canonical parsed tokens from the extracted tree-sitter
+  function region; formatting and comments are ignored.
+- Duplicate target matches fail closed.
 - Git commit SHA is the immutable baseline; branch is recorded only as metadata.
 - No agent-specific hooks are installed yet.
 - `deny-read`, `deny-write`, `require-read`, `require-write`, and `static-database` are intentionally not implemented yet.

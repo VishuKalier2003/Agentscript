@@ -64,13 +64,12 @@ pub(crate) fn json_field(value: &str, key: &str) -> Option<String> {
     let rest = &value[start + needle.len()..];
     let colon = rest.find(':')?;
     let value = rest[colon + 1..].trim_start();
-    if value.starts_with('"') {
-        let quoted = &value[1..];
+    if let Some(quoted) = value.strip_prefix('"') {
         let end = quoted.find('"')?;
         Some(quoted[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
     } else {
         value
-            .split(|character| character == ',' || character == '}')
+            .split([',', '}'])
             .next()
             .map(|number| number.trim().to_string())
     }

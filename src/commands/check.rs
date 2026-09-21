@@ -3,104 +3,224 @@ use std::fs;
 use crate::model::{Rule, Violation};
 use crate::policy::parse_file;
 use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root};
-use crate::resolver::{resolve_git, resolve_worktree};
+use crate::resolver::{resolve_git, resolve_worktree, supported_extensions, Resolution};
 use crate::util::{escape_json, io_error};
 
-pub(crate) fn run(json: bool) -> Result<(), String> {
-    ensure_initialized()?;
-    let directory = root()?.join("policies");
-    let mut policies = Vec::new();
-    for entry in fs::read_dir(directory).map_err(io_error)? {
-        let path = entry.map_err(io_error)?.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("crane") {
-            policies.push(parse_file(&path)?);
+struct Pass {
+    policy_id: String,
+    target: String,
+}
+
+struct Report {
+    passes: Vec<Pass>,
+    violations: Vec<Violation>,
+}
+
+pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
+    if let Err(error) = ensure_initialized() {
+        if json || agent {
+            print_error_json(&error);
         }
+        return Err(error);
     }
-    policies.sort_by(|left, right| left.name.cmp(&right.name));
-    let mut passes = Vec::new();
-    let mut failures = Vec::new();
-    for policy in policies {
-        for rule in policy.rules {
-            match rule {
-                Rule::PreserveFunction { target } => {
-                    let checkpoint = load_checkpoint(&policy.checkpoint)?;
-                    ensure_commit(&checkpoint.commit)?;
-                    let baseline = resolve_git(&checkpoint.commit, &target)?.ok_or_else(|| {
-                        format!("cannot locate {target} in checkpoint {}", checkpoint.name)
-                    })?;
-                    let current = resolve_worktree(&target)?
-                        .ok_or_else(|| format!("protected function {target} is missing"))?;
-                    if baseline.snippet == current.snippet {
-                        passes.push((policy.name.clone(), target));
-                    } else {
-                        failures.push(Violation {
-                            policy: policy.name.clone(),
-                            rule: "preserve".into(),
-                            target: target.clone(),
-                            checkpoint: checkpoint.name,
-                            message: format!("{target} changed"),
-                        });
-                    }
-                }
+    let report = match evaluate() {
+        Ok(report) => report,
+        Err(error) => {
+            if json || agent {
+                print_error_json(&error);
             }
+            return Err(error);
         }
-    }
-    if json {
-        print_json(&passes, &failures);
+    };
+    if json || agent {
+        print_json(&report);
     } else {
-        for (policy, target) in &passes {
-            println!("PASS {policy}: preserve --function {target}");
-        }
-        for violation in &failures {
-            println!(
-                "FAIL {}: {} (checkpoint {})",
-                violation.policy, violation.message, violation.checkpoint
-            );
-        }
-        println!(
-            "Crane check: {}",
-            if failures.is_empty() { "PASS" } else { "FAIL" }
-        );
+        print_human(&report);
     }
-    if failures.is_empty() {
+    if report.violations.is_empty() {
         Ok(())
     } else {
         Err("one or more Crane policies failed".into())
     }
 }
 
-fn print_json(passes: &[(String, String)], violations: &[Violation]) {
-    println!(
-        "{{\n  \"status\": \"{}\",\n  \"passes\": [",
-        if violations.is_empty() {
-            "pass"
-        } else {
-            "fail"
+fn print_error_json(error: &str) {
+    print_json(&Report {
+        passes: Vec::new(),
+        violations: vec![Violation {
+            policy_id: "crane".into(),
+            rule: "verification".into(),
+            target: String::new(),
+            checkpoint: String::new(),
+            violation_type: classify_violation(error),
+            message: error.into(),
+        }],
+    });
+}
+
+fn evaluate() -> Result<Report, String> {
+    let directory = root()?.join("policies");
+    let mut paths = fs::read_dir(directory)
+        .map_err(io_error)?
+        .map(|entry| entry.map(|value| value.path()).map_err(io_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    let mut policies = Vec::new();
+    let mut policy_errors = Vec::new();
+    for path in paths {
+        if path.extension().and_then(|value| value.to_str()) == Some("crane") {
+            match parse_file(&path) {
+                Ok(policy) => policies.push(policy),
+                Err(message) => policy_errors.push(Violation {
+                    policy_id: path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown")
+                        .into(),
+                    rule: "policy".into(),
+                    target: String::new(),
+                    checkpoint: String::new(),
+                    violation_type: "malformed_policy".into(),
+                    message,
+                }),
+            }
         }
-    );
-    for (index, (policy, target)) in passes.iter().enumerate() {
-        if index > 0 {
-            print!(",");
+    }
+    policies.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut report = Report {
+        passes: Vec::new(),
+        violations: policy_errors,
+    };
+    for policy in policies {
+        for rule in policy.rules {
+            match rule {
+                Rule::PreserveFunction { target } => {
+                    let checkpoint_name = policy.checkpoint.clone();
+                    let result = verify_function(&policy.name, &checkpoint_name, &target);
+                    match result {
+                        Ok(()) => report.passes.push(Pass {
+                            policy_id: policy.name.clone(),
+                            target,
+                        }),
+                        Err(message) => report.violations.push(Violation {
+                            policy_id: policy.name.clone(),
+                            rule: "preserve".into(),
+                            target,
+                            checkpoint: checkpoint_name,
+                            violation_type: classify_violation(&message),
+                            message,
+                        }),
+                    }
+                }
+            }
         }
-        print!(
-            "\n    {{\"policy\":\"{}\",\"target\":\"{}\"}}",
-            escape_json(policy),
-            escape_json(target)
+    }
+    Ok(report)
+}
+
+fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Result<(), String> {
+    let checkpoint = load_checkpoint(checkpoint_name)
+        .map_err(|error| format!("{error} (policy {policy_id}, target {target})"))?;
+    ensure_commit(&checkpoint.commit)?;
+    let baseline = match resolve_git(&checkpoint.commit, target)? {
+        Resolution::Found(value) => value,
+        Resolution::Missing => {
+            return Err(format!(
+                "protected function {target} is missing from checkpoint; supported source extensions: {}",
+                supported_extensions()
+            ))
+        }
+        Resolution::Duplicate(count) => {
+            return Err(format!("protected function {target} is ambiguous in checkpoint ({count} matches)"))
+        }
+        Resolution::Unsupported => return Err(format!("checkpoint source language is unsupported for {target}")),
+        Resolution::ParseFailure(error) => return Err(format!("checkpoint source could not be parsed: {error}")),
+    };
+    let current = match resolve_worktree(target)? {
+        Resolution::Found(value) => value,
+        Resolution::Missing => {
+            return Err(format!(
+                "protected function {target} is missing from the worktree; supported source extensions: {}",
+                supported_extensions()
+            ))
+        }
+        Resolution::Duplicate(count) => {
+            return Err(format!("protected function {target} is ambiguous in worktree ({count} matches)"))
+        }
+        Resolution::Unsupported => return Err(format!("worktree source language is unsupported for {target}")),
+        Resolution::ParseFailure(error) => return Err(format!("worktree source could not be parsed: {error}")),
+    };
+    if baseline.snippet == current.snippet {
+        Ok(())
+    } else {
+        Err("Protected function was modified.".into())
+    }
+}
+
+fn print_human(report: &Report) {
+    for pass in &report.passes {
+        println!(
+            "PASS {}: preserve --function {}",
+            pass.policy_id, pass.target
         );
     }
-    println!("\n  ],\n  \"violations\": [");
-    for (index, violation) in violations.iter().enumerate() {
+    for violation in &report.violations {
+        println!(
+            "FAIL {}: {} (checkpoint {})",
+            violation.policy_id, violation.message, violation.checkpoint
+        );
+    }
+    println!(
+        "Crane check: {}",
+        if report.violations.is_empty() {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+}
+
+fn print_json(report: &Report) {
+    let status = if report.violations.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    println!("{{\n  \"status\": \"{status}\",\n  \"violations\": [");
+    for (index, violation) in report.violations.iter().enumerate() {
         if index > 0 {
-            print!(",");
+            println!(",");
         }
         print!(
-            "\n    {{\"policy\":\"{}\",\"rule\":\"{}\",\"target\":\"{}\",\"checkpoint\":\"{}\",\"message\":\"{}\"}}",
-            escape_json(&violation.policy),
+            "    {{\"policy_id\":\"{}\",\"rule\":\"{}\",\"target\":\"{}\",\"checkpoint\":\"{}\",\"violation_type\":\"{}\",\"message\":\"{}\"}}",
+            escape_json(&violation.policy_id),
             escape_json(&violation.rule),
             escape_json(&violation.target),
             escape_json(&violation.checkpoint),
+            escape_json(&violation.violation_type),
             escape_json(&violation.message)
         );
     }
+
     println!("\n  ]\n}}");
+}
+
+fn classify_violation(message: &str) -> String {
+    if message.contains("ambiguous") {
+        "duplicate_target"
+    } else if message.contains("missing from") {
+        "target_not_found"
+    } else if message.contains("unsupported") {
+        "unsupported_language"
+    } else if message.contains("could not be parsed") {
+        "parse_failure"
+    } else if message.contains("checkpoint") {
+        "checkpoint_error"
+    } else if message.contains("modified") {
+        "source_changed"
+    } else {
+        "verification_error"
+    }
+    .into()
 }

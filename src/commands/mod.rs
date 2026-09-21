@@ -26,8 +26,11 @@ pub(crate) fn run() -> Result<(), String> {
             let path = rest.first().ok_or("parse requires a .crane file")?;
             parse::run(Path::new(path))
         }
-        "check" => check::run(rest.iter().any(|argument| argument == "--json")),
-        "test-all" => check::run(false),
+        "check" => check::run(
+            rest.iter().any(|argument| argument == "--json"),
+            rest.iter().any(|argument| argument == "--agent"),
+        ),
+        "test-all" => check::run(false, false),
         "context" => context::run(),
         "status" => status::run(),
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
@@ -49,6 +52,7 @@ Commands:
   protect --function TARGET [--policy NAME] [--checkpoint NAME]
   parse FILE
   check [--json]
+  check --agent
   test-all
   context
   status

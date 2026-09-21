@@ -20,14 +20,15 @@ pub(crate) struct Checkpoint {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Violation {
-    pub(crate) policy: String,
+    pub(crate) policy_id: String,
     pub(crate) rule: String,
     pub(crate) target: String,
     pub(crate) checkpoint: String,
+    pub(crate) violation_type: String,
     pub(crate) message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceTarget {
     pub(crate) snippet: String,
 }

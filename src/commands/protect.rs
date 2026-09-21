@@ -1,7 +1,7 @@
 use std::fs;
 
 use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root};
-use crate::resolver::{resolve_git, resolve_worktree};
+use crate::resolver::{resolve_git, resolve_worktree, supported_extensions, Resolution};
 use crate::util::{io_error, option, sanitize, validate_function_target};
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
@@ -13,14 +13,48 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let checkpoint_name = option(args, "--checkpoint").unwrap_or_else(|| "baseline".into());
     let checkpoint = load_checkpoint(&checkpoint_name)?;
     ensure_commit(&checkpoint.commit)?;
-    let current = resolve_worktree(&target)?
-        .ok_or_else(|| format!("could not resolve '{target}' in current working tree"))?;
-    let baseline = resolve_git(&checkpoint.commit, &target)?.ok_or_else(|| {
-        format!(
-            "could not resolve {target} in checkpoint {}",
-            checkpoint.name
-        )
-    })?;
+    let current = match resolve_worktree(&target)? {
+        Resolution::Found(value) => value,
+        Resolution::Missing => {
+            return Err(format!(
+            "could not resolve '{target}' in current working tree; supported source extensions: {}",
+            supported_extensions()
+        ))
+        }
+        Resolution::Duplicate(count) => {
+            return Err(format!(
+                "could not resolve '{target}': {count} duplicate targets"
+            ))
+        }
+        Resolution::Unsupported => {
+            return Err(format!("source language is unsupported for '{target}'"))
+        }
+        Resolution::ParseFailure(error) => {
+            return Err(format!("source could not be parsed: {error}"))
+        }
+    };
+    let baseline = match resolve_git(&checkpoint.commit, &target)? {
+        Resolution::Found(value) => value,
+        Resolution::Missing => {
+            return Err(format!(
+                "could not resolve {target} in checkpoint {}",
+                checkpoint.name
+            ))
+        }
+        Resolution::Duplicate(count) => {
+            return Err(format!(
+                "checkpoint contains {count} duplicate targets for {target}"
+            ))
+        }
+        Resolution::Unsupported => {
+            return Err(format!(
+                "checkpoint source language is unsupported for '{target}'"
+            ))
+        }
+        Resolution::ParseFailure(error) => {
+            return Err(format!("checkpoint source could not be parsed: {error}"))
+        }
+    };
     if current.snippet != baseline.snippet {
         return Err(format!(
             "current {target} differs from checkpoint {}; commit or refresh the checkpoint before protecting it",

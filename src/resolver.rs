@@ -8,6 +8,15 @@ use crate::model::SourceTarget;
 use crate::repository::{ensure_commit, git};
 use crate::util::io_error;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    Found(SourceTarget),
+    Missing,
+    Duplicate(usize),
+    Unsupported,
+    ParseFailure(String),
+}
+
 pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
     match Path::new(path)
         .extension()?
@@ -23,17 +32,33 @@ pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
     }
 }
 
-pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option<String> {
-    let language = language(path)?;
+pub(crate) fn supported_extensions() -> &'static str {
+    ".java, .js, .jsx, .mjs, .cjs, .py, .rs"
+}
+
+pub(crate) fn extract_functions(
+    source: &str,
+    path: &str,
+    target: &str,
+) -> Result<Vec<String>, String> {
+    let language = language(path).ok_or_else(|| "unsupported source language".to_string())?;
     let mut parser = Parser::new();
-    parser.set_language(language).ok()?;
-    let tree = parser.parse(source, None)?;
+    parser
+        .set_language(language)
+        .map_err(|error| error.to_string())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| "parser returned no syntax tree".to_string())?;
+    if tree.root_node().has_error() {
+        return Err("source contains a parser error".into());
+    }
     let wanted = target
         .rsplit("::")
         .next()
         .unwrap_or(target)
         .rsplit('.')
-        .next()?;
+        .next()
+        .ok_or_else(|| "target has no function name".to_string())?;
     let separator = if target.contains("::") { "::" } else { "." };
     let bytes = source.as_bytes();
 
@@ -43,11 +68,8 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
         target: &str,
         separator: &str,
         bytes: &[u8],
-        output: &mut Option<String>,
+        output: &mut Vec<String>,
     ) {
-        if output.is_some() {
-            return;
-        }
         let kind = node.kind();
         if kind.contains("function")
             || kind.contains("method")
@@ -76,12 +98,7 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
                     qualified.reverse();
                     qualified.push(wanted.into());
                     if target.split(separator).count() == 1 || qualified.join(separator) == target {
-                        *output = Some(
-                            String::from_utf8_lossy(&bytes[node.byte_range()])
-                                .replace("\r\n", "\n")
-                                .replace('\r', "\n"),
-                        );
-                        return;
+                        output.push(canonical_source_node(node, bytes));
                     }
                 }
             }
@@ -92,7 +109,29 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
         }
     }
 
-    let mut output = None;
+    fn canonical_source_node(node: Node, bytes: &[u8]) -> String {
+        fn append_tokens(node: Node, bytes: &[u8], output: &mut String) {
+            if node.kind().contains("comment") {
+                return;
+            }
+            let mut cursor = node.walk();
+            let mut has_named_child = false;
+            for child in node.children(&mut cursor) {
+                has_named_child = true;
+                append_tokens(child, bytes, output);
+            }
+            if !has_named_child {
+                output.push_str(&String::from_utf8_lossy(&bytes[node.byte_range()]));
+                output.push('\0');
+            }
+        }
+
+        let mut canonical = String::new();
+        append_tokens(node, bytes, &mut canonical);
+        canonical
+    }
+
+    let mut output = Vec::new();
     visit(
         tree.root_node(),
         wanted,
@@ -101,15 +140,42 @@ pub(crate) fn extract_function(source: &str, path: &str, target: &str) -> Option
         bytes,
         &mut output,
     );
-    output
+    Ok(output)
 }
 
 fn supported(path: &str) -> bool {
     language(path).is_some()
 }
 
-pub(crate) fn resolve_worktree(target: &str) -> Result<Option<SourceTarget>, String> {
+fn source_candidate(path: &str) -> bool {
+    matches!(
+        Path::new(path).extension().and_then(|value| value.to_str()),
+        Some(
+            "java"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "py"
+                | "rs"
+                | "ts"
+                | "tsx"
+                | "go"
+                | "rb"
+                | "php"
+                | "c"
+                | "h"
+                | "cpp"
+                | "cc"
+        )
+    )
+}
+
+pub(crate) fn resolve_worktree(target: &str) -> Result<Resolution, String> {
     let mut stack = vec![env::current_dir().map_err(io_error)?];
+    let mut unsupported = false;
+    let mut supported_seen = false;
+    let mut matches = Vec::new();
     while let Some(directory) = stack.pop() {
         for entry in fs::read_dir(directory).map_err(io_error)? {
             let path = entry.map_err(io_error)?.path();
@@ -122,24 +188,57 @@ pub(crate) fn resolve_worktree(target: &str) -> Result<Option<SourceTarget>, Str
                     stack.push(path);
                 }
             } else if supported(&path.to_string_lossy()) {
+                supported_seen = true;
                 let source = fs::read_to_string(&path).map_err(io_error)?;
-                if let Some(snippet) = extract_function(&source, &path.to_string_lossy(), target) {
-                    return Ok(Some(SourceTarget { snippet }));
+                match extract_functions(&source, &path.to_string_lossy(), target) {
+                    Ok(found) => {
+                        matches.extend(found.into_iter().map(|snippet| SourceTarget { snippet }))
+                    }
+                    Err(error) => {
+                        return Ok(Resolution::ParseFailure(format!(
+                            "{}: {error}",
+                            path.display()
+                        )))
+                    }
                 }
+            } else if source_candidate(&path.to_string_lossy()) {
+                unsupported = true;
             }
         }
     }
-    Ok(None)
+    match matches.len() {
+        0 if unsupported && !supported_seen => Ok(Resolution::Unsupported),
+        0 => Ok(Resolution::Missing),
+        1 => Ok(Resolution::Found(matches.remove(0))),
+        count => Ok(Resolution::Duplicate(count)),
+    }
 }
 
-pub(crate) fn resolve_git(commit: &str, target: &str) -> Result<Option<SourceTarget>, String> {
+pub(crate) fn resolve_git(commit: &str, target: &str) -> Result<Resolution, String> {
     ensure_commit(commit)?;
     let files = git(&["ls-tree", "-r", "--name-only", commit])?;
+    let mut unsupported = false;
+    let mut supported_seen = false;
+    let mut matches = Vec::new();
     for path in files.lines().filter(|path| supported(path)) {
+        supported_seen = true;
         let source = git(&["show", &format!("{commit}:{path}")])?;
-        if let Some(snippet) = extract_function(&source, path, target) {
-            return Ok(Some(SourceTarget { snippet }));
+        match extract_functions(&source, path, target) {
+            Ok(found) => matches.extend(found.into_iter().map(|snippet| SourceTarget { snippet })),
+            Err(error) => return Ok(Resolution::ParseFailure(format!("{path}: {error}"))),
         }
     }
-    Ok(None)
+    if files.lines().any(source_candidate)
+        && files
+            .lines()
+            .any(|path| source_candidate(path) && !supported(path))
+    {
+        unsupported = true;
+    }
+    match matches.len() {
+        0 if unsupported && !supported_seen => Ok(Resolution::Unsupported),
+        0 => Ok(Resolution::Missing),
+        1 => Ok(Resolution::Found(matches.remove(0))),
+        count => Ok(Resolution::Duplicate(count)),
+    }
 }
