@@ -14,10 +14,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: crane-release
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     strategy:
@@ -26,7 +31,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
@@ -86,6 +91,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
