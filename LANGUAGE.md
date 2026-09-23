@@ -3,7 +3,7 @@
 AgentScript is the policy language consumed by Crane. Version 0.1 has one
 contract primitive: `preserve --function`. It is deliberately non-recursive:
 there are no imports, inheritance, policy dependencies, macros, composition,
-databases, or other policy primitives.
+databases, or other policy primitives
 
 ## Policy syntax
 
