@@ -189,7 +189,7 @@ directory on your `PATH`.
 
 ### Windows
 
-Download `crane-v0.1.0-x86_64-pc-windows-msvc.zip`, extract `crane.exe`, and
+Download `crane-v0.1.2-x86_64-pc-windows-msvc.zip`, extract `crane.exe`, and
 add its directory to the user `PATH` through **System Properties → Environment
 Variables**. Open a new PowerShell window afterward.
 
@@ -201,7 +201,7 @@ to `~/.local/bin` or `/usr/local/bin`, and ensure that directory is on `PATH`.
 
 ### Linux
 
-Download `crane-v0.1.0-x86_64-unknown-linux-gnu.tar.gz`, extract `crane`, move
+Download `crane-v0.1.2-x86_64-unknown-linux-gnu.tar.gz`, extract `crane`, move
 it to `~/.local/bin` or `/usr/local/bin`, and ensure that directory is on
 `PATH`.
 
@@ -227,8 +227,8 @@ binary is written to `target/release/crane` (or `crane.exe` on Windows).
 Create and push a semantic-version tag after merging the desired changes:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The [release workflow](./.github/workflows/release.yml) builds archives for
@@ -236,6 +236,40 @@ Linux, macOS Intel, macOS Apple Silicon, and Windows, publishes SHA-256
 checksums, and creates a GitHub Release with generated release notes. The
 workflow can also be started manually from GitHub Actions by supplying an
 existing tag.
+
+## Consuming Crane from an application repository
+
+An application repository should commit its reviewed `.crane/policies/` and
+checkpoint metadata, then download a pinned Crane release in CI. It should not
+compile Crane from `main` for every build. The application checkpoint identifies
+the trusted application commit; the Crane release identifies the verifier
+version.
+
+The recommended CI sequence is:
+
+```text
+checkout application with full Git history
+  -> download pinned Crane release
+  -> verify the release checksum
+  -> crane context
+  -> crane check --json
+```
+
+For an interactive agent adapter, use:
+
+```text
+crane context
+  -> agent edits application
+  -> crane check --agent
+  -> return JSON violations to the agent
+  -> agent repairs
+  -> crane check --agent
+```
+
+Crane provides the adapter-facing commands `crane agent init` and
+`crane agent verify`; these coordinate initialization and verification only.
+They do not implement an agent runtime, create checkpoints automatically, or
+duplicate policy semantics.
 
 ## GitHub Actions CI
 
