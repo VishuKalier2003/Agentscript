@@ -16,6 +16,8 @@ It also implements the Git-backed workflow discussed during design:
 - `crane test-all`
 - `crane context`
 - `crane check --agent`
+- `crane agent init`
+- `crane agent verify`
 - `crane status`
 
 ## Core idea
@@ -132,6 +134,29 @@ when every policy passes, and exits non-zero when a policy fails or cannot be
 verified. Claude Code, Codex, GitHub Copilot, or another external agent can
 run these commands through its existing terminal/tool integration; no custom
 agent runtime is required.
+
+### Agent adapter flow
+
+Crane exposes a small adapter boundary with a universal profile and named
+profiles for `generic`, `claude`, and `codex`:
+
+```text
+agent receives user request
+  -> adapter: crane agent init --profile claude
+  -> Crane initializes .crane and immediately verifies
+  -> agent edits repository
+  -> adapter: crane agent verify --profile claude
+  -> JSON violation text is returned to the agent
+  -> agent repairs the repository
+  -> adapter: crane agent verify --profile claude
+  -> exit 0 means the workflow is complete
+```
+
+The adapter is deliberately not an agent runtime: it does not invent edits or
+silently mutate source. Claude Code, Codex, Copilot, or another host invokes
+the same adapter commands through its normal tool interface. Profile names
+provide a stable integration contract today and allow host-specific launchers
+to specialize later without duplicating Crane policy semantics.
 
 The agent-check JSON contract is:
 
@@ -289,5 +314,6 @@ This MVP intentionally keeps the implementation narrow:
   function region; formatting and comments are ignored.
 - Duplicate target matches fail closed.
 - Git commit SHA is the immutable baseline; branch is recorded only as metadata.
-- No agent-specific hooks are installed yet.
+- Host-specific agent hooks are not installed by Crane; hosts invoke the
+  adapter commands through their normal tool interfaces.
 - `deny-read`, `deny-write`, `require-read`, `require-write`, and `static-database` are intentionally not implemented yet.

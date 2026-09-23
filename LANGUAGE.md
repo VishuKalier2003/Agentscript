@@ -125,3 +125,21 @@ The JSON object always has:
 by policy path/name and rule order. Every violation contains all six stable
 fields; setup-level failures use `policy_id` `crane` and empty target and
 checkpoint fields.
+
+## Agent adapter contract
+
+Crane exposes a universal adapter boundary with specialized profiles for
+`generic`, `claude`, and `codex`:
+
+```text
+crane agent init --profile PROFILE
+crane agent verify --profile PROFILE
+```
+
+`agent init` creates the normal Crane repository structure and immediately
+runs the independent verification. `agent verify` runs verification and
+returns the stable JSON result on stdout with a non-zero exit code for any
+violation. The adapter does not edit source, create checkpoints, or repair
+violations. The host agent consumes the returned text, performs its own repair,
+and invokes verification again. A zero exit code is the completion signal for
+the host workflow.

@@ -1,6 +1,8 @@
 use std::env;
 use std::path::Path;
 
+use crate::adapter::{adapter, AgentKind};
+
 mod check;
 mod checkpoint;
 mod context;
@@ -26,6 +28,7 @@ pub(crate) fn run() -> Result<(), String> {
             let path = rest.first().ok_or("parse requires a .crane file")?;
             parse::run(Path::new(path))
         }
+
         "check" => check::run(
             rest.iter().any(|argument| argument == "--json"),
             rest.iter().any(|argument| argument == "--agent"),
@@ -33,7 +36,42 @@ pub(crate) fn run() -> Result<(), String> {
         "test-all" => check::run(false, false),
         "context" => context::run(),
         "status" => status::run(),
+        "agent" => agent(&rest),
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
+    }
+}
+
+pub(crate) fn initialize_for_agent() -> Result<(), String> {
+    init::run()
+}
+
+pub(crate) fn verify_for_agent() -> Result<(), String> {
+    check::run(true, true)
+}
+
+fn agent(args: &[String]) -> Result<(), String> {
+    let operation = args.first().map(String::as_str).unwrap_or("verify");
+    let profile = args
+        .iter()
+        .position(|argument| argument == "--profile" || argument == "--agent")
+        .and_then(|index| args.get(index + 1))
+        .map(String::as_str);
+    let selected = AgentKind::parse(profile)?;
+    let adapter = adapter(selected);
+    match operation {
+        "init" => {
+            adapter.initialize()?;
+            println!(
+                "Activated Crane agent adapter profile '{}'.",
+                adapter.kind().name()
+            );
+            println!("{}", adapter.feedback_contract());
+            Ok(())
+        }
+        "verify" | "check" => adapter.verify(),
+        _ => Err(format!(
+            "unknown agent operation '{operation}'; use 'crane agent init' or 'crane agent verify'"
+        )),
     }
 }
 
@@ -53,6 +91,8 @@ Commands:
   parse FILE
   check [--json]
   check --agent
+  agent init [--profile generic|claude|codex]
+  agent verify [--profile generic|claude|codex]
   test-all
   context
   status
