@@ -1,6 +1,6 @@
 [package]
 name = "crane"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 description = "Crane: a tiny contract language and verifier for AI-assisted code changes."
 license = "Apache-2.0"
