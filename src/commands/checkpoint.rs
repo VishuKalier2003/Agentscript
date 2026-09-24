@@ -5,6 +5,7 @@ use crate::repository::{checkpoint_json, ensure_repo, git, root};
 use crate::util::{io_error, now_unix, option, validate_identifier};
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
+    // Record an explicit Git commit as the trusted baseline for future checks
     ensure_repo()?;
     let root = root()?;
     let name = option(args, "--name").unwrap_or_else(|| "baseline".into());

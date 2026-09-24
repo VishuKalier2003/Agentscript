@@ -6,6 +6,7 @@ use crate::repository::{ensure_initialized, root};
 use crate::util::io_error;
 
 pub(crate) fn run() -> Result<(), String> {
+    // Emit deterministic policy context that an agent can consume at session start
     ensure_initialized()?;
     let directory = root()?.join("policies");
     let paths = fs::read_dir(directory)

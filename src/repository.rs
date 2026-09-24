@@ -7,6 +7,7 @@ use crate::model::Checkpoint;
 use crate::util::{io_error, json_field};
 
 pub(crate) fn root() -> Result<PathBuf, String> {
+    // Locate the nearest initialized Crane directory from the current path
     let mut directory = env::current_dir().map_err(io_error)?;
     loop {
         let candidate = directory.join(".crane");
@@ -21,6 +22,7 @@ pub(crate) fn root() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
+    // Locate a Git repository so init can create its Crane directory
     let mut directory = env::current_dir().map_err(io_error)?;
     let original = directory.clone();
     loop {
@@ -39,11 +41,13 @@ pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
 }
 
 pub(crate) fn ensure_initialized() -> Result<(), String> {
+    // Require both Git and a valid Crane configuration before verification
     let crane_root = root()?;
     ensure_repo().and_then(|()| validate_config(&crane_root))
 }
 
 fn validate_config(crane_root: &Path) -> Result<(), String> {
+    // Reject configuration syntax that v0.1 does not understand
     let path = crane_root.join("config.toml");
     if !path.exists() {
         return Ok(());
@@ -62,11 +66,13 @@ fn validate_config(crane_root: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn ensure_repo() -> Result<(), String> {
+    // Use Git itself as the authority for repository membership
     let _ = git(&["rev-parse", "--show-toplevel"])?;
     Ok(())
 }
 
 pub(crate) fn git(args: &[&str]) -> Result<String, String> {
+    // Run Git without shell interpolation so paths and arguments stay isolated
     let output = Command::new("git")
         .args(args)
         .output()
@@ -78,6 +84,7 @@ pub(crate) fn git(args: &[&str]) -> Result<String, String> {
 }
 
 pub(crate) fn load_checkpoint(name: &str) -> Result<Checkpoint, String> {
+    // Load checkpoint metadata without accepting a missing or partial baseline
     let path = root()?.join("checkpoints").join(format!("{name}.json"));
     let content = fs::read_to_string(path).map_err(|_| {
         format!("checkpoint '{name}' does not exist; run 'crane checkpoint --name {name}'")
@@ -91,6 +98,7 @@ pub(crate) fn load_checkpoint(name: &str) -> Result<Checkpoint, String> {
 }
 
 pub(crate) fn ensure_commit(commit: &str) -> Result<(), String> {
+    // Confirm the checkpoint commit is locally available before resolving source
     if commit.trim().is_empty() {
         return Err("checkpoint has an empty Git commit reference".into());
     }
@@ -104,6 +112,7 @@ pub(crate) fn ensure_commit(commit: &str) -> Result<(), String> {
 }
 
 pub(crate) fn checkpoint_json(checkpoint: &Checkpoint) -> String {
+    // Serialize checkpoint identity in the version-controlled metadata format
     format!(
         "{{\n  \"name\":\"{}\",\n  \"commit\":\"{}\",\n  \"branch\":\"{}\",\n  \"created_at_unix\":{}\n}}\n",
         crate::util::escape_json(&checkpoint.name),

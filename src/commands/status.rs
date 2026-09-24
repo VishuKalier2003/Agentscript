@@ -4,6 +4,7 @@ use crate::repository::{ensure_initialized, git, root};
 use crate::util::{io_error, json_field};
 
 pub(crate) fn run() -> Result<(), String> {
+    // Summarize repository identity, checkpoints, and policies without evaluating rules
     ensure_initialized()?;
     let root = root()?;
     println!("Crane status\n============");

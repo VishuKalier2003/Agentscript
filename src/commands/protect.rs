@@ -5,6 +5,7 @@ use crate::resolver::{resolve_git, resolve_worktree, supported_extensions, Resol
 use crate::util::{io_error, option, sanitize, validate_function_target};
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
+    // Create a preserve policy only when current code matches its checkpoint
     ensure_initialized()?;
     let target = option(args, "--function").ok_or("protect requires --function TARGET")?;
     validate_function_target(&target)?;

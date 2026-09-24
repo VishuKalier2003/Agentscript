@@ -4,6 +4,7 @@ use crate::repository::root_allow_missing;
 use crate::util::io_error;
 
 pub(crate) fn run() -> Result<(), String> {
+    // Create only Crane metadata directories and never alter application source
     let root = root_allow_missing()?;
     fs::create_dir_all(root.join("policies")).map_err(io_error)?;
     fs::create_dir_all(root.join("checkpoints")).map_err(io_error)?;

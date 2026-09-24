@@ -17,6 +17,7 @@ struct Report {
 }
 
 pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
+    // Verify policies without changing source, checkpoints, or repository state
     if let Err(error) = ensure_initialized() {
         if json || agent {
             print_error_json(&error);
@@ -48,6 +49,7 @@ pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
 }
 
 fn print_error_json(error: &str) {
+    // Convert setup failures into the same violation shape as policy failures
     let report = Report {
         passes: Vec::new(),
         violations: vec![Violation {
@@ -64,6 +66,7 @@ fn print_error_json(error: &str) {
 }
 
 fn evaluate() -> Result<Report, String> {
+    // Parse policies in deterministic order before evaluating each rule independently
     let directory = root()?.join("policies");
     let mut paths = fs::read_dir(directory)
         .map_err(io_error)?
@@ -125,6 +128,7 @@ fn evaluate() -> Result<Report, String> {
 }
 
 fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Result<(), String> {
+    // Compare one protected target from the trusted commit against the worktree
     let checkpoint = load_checkpoint(checkpoint_name)
         .map_err(|error| format!("{error} (policy {policy_id}, target {target})"))?;
     ensure_commit(&checkpoint.commit)?;
@@ -164,6 +168,7 @@ fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Resu
 }
 
 fn print_human(report: &Report) {
+    // Render a concise report for interactive terminal use
     for pass in &report.passes {
         println!(
             "PASS {}: preserve --function {}",
@@ -187,10 +192,12 @@ fn print_human(report: &Report) {
 }
 
 fn print_json(report: &Report) {
+    // Keep JSON output on stdout for scripts and agent integrations
     println!("{}", render_json(report));
 }
 
 fn render_json(report: &Report) -> String {
+    // Serialize fields in a fixed order to keep the agent contract deterministic
     let status = if report.violations.is_empty() {
         "passed"
     } else {
@@ -217,6 +224,7 @@ fn render_json(report: &Report) -> String {
 }
 
 fn classify_violation(message: &str) -> String {
+    // Map stable verifier messages to machine-readable failure categories
     if message.contains("ambiguous") {
         "duplicate_target"
     } else if message.contains("missing from") {

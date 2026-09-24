@@ -16,6 +16,7 @@ mod status;
 mod tests;
 
 pub(crate) fn run() -> Result<(), String> {
+    // Keep all CLI entry points in one dispatcher so hooks and direct commands share behavior
     let mut arguments = env::args().skip(1);
     let command = arguments.next().unwrap_or_else(|| "help".into());
     let rest: Vec<String> = arguments.collect();
@@ -43,14 +44,17 @@ pub(crate) fn run() -> Result<(), String> {
 }
 
 pub(crate) fn initialize_for_agent() -> Result<(), String> {
+    // Agent initialization creates repository state before the first verification
     init::run()
 }
 
 pub(crate) fn verify_for_agent() -> Result<(), String> {
+    // Agent verification always requests the stable machine-readable contract
     check::run(true, true)
 }
 
 fn agent(args: &[String]) -> Result<(), String> {
+    // Route adapter operations while keeping policy evaluation inside Crane
     let operation = args.first().map(String::as_str).unwrap_or("verify");
     let profile = args
         .iter()
@@ -87,6 +91,7 @@ fn agent(args: &[String]) -> Result<(), String> {
 }
 
 fn install_agent_hooks(profile: AgentKind) -> Result<(), String> {
+    // Register project-local hooks so Claude starts Crane as a separate process
     if profile != AgentKind::Claude {
         return Err("automatic hooks are currently supported only for --profile claude".into());
     }
@@ -155,6 +160,7 @@ fn install_agent_hooks(profile: AgentKind) -> Result<(), String> {
 }
 
 fn run_agent_hook(event: &str, profile: AgentKind) -> Result<(), String> {
+    // Map Claude lifecycle events to context loading or independent verification
     if profile != AgentKind::Claude {
         return Err("automatic hooks are currently supported only for --profile claude".into());
     }
@@ -168,15 +174,18 @@ fn run_agent_hook(event: &str, profile: AgentKind) -> Result<(), String> {
 }
 
 fn verify_for_hook() -> Result<(), String> {
+    // Prefix hook failures so main can return Claude's blocking exit code
     verify_for_agent().map_err(|error| format!("HOOK_BLOCK:{error}"))
 }
 
 fn version() -> Result<(), String> {
+    // Report the package version compiled into this executable
     println!("crane {}", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
 
 fn help() -> Result<(), String> {
+    // Keep the command contract discoverable without requiring repository setup
     println!(
         r#"Crane MVP
 

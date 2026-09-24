@@ -18,6 +18,7 @@ pub(crate) enum Resolution {
 }
 
 pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
+    // Select a parser from the source extension and fail closed for unknown languages
     match Path::new(path)
         .extension()?
         .to_str()?
@@ -33,6 +34,7 @@ pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
 }
 
 pub(crate) fn supported_extensions() -> &'static str {
+    // Keep supported-language diagnostics aligned with parser selection
     ".java, .js, .jsx, .mjs, .cjs, .py, .rs"
 }
 
@@ -41,6 +43,7 @@ pub(crate) fn extract_functions(
     path: &str,
     target: &str,
 ) -> Result<Vec<String>, String> {
+    // Resolve target nodes and reduce each node to canonical non-comment tokens
     let language = language(path).ok_or_else(|| "unsupported source language".to_string())?;
     let mut parser = Parser::new();
     parser
@@ -62,6 +65,7 @@ pub(crate) fn extract_functions(
     let separator = if target.contains("::") { "::" } else { "." };
     let bytes = source.as_bytes();
 
+    // Walk the syntax tree and collect every exact qualified target match
     fn visit(
         node: Node,
         wanted: &str,
@@ -109,7 +113,9 @@ pub(crate) fn extract_functions(
         }
     }
 
+    // Ignore formatting and comments while retaining token order and spelling
     fn canonical_source_node(node: Node, bytes: &[u8]) -> String {
+        // Leaves are separated with a sentinel so adjacent tokens stay distinct
         fn append_tokens(node: Node, bytes: &[u8], output: &mut String) {
             if node.kind().contains("comment") {
                 return;
@@ -144,10 +150,12 @@ pub(crate) fn extract_functions(
 }
 
 fn supported(path: &str) -> bool {
+    // Identify files that Crane can parse for target resolution
     language(path).is_some()
 }
 
 fn source_candidate(path: &str) -> bool {
+    // Track recognizable but unsupported source files for fail-closed diagnostics
     matches!(
         Path::new(path).extension().and_then(|value| value.to_str()),
         Some(
@@ -172,6 +180,7 @@ fn source_candidate(path: &str) -> bool {
 }
 
 pub(crate) fn resolve_worktree(target: &str) -> Result<Resolution, String> {
+    // Scan the current worktree while excluding generated and Crane metadata
     let mut stack = vec![env::current_dir().map_err(io_error)?];
     let mut unsupported = false;
     let mut supported_seen = false;
@@ -215,6 +224,7 @@ pub(crate) fn resolve_worktree(target: &str) -> Result<Resolution, String> {
 }
 
 pub(crate) fn resolve_git(commit: &str, target: &str) -> Result<Resolution, String> {
+    // Resolve the same target from an immutable Git commit for baseline comparison
     ensure_commit(commit)?;
     let files = git(&["ls-tree", "-r", "--name-only", commit])?;
     let mut unsupported = false;

@@ -5,11 +5,13 @@ use crate::model::{Policy, Rule};
 use crate::util::{io_error, validate_function_target, validate_identifier};
 
 pub(crate) fn parse_file(path: &Path) -> Result<Policy, String> {
+    // Read one policy file and preserve its path in parse errors
     parse(&fs::read_to_string(path).map_err(io_error)?)
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 pub(crate) fn parse(content: &str) -> Result<Policy, String> {
+    // Parse the intentionally small v0.1 language and reject unknown statements
     let mut name = None;
     let mut checkpoint = None;
     let mut rules = Vec::new();
@@ -74,6 +76,7 @@ pub(crate) fn parse(content: &str) -> Result<Policy, String> {
 }
 
 pub(crate) fn print(policy: &Policy) {
+    // Display parsed policy fields for the parse command
     println!("Policy: {}\nCheckpoint: {}", policy.name, policy.checkpoint);
     for rule in &policy.rules {
         let Rule::PreserveFunction { target } = rule;
