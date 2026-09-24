@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::Path;
 
 use crate::adapter::{adapter, AgentKind};
@@ -59,6 +60,16 @@ fn agent(args: &[String]) -> Result<(), String> {
     let selected = AgentKind::parse(profile)?;
     let adapter = adapter(selected);
     match operation {
+        "install" => install_agent_hooks(selected),
+        "hook" => {
+            let event = args
+                .iter()
+                .position(|argument| argument == "--event")
+                .and_then(|index| args.get(index + 1))
+                .map(String::as_str)
+                .ok_or("agent hook requires --event session-start|user-prompt-submit|post-tool-use|stop")?;
+            run_agent_hook(event, selected)
+        }
         "init" => {
             adapter.initialize()?;
             println!(
@@ -73,6 +84,91 @@ fn agent(args: &[String]) -> Result<(), String> {
             "unknown agent operation '{operation}'; use 'crane agent init' or 'crane agent verify'"
         )),
     }
+}
+
+fn install_agent_hooks(profile: AgentKind) -> Result<(), String> {
+    if profile != AgentKind::Claude {
+        return Err("automatic hooks are currently supported only for --profile claude".into());
+    }
+
+    let directory = Path::new(".claude");
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let path = directory.join("settings.local.json");
+    if path.exists() {
+        return Err(format!(
+            "{} already exists; review it and merge the Crane hooks manually, or remove it before reinstalling",
+            path.display()
+        ));
+    }
+    let settings = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crane agent hook --event session-start --profile claude"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crane agent hook --event user-prompt-submit --profile claude"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crane agent hook --event post-tool-use --profile claude"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "crane agent hook --event stop --profile claude"
+          }
+        ]
+      }
+    ]
+  }
+}
+"#;
+    fs::write(&path, settings)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    println!("Installed Claude Code hooks in {}", path.display());
+    println!("The hooks use the Crane executable available on PATH.");
+    Ok(())
+}
+
+fn run_agent_hook(event: &str, profile: AgentKind) -> Result<(), String> {
+    if profile != AgentKind::Claude {
+        return Err("automatic hooks are currently supported only for --profile claude".into());
+    }
+    match event {
+        "session-start" => context::run(),
+        "user-prompt-submit" | "post-tool-use" | "stop" => verify_for_hook(),
+        _ => Err(format!(
+            "unknown hook event '{event}'; use session-start, user-prompt-submit, post-tool-use, or stop"
+        )),
+    }
+}
+
+fn verify_for_hook() -> Result<(), String> {
+    verify_for_agent().map_err(|error| format!("HOOK_BLOCK:{error}"))
 }
 
 fn version() -> Result<(), String> {
@@ -93,6 +189,8 @@ Commands:
   check --agent
   agent init [--profile generic|claude|codex]
   agent verify [--profile generic|claude|codex]
+  agent install --profile claude
+  agent hook --event session-start|user-prompt-submit|post-tool-use|stop --profile claude
   test-all
   context
   status

@@ -18,6 +18,7 @@ It also implements the Git-backed workflow discussed during design:
 - `crane check --agent`
 - `crane agent init`
 - `crane agent verify`
+- `crane agent install --profile claude`
 - `crane status`
 
 ## Core idea
@@ -158,6 +159,40 @@ the same adapter commands through its normal tool interface. Profile names
 provide a stable integration contract today and allow host-specific launchers
 to specialize later without duplicating Crane policy semantics.
 
+### Automatic Claude Code hooks
+
+Run this once from an application repository:
+
+```text
+crane init
+crane agent install --profile claude
+```
+
+This creates `.claude/settings.local.json` with project-local hooks and makes
+Crane run automatically:
+
+- `SessionStart` prints the deterministic policy context to Claude.
+- `UserPromptSubmit` verifies the repository whenever the user submits a
+  prompt, before Claude performs new edits.
+- `PostToolUse` verifies after file-editing tools and returns JSON violations.
+- `Stop` verifies again before Claude finishes and reports any final failure.
+
+The hooks invoke `crane` from `PATH`, so install a pinned Crane release before
+starting Claude Code. On Windows, restart Claude Code after adding the Crane
+directory to `PATH`. Claude Code provides the host lifecycle; Crane remains
+the independent verifier. Hook output and its non-zero exit status are passed
+back to Claude Code, which can repair the reported violation and retry without
+the user repeating a Crane instruction.
+
+A blocked prompt/edit/stop hook exits with status `2`, the Claude Code hook
+convention for feedback that must be shown to the agent; a passing hook exits
+`0`.
+
+Crane does not overwrite an existing `.claude/settings.local.json`; merge the
+generated hook entries deliberately if that file already exists. The hooks
+never create or move checkpoints, modify policies, or edit source code, and
+they work for every language supported by the verifier.
+
 The agent-check JSON contract is:
 
 ```json
@@ -271,6 +306,13 @@ Crane provides the adapter-facing commands `crane agent init` and
 They do not implement an agent runtime, create checkpoints automatically, or
 duplicate policy semantics.
 
+The Claude adapter is activated by the project-local hook file, not by the
+application CI YAML. Once `crane agent install --profile claude` has created
+`.claude/settings.local.json` and Claude Code is restarted, pasting a prompt
+automatically invokes the `UserPromptSubmit` hook. No Crane command needs to be
+pasted into the Claude conversation. The YAML workflow is a separate CI gate
+that runs on pushes and pull requests.
+
 ## GitHub Actions CI
 
 Crane includes a GitHub Actions workflow at
@@ -348,6 +390,6 @@ This MVP intentionally keeps the implementation narrow:
   function region; formatting and comments are ignored.
 - Duplicate target matches fail closed.
 - Git commit SHA is the immutable baseline; branch is recorded only as metadata.
-- Host-specific agent hooks are not installed by Crane; hosts invoke the
-  adapter commands through their normal tool interfaces.
+- Claude Code project hooks are supported through `crane agent install`; other
+  agent hosts still require their own hook, MCP, or wrapper integration.
 - `deny-read`, `deny-write`, `require-read`, `require-write`, and `static-database` are intentionally not implemented yet.

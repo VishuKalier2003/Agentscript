@@ -34,6 +34,9 @@ pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
     };
     if json || agent {
         print_json(&report);
+        if agent && !report.violations.is_empty() {
+            eprintln!("{}", render_json(&report));
+        }
     } else {
         print_human(&report);
     }
@@ -45,7 +48,7 @@ pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
 }
 
 fn print_error_json(error: &str) {
-    print_json(&Report {
+    let report = Report {
         passes: Vec::new(),
         violations: vec![Violation {
             policy_id: "crane".into(),
@@ -55,7 +58,9 @@ fn print_error_json(error: &str) {
             violation_type: classify_violation(error),
             message: error.into(),
         }],
-    });
+    };
+    print_json(&report);
+    eprintln!("{}", render_json(&report));
 }
 
 fn evaluate() -> Result<Report, String> {
@@ -182,17 +187,21 @@ fn print_human(report: &Report) {
 }
 
 fn print_json(report: &Report) {
+    println!("{}", render_json(report));
+}
+
+fn render_json(report: &Report) -> String {
     let status = if report.violations.is_empty() {
         "passed"
     } else {
         "failed"
     };
-    println!("{{\n  \"status\": \"{status}\",\n  \"violations\": [");
+    let mut output = format!("{{\n  \"status\": \"{status}\",\n  \"violations\": [");
     for (index, violation) in report.violations.iter().enumerate() {
         if index > 0 {
-            println!(",");
+            output.push(',');
         }
-        print!(
+        output.push_str(&format!(
             "    {{\"policy_id\":\"{}\",\"rule\":\"{}\",\"target\":\"{}\",\"checkpoint\":\"{}\",\"violation_type\":\"{}\",\"message\":\"{}\"}}",
             escape_json(&violation.policy_id),
             escape_json(&violation.rule),
@@ -200,10 +209,11 @@ fn print_json(report: &Report) {
             escape_json(&violation.checkpoint),
             escape_json(&violation.violation_type),
             escape_json(&violation.message)
-        );
+        ));
     }
 
-    println!("\n  ]\n}}");
+    output.push_str("\n  ]\n}");
+    output
 }
 
 fn classify_violation(message: &str) -> String {

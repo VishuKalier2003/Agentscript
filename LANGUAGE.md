@@ -143,3 +143,13 @@ violation. The adapter does not edit source, create checkpoints, or repair
 violations. The host agent consumes the returned text, performs its own repair,
 and invokes verification again. A zero exit code is the completion signal for
 the host workflow.
+
+For Claude Code, `crane agent install --profile claude` writes project-local
+`.claude/settings.local.json` hooks. The `SessionStart` hook emits `crane
+context`; `UserPromptSubmit` runs `crane check --agent` for every submitted
+prompt; `PostToolUse` runs it after editing tools; and `Stop` runs the same
+verification before the agent finishes. These hooks are language-neutral and
+invoke the `crane` executable from `PATH`. They do not change policy files,
+checkpoints, or source code. Installation refuses to overwrite an existing
+settings file. A passing hook exits `0`; a blocked prompt/edit/stop hook exits
+`2` and emits the structured verification result.
