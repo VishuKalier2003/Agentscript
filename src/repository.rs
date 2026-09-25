@@ -6,6 +6,11 @@ use std::process::Command;
 use crate::model::Checkpoint;
 use crate::util::{io_error, json_field};
 
+/** Locate the nearest crane directory from the current path
+ * Output
+    - Result<PathBuf, String>
+    - Error if crane init not invoked
+*/
 pub(crate) fn root() -> Result<PathBuf, String> {
     // Locate the nearest initialized Crane directory from the current path
     let mut directory = env::current_dir().map_err(io_error)?;
@@ -23,7 +28,7 @@ pub(crate) fn root() -> Result<PathBuf, String> {
 
 pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
     // Locate a Git repository so init can create its Crane directory
-    let mut directory = env::current_dir().map_err(io_error)?;
+    let mut directory = env::current_dir().map_err(io_error)?;  // ? return error if current_dir fails, else unwraps the value
     let original = directory.clone();
     loop {
         let candidate = directory.join(".crane");
@@ -40,29 +45,32 @@ pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
     Err("not inside a Git repository".into())
 }
 
+// Checks if crane is initialized correctly
 pub(crate) fn ensure_initialized() -> Result<(), String> {
     // Require both Git and a valid Crane configuration before verification
-    let crane_root = root()?;
-    ensure_repo().and_then(|()| validate_config(&crane_root))
+    let crane_root = root()?;       // ? to indicate if success provide PathBuf, else return the error immediately
+    ensure_repo().and_then(|()| validate_config(&crane_root))   // lambda chaining, |x| x+1
 }
 
 fn validate_config(crane_root: &Path) -> Result<(), String> {
     // Reject configuration syntax that v0.1 does not understand
     let path = crane_root.join("config.toml");
+    // safe check if config.toml doesn't exist, still count the config as validated
     if !path.exists() {
-        return Ok(());
+        return Ok(());      // Unit value () indicates success, no value to return
     }
     let content = fs::read_to_string(&path).map_err(io_error)?;
-    if content.lines().any(|line| {
+    if content.lines().any(|line| {     // lambda call
         let line = line.trim();
         !line.is_empty() && !line.starts_with('#')
     }) {
+        // Currently we make config.toml as empty, we will decide what to do later
         return Err(format!(
-            "invalid Crane configuration at {}; v0.1 config accepts only blank lines and comments",
+            "invalid Crane configuration at {}; v0.1.5 config accepts only blank lines and comments",
             path.display()
         ));
     }
-    Ok(())
+    Ok(())      // safe check, if there are no errors
 }
 
 pub(crate) fn ensure_repo() -> Result<(), String> {

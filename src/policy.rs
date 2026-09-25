@@ -11,7 +11,7 @@ pub(crate) fn parse_file(path: &Path) -> Result<Policy, String> {
 }
 
 pub(crate) fn parse(content: &str) -> Result<Policy, String> {
-    // Parse the intentionally small v0.1 language and reject unknown statements
+    // Parse the intentionally small v0.1.5 language and reject unknown statements
     let mut name = None;
     let mut checkpoint = None;
     let mut rules = Vec::new();

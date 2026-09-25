@@ -68,11 +68,12 @@ fn print_error_json(error: &str) {
 fn evaluate() -> Result<Report, String> {
     // Parse policies in deterministic order before evaluating each rule independently
     let directory = root()?.join("policies");
+    // Read all files in the policies directory, converts to vector of paths
     let mut paths = fs::read_dir(directory)
         .map_err(io_error)?
         .map(|entry| entry.map(|value| value.path()).map_err(io_error))
         .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();
+    paths.sort();       // gives deterministic order, preventing any ambiguity
     let mut policies = Vec::new();
     let mut policy_errors = Vec::new();
     for path in paths {

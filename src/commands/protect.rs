@@ -20,7 +20,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             return Err(format!(
             "could not resolve '{target}' in current working tree; supported source extensions: {}",
             supported_extensions()
-        ))
+            ))
         }
         Resolution::Duplicate(count) => {
             return Err(format!(
@@ -63,7 +63,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         ));
     }
     let root = root()?;
-    fs::write(
+    fs::write(      // Create the file
         root.join("policies").join(format!("{policy_name}.crane")),
         format!(
             "policy {policy_name} {{\n    checkpoint {checkpoint_name}\n    preserve --function {target}\n}}\n"

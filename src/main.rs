@@ -1,3 +1,4 @@
+// fetch the necessary modules
 mod adapter;
 mod commands;
 mod model;

@@ -34,6 +34,7 @@ pub(crate) fn validate_function_target(value: &str) -> Result<(), String> {
     }
 }
 
+// Returning the next value after the --function key
 pub(crate) fn option(args: &[String], key: &str) -> Option<String> {
     // Read simple key-value CLI options without introducing a second parser layer
     args.windows(2)

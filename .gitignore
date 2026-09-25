@@ -1,2 +1,4 @@
 .crane/checkpoints/
 target/
+.vscode/
+.claude/

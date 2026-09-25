@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use crate::adapter::{adapter, AgentKind};
+use crate::adapter::{adapter, AgentKind};   // binary compilation of the project is termed as crate, here using the adapter.rs file
 
 mod check;
 mod checkpoint;
@@ -12,20 +12,21 @@ mod parse;
 mod protect;
 mod status;
 
-#[cfg(test)]
+#[cfg(test)]  // Compile the module only when running tests, not in production builds
 mod tests;
 
+// like a gateway, where the commands are checked and redirected to the appropriate function
 pub(crate) fn run() -> Result<(), String> {
     // Keep all CLI entry points in one dispatcher so hooks and direct commands share behavior
-    let mut arguments = env::args().skip(1);
+    let mut arguments = env::args().skip(1);  // Keeping arguments mutable since iterator uses pointer and loc may shift
     let command = arguments.next().unwrap_or_else(|| "help".into());
-    let rest: Vec<String> = arguments.collect();
+    let rest: Vec<String> = arguments.collect();    // converts one collection to another, here Iterator to vector
     match command.as_str() {
         "help" => help(),
         "--version" | "-V" | "version" => version(),
-        "init" => init::run(),
-        "checkpoint" => checkpoint::run(&rest),
-        "protect" => protect::run(&rest),
+        "init" => init::run(),    // creates the metadata directories at root level
+        "checkpoint" => checkpoint::run(&rest),   // creates checkpoint metadata for the current git commit
+        "protect" => protect::run(&rest),   // command line for the preserve --function call
         "parse" => {
             let path = rest.first().ok_or("parse requires a .crane file")?;
             parse::run(Path::new(path))
