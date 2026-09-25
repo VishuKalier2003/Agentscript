@@ -139,7 +139,11 @@ fn claude_pre_tool_hook_blocks_crane_metadata_edits() {
         r#"{"tool_name":"mcp__fs__write_file","tool_input":{"path":"./.crane/config.toml"}}"#,
     ];
     for payload in blocked {
-        assert_eq!(pre_tool_hook(&directory, payload).status.code(), Some(2), "{payload}");
+        assert_eq!(
+            pre_tool_hook(&directory, payload).status.code(),
+            Some(2),
+            "{payload}"
+        );
     }
 
     let allowed = [
@@ -149,7 +153,10 @@ fn claude_pre_tool_hook_blocks_crane_metadata_edits() {
         r#"{"tool_name":"Write","tool_input":{"file_path":"src/my.crane"}}"#,
     ];
     for payload in allowed {
-        assert!(pre_tool_hook(&directory, payload).status.success(), "{payload}");
+        assert!(
+            pre_tool_hook(&directory, payload).status.success(),
+            "{payload}"
+        );
     }
     fs::remove_dir_all(directory).unwrap();
 }
@@ -165,7 +172,10 @@ fn claude_hooks_do_not_loop_on_human_only_failures() {
     git(&directory, &["init", "-q"]);
     assert!(crane(&directory, &["init"]).status.success());
     fs::write(
-        directory.join(".crane").join("policies").join("broken.crane"),
+        directory
+            .join(".crane")
+            .join("policies")
+            .join("broken.crane"),
         "policy broken {\n preserve --function\n",
     )
     .unwrap();
@@ -203,7 +213,14 @@ fn claude_hooks_do_not_loop_on_human_only_failures() {
 fn pre_tool_hook(directory: &std::path::Path, payload: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_crane"))
-        .args(["agent", "hook", "--event", "pre-tool-use", "--profile", "claude"])
+        .args([
+            "agent",
+            "hook",
+            "--event",
+            "pre-tool-use",
+            "--profile",
+            "claude",
+        ])
         .current_dir(directory)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

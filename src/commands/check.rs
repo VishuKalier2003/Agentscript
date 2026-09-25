@@ -192,7 +192,7 @@ fn evaluate() -> Result<Report, String> {
         .map_err(io_error)?
         .map(|entry| entry.map(|value| value.path()).map_err(io_error))
         .collect::<Result<Vec<_>, _>>()?;
-    paths.sort();       // gives deterministic order, preventing any ambiguity
+    paths.sort(); // gives deterministic order, preventing any ambiguity
     let mut policies = Vec::new();
     let mut policy_errors = Vec::new();
     for path in paths {
@@ -226,7 +226,8 @@ fn evaluate() -> Result<Report, String> {
     };
     for policy in policies {
         for rule in policy.rules {
-            match rule {        // Match the policy with the rule
+            match rule {
+                // Match the policy with the rule
                 Rule::PreserveFunction { target } => {
                     let checkpoint_name = policy.checkpoint.clone();
                     let result = verify_function(&policy.name, &checkpoint_name, &target);
@@ -248,7 +249,7 @@ fn evaluate() -> Result<Report, String> {
             }
         }
     }
-    Ok(report)      // Pass the completed report
+    Ok(report) // Pass the completed report
 }
 
 /** Check that one protected function is unchanged, by first loading the checkpoint and confirming

@@ -40,7 +40,8 @@ pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
         .to_str()?
         .to_ascii_lowercase()
         .as_str()
-    {       // Define the tree sitter we can use for the language
+    {
+        // Define the tree sitter we can use for the language
         "java" => Some(tree_sitter_java::language()),
         "js" | "jsx" | "mjs" | "cjs" => Some(tree_sitter_javascript::language()),
         "py" => Some(tree_sitter_python::language()),
@@ -130,7 +131,7 @@ pub(crate) fn extract_functions(
             if let Some(name) = node.child_by_field_name("name") {
                 if name.utf8_text(bytes).ok() == Some(wanted) {
                     let mut qualified = Vec::new();
-                    let mut parent = node.parent();     // if found, check the parent for the correct declaration
+                    let mut parent = node.parent(); // if found, check the parent for the correct declaration
                     while let Some(ancestor) = parent {
                         let named = ancestor
                             .child_by_field_name("name")
@@ -149,13 +150,14 @@ pub(crate) fn extract_functions(
                     qualified.reverse();
                     qualified.push(wanted.into());
                     if target.split(separator).count() == 1 || qualified.join(separator) == target {
-                        output.push(canonical_source_node(node, bytes));        // functional cal for canonical code
+                        output.push(canonical_source_node(node, bytes)); // functional cal for canonical code
                     }
                 }
             }
         }
-        let mut cursor = node.walk();       // creating a pointer
-        for child in node.children(&mut cursor) {       // If there are children of this node, base case termination if no children
+        let mut cursor = node.walk(); // creating a pointer
+        for child in node.children(&mut cursor) {
+            // If there are children of this node, base case termination if no children
             visit(child, wanted, target, separator, bytes, output);
         }
     }
@@ -180,18 +182,19 @@ pub(crate) fn extract_functions(
             - None (appends to output)
         */
         fn append_tokens(node: Node, bytes: &[u8], output: &mut String) {
-            if node.kind().contains("comment") {        // comments are skipped
+            if node.kind().contains("comment") {
+                // comments are skipped
                 return;
             }
-            let mut cursor = node.walk();       // creating a new pointer
+            let mut cursor = node.walk(); // creating a new pointer
             let mut has_named_child = false;
             for child in node.children(&mut cursor) {
                 has_named_child = true;
-                append_tokens(child, bytes, output);        // append the data (text)
+                append_tokens(child, bytes, output); // append the data (text)
             }
             if !has_named_child {
                 output.push_str(&String::from_utf8_lossy(&bytes[node.byte_range()]));
-                output.push('\0');      // delimiter for token concatenation x + 1, becomes x\0+\0+1\0
+                output.push('\0'); // delimiter for token concatenation x + 1, becomes x\0+\0+1\0
             }
         }
 
@@ -201,7 +204,8 @@ pub(crate) fn extract_functions(
     }
 
     let mut output = Vec::new();
-    visit(      // Recursively called in the function
+    visit(
+        // Recursively called in the function
         tree.root_node(),
         wanted,
         target,

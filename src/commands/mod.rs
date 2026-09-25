@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::adapter::{adapter, AgentKind};   // binary compilation of the project is termed as crate, here using the adapter.rs file
+use crate::adapter::{adapter, AgentKind}; // binary compilation of the project is termed as crate, here using the adapter.rs file
 use serde_json::Value;
 
 mod check;
@@ -14,7 +14,7 @@ mod parse;
 mod protect;
 mod status;
 
-#[cfg(test)]  // Compile the module only when running tests, not in production builds
+#[cfg(test)] // Compile the module only when running tests, not in production builds
 mod tests;
 
 /** Act as the gateway for every CLI command, by first reading the command name from the process
@@ -28,15 +28,15 @@ mod tests;
 */
 pub(crate) fn run() -> Result<(), String> {
     // Keep all CLI entry points in one dispatcher so hooks and direct commands share behavior
-    let mut arguments = env::args().skip(1);  // Keeping arguments mutable since iterator uses pointer and loc may shift
+    let mut arguments = env::args().skip(1); // Keeping arguments mutable since iterator uses pointer and loc may shift
     let command = arguments.next().unwrap_or_else(|| "help".into());
-    let rest: Vec<String> = arguments.collect();    // converts one collection to another, here Iterator to vector
+    let rest: Vec<String> = arguments.collect(); // converts one collection to another, here Iterator to vector
     match command.as_str() {
         "help" => help(),
         "--version" | "-V" | "version" => version(),
-        "init" => init::run(),    // creates the metadata directories at root level
-        "checkpoint" => checkpoint::run(&rest),   // creates checkpoint metadata for the current git commit
-        "protect" => protect::run(&rest),   // command line for the preserve --function call
+        "init" => init::run(), // creates the metadata directories at root level
+        "checkpoint" => checkpoint::run(&rest), // creates checkpoint metadata for the current git commit
+        "protect" => protect::run(&rest),       // command line for the preserve --function call
         "parse" => {
             let path = rest.first().ok_or("parse requires a .crane file")?;
             parse::run(Path::new(path))

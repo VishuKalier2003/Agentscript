@@ -40,7 +40,7 @@ pub(crate) fn root() -> Result<PathBuf, String> {
 */
 pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
     // Locate a Git repository so init can create its Crane directory
-    let mut directory = env::current_dir().map_err(io_error)?;  // ? return error if current_dir fails, else unwraps the value
+    let mut directory = env::current_dir().map_err(io_error)?; // ? return error if current_dir fails, else unwraps the value
     let original = directory.clone();
     loop {
         let candidate = directory.join(".crane");
@@ -67,8 +67,8 @@ pub(crate) fn root_allow_missing() -> Result<PathBuf, String> {
 */
 pub(crate) fn ensure_initialized() -> Result<(), String> {
     // Require both Git and a valid Crane configuration before verification
-    let crane_root = root()?;       // ? to indicate if success provide PathBuf, else return the error immediately
-    ensure_repo().and_then(|()| validate_config(&crane_root))   // lambda chaining, |x| x+1
+    let crane_root = root()?; // ? to indicate if success provide PathBuf, else return the error immediately
+    ensure_repo().and_then(|()| validate_config(&crane_root)) // lambda chaining, |x| x+1
 }
 
 /** Validate the reserved config.toml file, by treating a missing file as valid and otherwise
@@ -84,10 +84,11 @@ fn validate_config(crane_root: &Path) -> Result<(), String> {
     let path = crane_root.join("config.toml");
     // safe check if config.toml doesn't exist, still count the config as validated
     if !path.exists() {
-        return Ok(());      // Unit value () indicates success, no value to return
+        return Ok(()); // Unit value () indicates success, no value to return
     }
     let content = fs::read_to_string(&path).map_err(io_error)?;
-    if content.lines().any(|line| {     // lambda call
+    if content.lines().any(|line| {
+        // lambda call
         let line = line.trim();
         !line.is_empty() && !line.starts_with('#')
     }) {
@@ -97,7 +98,7 @@ fn validate_config(crane_root: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    Ok(())      // safe check, if there are no errors
+    Ok(()) // safe check, if there are no errors
 }
 
 /** Confirm the current directory belongs to a Git repository, by running

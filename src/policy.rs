@@ -68,7 +68,8 @@ pub(crate) fn parse(content: &str) -> Result<Policy, String> {
             }
             validate_identifier(value.trim())?;
             checkpoint = Some(value.trim().into());
-        } else if let Some(value) = line.strip_prefix("preserve --function ") {     // For preserve --function added a rule
+        } else if let Some(value) = line.strip_prefix("preserve --function ") {
+            // For preserve --function added a rule
             validate_function_target(value.trim())?;
             rules.push(Rule::PreserveFunction {
                 target: value.trim().into(),
