@@ -4,6 +4,15 @@ use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root
 use crate::resolver::{resolve_git, resolve_worktree, supported_extensions, Resolution};
 use crate::util::{io_error, option, sanitize, validate_function_target};
 
+/** Create a preserve policy for a function, by first reading and validating --function, --policy,
+ * and --checkpoint, then resolving the target in both the worktree and the checkpoint commit,
+ * requiring the two to match exactly, and finally writing the policy file to .crane/policies
+ * Input
+    - args: &[String] - command arguments with --function TARGET and optional --policy, --checkpoint
+ * Output
+    - Result<(), String>
+    - Error if the target cannot be resolved uniquely or differs from the checkpoint
+*/
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     // Create a preserve policy only when current code matches its checkpoint
     ensure_initialized()?;

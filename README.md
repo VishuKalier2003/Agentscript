@@ -188,6 +188,23 @@ A blocked prompt/edit/stop hook exits with status `2`, the Claude Code hook
 convention for feedback that must be shown to the agent; a passing hook exits
 `0`.
 
+Each violation carries a `repair_owner`. Only worktree source problems are
+`agent`-repairable; malformed policies, checkpoint errors, and setup errors are
+`human`, because fixing them requires editing `.crane`. Hooks block only on
+`agent` violations. When every remaining violation is `human`, the hooks exit
+`0` with a `systemMessage` warning the user and context telling Claude not to
+retry, so a broken policy cannot trap the agent in an endless repair loop.
+`crane check` and `crane agent verify` still fail, so CI stays strict.
+
+`PreToolUse` protects the verifier itself. It blocks any non-read-only tool
+call that targets `.crane`, `.claude/settings.json`, or
+`.claude/settings.local.json`, and any shell command that runs
+`crane checkpoint`, `crane protect`, `crane init`, or
+`crane agent init|install`, since re-baselining would hide a violation. The
+installed settings also add matching `permissions.deny` `Edit` rules. Shell
+inspection is best-effort pattern matching; treat it as a guard rail and keep
+`.crane` changes under human code review.
+
 Crane does not overwrite an existing `.claude/settings.local.json`; merge the
 generated hook entries deliberately if that file already exists. The hooks
 never create or move checkpoints, modify policies, or edit source code, and
@@ -204,6 +221,8 @@ The agent-check JSON contract is:
       "rule": "preserve",
       "target": "PaymentService.charge",
       "checkpoint": "baseline",
+      "violation_type": "source_changed",
+      "repair_owner": "agent",
       "message": "Protected function was modified."
     }
   ]

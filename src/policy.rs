@@ -4,12 +4,30 @@ use std::path::Path;
 use crate::model::{Policy, Rule};
 use crate::util::{io_error, validate_function_target, validate_identifier};
 
+/** Parse a single .crane policy file from disk, by first reading the whole file into a string and
+ * then handing the content to parse, prefixing any parse error with the file path for diagnostics
+ * Input
+    - path: &Path - location of the .crane policy file
+ * Output
+    - Result<Policy, String>
+    - Error if the file cannot be read or its content is not a valid policy
+*/
 pub(crate) fn parse_file(path: &Path) -> Result<Policy, String> {
     // Read one policy file and preserve its path in parse errors
     parse(&fs::read_to_string(path).map_err(io_error)?)
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/** Parse policy source text into a Policy, by walking the lines in order while skipping blanks,
+ * requiring the first line to be "policy NAME {", then accepting one checkpoint statement and any
+ * number of preserve --function rules until the closing "}", and finally rejecting unclosed blocks,
+ * trailing content, unknown statements, empty rule lists, and a missing checkpoint
+ * Input
+    - content: &str - full text of a policy file
+ * Output
+    - Result<Policy, String>
+    - Error with the offending line number if the policy is malformed
+*/
 pub(crate) fn parse(content: &str) -> Result<Policy, String> {
     // Parse the intentionally small v0.1.5 language and reject unknown statements
     let mut name = None;
@@ -50,7 +68,7 @@ pub(crate) fn parse(content: &str) -> Result<Policy, String> {
             }
             validate_identifier(value.trim())?;
             checkpoint = Some(value.trim().into());
-        } else if let Some(value) = line.strip_prefix("preserve --function ") {
+        } else if let Some(value) = line.strip_prefix("preserve --function ") {     // For preserve --function added a rule
             validate_function_target(value.trim())?;
             rules.push(Rule::PreserveFunction {
                 target: value.trim().into(),
@@ -75,6 +93,13 @@ pub(crate) fn parse(content: &str) -> Result<Policy, String> {
     })
 }
 
+/** Print a parsed policy for the parse command, by first writing the policy name and checkpoint
+ * and then looping through the rules to print each preserve target
+ * Input
+    - policy: &Policy - an already parsed policy
+ * Output
+    - None (writes to stdout)
+*/
 pub(crate) fn print(policy: &Policy) {
     // Display parsed policy fields for the parse command
     println!("Policy: {}\nCheckpoint: {}", policy.name, policy.checkpoint);

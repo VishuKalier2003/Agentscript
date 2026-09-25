@@ -5,6 +5,15 @@ use crate::policy::parse_file;
 use crate::repository::{ensure_initialized, root};
 use crate::util::io_error;
 
+/** Print policy context for an agent session, by first confirming Crane is initialized, then
+ * parsing every .crane file in the policies directory, sorting them by name, and finally printing
+ * each policy's checkpoint and preserve targets in a stable CRANE_CONTEXT_V1 format
+ * Input
+    - None
+ * Output
+    - Result<(), String>
+    - Error if not initialized or any policy fails to parse
+*/
 pub(crate) fn run() -> Result<(), String> {
     // Emit deterministic policy context that an agent can consume at session start
     ensure_initialized()?;

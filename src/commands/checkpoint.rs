@@ -4,6 +4,15 @@ use crate::model::Checkpoint;
 use crate::repository::{checkpoint_json, ensure_repo, git, root};
 use crate::util::{io_error, now_unix, option, validate_identifier};
 
+/** Record the current Git HEAD as a trusted baseline, by first validating the --name option
+ * (default baseline), then reading HEAD and the current branch from Git, and finally writing the
+ * checkpoint JSON to .crane/checkpoints/NAME.json
+ * Input
+    - args: &[String] - command arguments, optionally --name NAME
+ * Output
+    - Result<(), String>
+    - Error if not initialized, the name is invalid, HEAD is unavailable, or the file cannot be written
+*/
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     // Record an explicit Git commit as the trusted baseline for future checks
     ensure_repo()?;

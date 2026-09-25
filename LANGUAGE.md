@@ -115,6 +115,7 @@ The JSON object always has:
       "target": "PaymentService.charge",
       "checkpoint": "baseline",
       "violation_type": "source_changed",
+      "repair_owner": "agent",
       "message": "Protected function was modified."
     }
   ]
@@ -122,9 +123,11 @@ The JSON object always has:
 ```
 
 `violations` is empty on success. On failure it is deterministically ordered
-by policy path/name and rule order. Every violation contains all six stable
+by policy path/name and rule order. Every violation contains all seven stable
 fields; setup-level failures use `policy_id` `crane` and empty target and
-checkpoint fields.
+checkpoint fields. `repair_owner` is `agent` for worktree source problems and
+`human` for policy, checkpoint, and setup failures that require editing
+`.crane`.
 
 ## Agent adapter contract
 

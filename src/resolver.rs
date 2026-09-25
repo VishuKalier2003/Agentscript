@@ -8,6 +8,14 @@ use crate::model::SourceTarget;
 use crate::repository::{ensure_commit, git};
 use crate::util::io_error;
 
+/** Outcome of looking up a target in the worktree or a checkpoint commit
+ * Variants
+    - Found(SourceTarget) - exactly one matching definition
+    - Missing - no match in any supported file
+    - Duplicate(usize) - more than one match, with the count
+    - Unsupported - no match, and only unsupported source languages were present
+    - ParseFailure(String) - a supported file failed to parse, with the file and error
+*/
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Resolution {
     Found(SourceTarget),
@@ -17,6 +25,14 @@ pub(crate) enum Resolution {
     ParseFailure(String),
 }
 
+/** Select the tree-sitter grammar for a source file, by reading the path's extension, lowercasing
+ * it, and matching it against the supported languages
+ * Input
+    - path: &str - source file path
+ * Output
+    - Option<tree_sitter::Language>
+    - None if the extension is missing or unsupported
+*/
 pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
     // Select a parser from the source extension and fail closed for unknown languages
     match Path::new(path)
@@ -33,12 +49,30 @@ pub(crate) fn language(path: &str) -> Option<tree_sitter::Language> {
     }
 }
 
+/** List the supported source extensions for diagnostics, by returning a fixed string kept in sync
+ * with language
+ * Input
+    - None
+ * Output
+    - &'static str of comma-separated extensions
+*/
 pub(crate) fn supported_extensions() -> &'static str {
     // Keep supported-language diagnostics aligned with parser selection
     ".java, .js, .jsx, .mjs, .cjs, .py, .rs"
 }
 
-// Finding the function in the current worktree and the checkpoint, and comparing them. If they are different, return an error.
+/** Find every definition matching a target in one source file, by first parsing the source with the
+ * grammar for its extension and rejecting trees with parse errors, then splitting the target into
+ * its final function name and separator, and finally walking the syntax tree to collect each
+ * matching definition as a canonical token string
+ * Input
+    - source: &str - file contents
+    - path: &str - file path, used to pick the language
+    - target: &str - qualified target such as Type.method or Type::method
+ * Output
+    - Result<Vec<String>, String> with one canonical snippet per match
+    - Error if the language is unsupported or the source does not parse
+*/
 pub(crate) fn extract_functions(
     source: &str,
     path: &str,
@@ -66,7 +100,19 @@ pub(crate) fn extract_functions(
     let separator = if target.contains("::") { "::" } else { "." };
     let bytes = source.as_bytes();
 
-    // Walk the syntax tree and collect every exact qualified target match, can be function, nodes or other declarations
+    /** Walk the syntax tree and collect every exact qualified target match, by checking whether the
+     * node is a function, method, or declaration named like the target, then climbing its ancestors
+     * to build the class/struct/impl qualified name, and finally recursing into every child node
+     * Input
+        - node: Node - current syntax node
+        - wanted: &str - final function name to match
+        - target: &str - full qualified target
+        - separator: &str - "." or "::" used by the target
+        - bytes: &[u8] - source bytes for reading node text
+        - output: &mut Vec<String> - collected canonical snippets
+     * Output
+        - None (appends matches to output)
+    */
     fn visit(
         node: Node,
         wanted: &str,
@@ -114,9 +160,25 @@ pub(crate) fn extract_functions(
         }
     }
 
-    // Ignore formatting and comments while retaining token order and spelling
+    /** Reduce a definition to a canonical token string that ignores formatting and comments, by
+     * collecting its leaf tokens in source order through append_tokens
+     * Input
+        - node: Node - matched definition node
+        - bytes: &[u8] - source bytes
+     * Output
+        - String of tokens separated by \0
+    */
     fn canonical_source_node(node: Node, bytes: &[u8]) -> String {
-        // Leaves are separated with a sentinel so adjacent tokens stay distinct
+        /** Append a node's tokens to the output, by skipping comment nodes, recursing into
+         * children, and writing each leaf's text followed by a \0 sentinel so adjacent tokens stay
+         * distinct
+         * Input
+            - node: Node - current syntax node
+            - bytes: &[u8] - source bytes
+            - output: &mut String - canonical token buffer
+         * Output
+            - None (appends to output)
+        */
         fn append_tokens(node: Node, bytes: &[u8], output: &mut String) {
             if node.kind().contains("comment") {        // comments are skipped
                 return;
@@ -150,11 +212,25 @@ pub(crate) fn extract_functions(
     Ok(output)
 }
 
+/** Check whether Crane can parse a file, by asking language for a grammar for its path
+ * Input
+    - path: &str - file path
+ * Output
+    - bool, true if a grammar exists
+*/
 fn supported(path: &str) -> bool {
     // Identify files that Crane can parse for target resolution
     language(path).is_some()
 }
 
+/** Check whether a file looks like source code, supported or not, by matching its extension
+ * against a wider list of common languages so unsupported sources can be reported instead of
+ * silently treated as missing
+ * Input
+    - path: &str - file path
+ * Output
+    - bool, true if the extension is a known source language
+*/
 fn source_candidate(path: &str) -> bool {
     // Track recognizable but unsupported source files for fail-closed diagnostics
     matches!(
@@ -180,6 +256,16 @@ fn source_candidate(path: &str) -> bool {
     )
 }
 
+/** Resolve a target in the current working tree, by walking directories with a stack from the
+ * current directory (skipping .git, .crane, and target), extracting matches from every supported
+ * file, and finally classifying the result as found, missing, duplicate, or unsupported
+ * Input
+    - target: &str - qualified function target
+ * Output
+    - Result<Resolution, String>
+    - ParseFailure resolution if a supported file does not parse
+    - Error if a directory or file cannot be read
+*/
 pub(crate) fn resolve_worktree(target: &str) -> Result<Resolution, String> {
     // Scan the current worktree while excluding generated and Crane metadata
     let mut stack = vec![env::current_dir().map_err(io_error)?];
@@ -224,7 +310,17 @@ pub(crate) fn resolve_worktree(target: &str) -> Result<Resolution, String> {
     }
 }
 
-// Solves the issue of what did the protected function look like at the given checkpoint
+/** Resolve what a protected target looked like at a checkpoint commit, by first confirming the
+ * commit exists, then listing its files with git ls-tree, reading each supported file with git
+ * show, extracting matches, and finally classifying the result like resolve_worktree
+ * Input
+    - commit: &str - checkpoint commit SHA
+    - target: &str - qualified function target
+ * Output
+    - Result<Resolution, String>
+    - ParseFailure resolution if a supported file does not parse
+    - Error if the commit is missing or a Git command fails
+*/
 pub(crate) fn resolve_git(commit: &str, target: &str) -> Result<Resolution, String> {
     // Resolve the same target from an immutable Git commit for baseline comparison
     ensure_commit(commit)?;

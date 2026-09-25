@@ -3,6 +3,15 @@ use std::fs;
 use crate::repository::{ensure_initialized, git, root};
 use crate::util::{io_error, json_field};
 
+/** Print a summary of the repository's Crane state, by first confirming Crane is initialized, then
+ * printing Git HEAD and branch, and finally looping through the checkpoints and policies
+ * directories to list each checkpoint's commit and each policy name
+ * Input
+    - None
+ * Output
+    - Result<(), String>
+    - Error if not initialized, Git fails, or the metadata directories cannot be read
+*/
 pub(crate) fn run() -> Result<(), String> {
     // Summarize repository identity, checkpoints, and policies without evaluating rules
     ensure_initialized()?;
