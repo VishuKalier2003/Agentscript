@@ -2,15 +2,20 @@
 
 Crane is a deliberately small, modular contract language for protecting trusted code from unintended AI-agent changes.
 
-This MVP implements one policy primitive:
+This MVP implements two policy primitives:
 
-- `preserve --function`
+- `preserve` (code must stay the same)
+- `target` (code must be changed, optionally in a given way)
+
+Each rule points at a `--function`, `--data` (the value stored in a
+variable), `--variable` (its whole declaration), `--class`, or `--interface`.
 
 It also implements the Git-backed workflow discussed during design:
 
 - `crane init`
 - `crane checkpoint`
-- `crane protect --function ...`
+- `crane protect --KIND ... [scope SCOPE]`
+- `crane target --KIND ... [scope SCOPE] [change_type CHANGE_TYPE]`
 - `crane parse`
 - `crane check`
 - `crane test-all`
@@ -29,12 +34,33 @@ A policy is an independent, non-recursive module:
 
 ```crane
 policy payment_gateway {
-    checkpoint baseline
-    preserve --function GatewayService.call
+    checkpoint baseline;
+    preserve --function GatewayService.call scope flow;
+    target --function GatewayService.retry change_type logical_bn;
+    preserve --class GatewayConfig;
 }
 ```
 
-The verifier compares the protected function in the checkpoint commit with the current working tree. The model is never the authority that decides whether the contract passed.
+`preserve` requires code to stay the same; `target` requires the agent to
+change it, optionally with a required kind of change: `logical_bn`
+(business logic), `logical_cn` (complexity), `logical_sn` (structure), or
+`semantic` (wording and alignment). See [LANGUAGE.md](LANGUAGE.md#targets).
+
+Every statement ends with `;`. An optional `scope` at the end of a preserve
+statement widens what is protected around the function: `block` (the
+default, just the function), `file`, `flow` (every function it calls and every
+function that calls it), `folder`, or `all`. See [LANGUAGE.md](LANGUAGE.md#scopes).
+`crane protect` accepts the same suffix, and `crane target` accepts both
+`scope` and `change_type`, for example:
+
+```bash
+crane protect --function GatewayService.call scope flow
+crane target --function GatewayService.retry scope file change_type logical_bn
+```
+
+Both options may also be written as flags (`--scope`, `--change-type`).
+
+The verifier compares the protected code in the checkpoint commit with the current working tree. The model is never the authority that decides whether the contract passed.
 
 ## Trust model
 
@@ -44,10 +70,9 @@ commit and the current worktree. An agent may edit files, but it cannot create
 or move a checkpoint through `crane check`, and it cannot turn an uncertain
 resolution into a pass.
 
-`preserve` guarantees equality of the protected function's canonical parsed
-token stream: formatting and comments may change, while code tokens,
-identifiers, literals, operators, modifiers, annotations, and structure remain
-protected. It does not guarantee semantic equivalence, runtime behavior,
+`preserve` guarantees that the protected function's source text is unchanged
+apart from comments, blank lines, and trailing whitespace. Comments may change;
+code, indentation, and line layout remain protected. It does not guarantee semantic equivalence, runtime behavior,
 security, protection of unrelated code, or protection against changes outside
 the resolved function.
 
@@ -188,8 +213,8 @@ A blocked prompt/edit/stop hook exits with status `2`, the Claude Code hook
 convention for feedback that must be shown to the agent; a passing hook exits
 `0`.
 
-Each violation carries a `repair_owner`. Only worktree source problems are
-`agent`-repairable; malformed policies, checkpoint errors, and setup errors are
+Each violation carries a `repair_owner`. Only worktree source problems and
+unmet targets are `agent`-repairable; malformed policies, checkpoint errors, and setup errors are
 `human`, because fixing them requires editing `.crane`. Hooks block only on
 `agent` violations. When every remaining violation is `human`, the hooks exit
 `0` with a `systemMessage` warning the user and context telling Claude not to
@@ -382,8 +407,9 @@ This is not primarily a performance decision. It is a portability, packaging, an
 `preserve --function TARGET` uses a language-neutral qualified name. `TARGET`
 is normally `Type.method` (or a single top-level function name), rather than a
 language-specific signature or source path. Crane detects the parser from the
-file extension and compares the complete syntax node for the function, so
-formatting and comments inside the protected node remain protected as well.
+file extension and compares the complete syntax node for the function with
+only comments removed, using each language's own comment syntax (`#` for
+Python; `//` and `/* */` for Java, JavaScript, and Rust).
 
 The MVP includes tree-sitter grammars for Java (`.java`), JavaScript/JSX
 (`.js`, `.jsx`, `.mjs`, `.cjs`), Python (`.py`), and Rust (`.rs`). Unsupported
@@ -405,8 +431,10 @@ This MVP intentionally keeps the implementation narrow:
 
 - Function resolution is source-based and conservative; overloaded functions
   are not disambiguated by parameters.
-- The check compares canonical parsed tokens from the extracted tree-sitter
-  function region; formatting and comments are ignored.
+- The check compares the extracted tree-sitter function region with comments,
+  blank lines, and trailing whitespace removed; indentation and layout
+  changes fail, so running a code formatter over a protected function
+  requires a new checkpoint.
 - Duplicate target matches fail closed.
 - Git commit SHA is the immutable baseline; branch is recorded only as metadata.
 - Claude Code project hooks are supported through `crane agent install`; other

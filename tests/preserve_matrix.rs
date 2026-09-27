@@ -47,7 +47,7 @@ fn setup(files: &[(&str, &str)], target: &str) -> PathBuf {
     assert!(crane(&directory, &["init"]).contains("Initialized"));
     assert!(crane(&directory, &["checkpoint", "--name", "baseline"]).contains("Created checkpoint"));
     let policy = format!(
-        "policy test_policy {{\n    checkpoint baseline\n    preserve --function {target}\n}}\n"
+        "policy test_policy {{\n    checkpoint baseline;\n    preserve --function {target};\n}}\n"
     );
     fs::write(
         directory.join(".crane").join("policies").join("test.crane"),
@@ -155,11 +155,23 @@ fn preserve_adversarial_matrix() {
             None,
         ),
         (
-            "formatting changed",
+            "indentation changed",
             Box::new(|dir| {
                 fs::write(
                     dir.join("PaymentService.java"),
                     JAVA.replace("        return;", "    return;"),
+                )
+                .unwrap()
+            }),
+            "failed",
+            Some("source_changed"),
+        ),
+        (
+            "blank line added",
+            Box::new(|dir| {
+                fs::write(
+                    dir.join("PaymentService.java"),
+                    JAVA.replacen("        return;", "\n        return;", 1),
                 )
                 .unwrap()
             }),
@@ -236,7 +248,7 @@ fn preserve_fails_closed_for_resolution_and_configuration_errors() {
     let directory = setup(&[("PaymentService.java", JAVA)], "PaymentService.charge");
     fs::write(
         directory.join(".crane").join("policies").join("test.crane"),
-        "policy test_policy {\n checkpoint baseline\n preserve --function PaymentService.charge\n",
+        "policy test_policy {\n checkpoint baseline;\n preserve --function PaymentService.charge;\n",
     )
     .unwrap();
     assert_check(&directory, "failed", Some("malformed_policy"));

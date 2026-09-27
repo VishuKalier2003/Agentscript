@@ -13,6 +13,7 @@ mod init;
 mod parse;
 mod protect;
 mod status;
+mod target;
 
 #[cfg(test)] // Compile the module only when running tests, not in production builds
 mod tests;
@@ -37,6 +38,7 @@ pub(crate) fn run() -> Result<(), String> {
         "init" => init::run(), // creates the metadata directories at root level
         "checkpoint" => checkpoint::run(&rest), // creates checkpoint metadata for the current git commit
         "protect" => protect::run(&rest),       // command line for the preserve --function call
+        "target" => target::run(&rest),         // command line for the target --function call
         "parse" => {
             let path = rest.first().ok_or("parse requires a .crane file")?;
             parse::run(Path::new(path))
@@ -238,11 +240,31 @@ fn run_agent_hook(event: &str, profile: AgentKind) -> Result<(), String> {
     match event {
         "pre-tool-use" => protect_crane_metadata(),
         "session-start" => context::run(),
-        "user-prompt-submit" | "post-tool-use" | "stop" => check::run_hook(event),
+        "user-prompt-submit" | "post-tool-use" => check::run_hook(event, false),
+        "stop" => check::run_hook(event, stop_hook_active()),
         _ => Err(format!(
             "unknown hook event '{event}'; use pre-tool-use, session-start, user-prompt-submit, post-tool-use, or stop"
         )),
     }
+}
+
+/** Read whether Claude Code is already continuing because a stop hook blocked, by parsing the
+ * Stop hook JSON from stdin and reading its stop_hook_active field, treating missing or invalid
+ * input as false
+ * Input
+    - None (hook payload is read from stdin)
+ * Output
+    - bool, true when this stop is a forced retry
+*/
+fn stop_hook_active() -> bool {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        return false;
+    }
+    serde_json::from_str::<Value>(&input)
+        .ok()
+        .and_then(|payload| payload.get("stop_hook_active").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /** Block agent tool calls that would change Crane's own enforcement, by first reading the
@@ -358,7 +380,7 @@ fn runs_mutating_crane(command: &str) -> bool {
             return false;
         }
         match tokens.get(index + 1).copied() {
-            Some("checkpoint" | "protect" | "init") => true,
+            Some("checkpoint" | "protect" | "target" | "init") => true,
             Some("agent") => matches!(tokens.get(index + 2).copied(), Some("init" | "install")),
             _ => false,
         }
@@ -391,7 +413,8 @@ fn help() -> Result<(), String> {
 Commands:
   init
   checkpoint [--name NAME]
-  protect --function TARGET [--policy NAME] [--checkpoint NAME]
+  protect --KIND TARGET [--policy NAME] [--checkpoint NAME] [scope SCOPE]
+  target --KIND TARGET [--policy NAME] [--checkpoint NAME] [scope SCOPE] [change_type CHANGE_TYPE]
   parse FILE
   check [--json]
   check --agent
@@ -403,9 +426,14 @@ Commands:
   context
   status
 
-TARGET is a language-neutral qualified function name, normally Type.method
-(or just function for a top-level function). The source language is inferred
-from the file extension."#
+TARGET is a language-neutral qualified name, normally Type.member
+(or just the name for a top-level item). The source language is inferred
+from the file extension.
+--KIND is --function, --data (a variable's stored value), --variable (its whole declaration),
+--class, or --interface.
+SCOPE is block (default), file, flow, folder, or all.
+CHANGE_TYPE is logical_bn, logical_cn, logical_sn, or semantic (default: any change).
+scope and change_type may also be written as --scope and --change-type."#
     );
     Ok(())
 }

@@ -66,6 +66,35 @@ pub(crate) fn option(args: &[String], key: &str) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
+/** Read an option that may be spelled several ways, such as "scope file" (policy style) or
+ * "--scope file" (flag style), by finding the first argument equal to any of the keys and
+ * returning the argument after it
+ * Input
+    - args: &[String] - command arguments
+    - keys: &[&str] - accepted spellings of the option, the first one used in messages
+    - values: &str - accepted values, shown when the value is missing
+ * Output
+    - Result<Option<String>, String>, None if the option is absent
+    - Error if the option is the last argument and so has no value
+*/
+pub(crate) fn keyword_option(
+    args: &[String],
+    keys: &[&str],
+    values: &str,
+) -> Result<Option<String>, String> {
+    match args
+        .iter()
+        .position(|argument| keys.contains(&argument.as_str()))
+    {
+        None => Ok(None),
+        Some(index) => args
+            .get(index + 1)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("{} requires a value: {values}", keys[0])),
+    }
+}
+
 /** Turn a target into a filesystem-safe name, by mapping each character and replacing anything
  * that is not an ASCII letter or digit with an underscore
  * Input

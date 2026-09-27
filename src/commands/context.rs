@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::model::Rule;
+use crate::model::{ChangeType, Rule};
 use crate::policy::parse_file;
 use crate::repository::{ensure_initialized, root};
 use crate::util::io_error;
@@ -35,8 +35,33 @@ pub(crate) fn run() -> Result<(), String> {
             policy.name, policy.checkpoint
         );
         for rule in policy.rules {
-            let Rule::PreserveFunction { target } = rule;
-            println!("rule: preserve\ntarget: {target}");
+            match rule {
+                Rule::Preserve {
+                    kind,
+                    target,
+                    scope,
+                } => {
+                    println!(
+                        "rule: preserve\nkind: {}\ntarget: {target}\nscope: {}",
+                        kind.noun(),
+                        scope.name()
+                    );
+                }
+                Rule::Target {
+                    kind,
+                    target,
+                    scope,
+                    change_type,
+                } => {
+                    // Targets tell the agent which change its task must make
+                    println!(
+                        "rule: target\nkind: {}\ntarget: {target}\nscope: {}\nchange_type: {}",
+                        kind.noun(),
+                        scope.name(),
+                        change_type.map_or("any", ChangeType::name)
+                    );
+                }
+            }
         }
     }
     println!("\nverification: crane check --agent");

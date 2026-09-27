@@ -46,7 +46,7 @@ fn adapter_initializes_and_returns_repair_feedback() {
             .join(".crane")
             .join("policies")
             .join("payment.crane"),
-        "policy payment {\n checkpoint baseline\n preserve --function PaymentService.charge\n}\n",
+        "policy payment {\n checkpoint baseline;\n preserve --function PaymentService.charge;\n}\n",
     )
     .unwrap();
     fs::write(
@@ -134,6 +134,7 @@ fn claude_pre_tool_hook_blocks_crane_metadata_edits() {
         r#"{"tool_name":"Write","tool_input":{"file_path":".claude/settings.local.json"}}"#,
         r#"{"tool_name":"Bash","tool_input":{"command":"git commit -am wip && crane checkpoint --name baseline"}}"#,
         r#"{"tool_name":"Bash","tool_input":{"command":"./target/release/crane protect --function A.b"}}"#,
+        r#"{"tool_name":"Bash","tool_input":{"command":"crane target --function A.b scope all"}}"#,
         r#"{"tool_name":"Bash","tool_input":{"command":"python -c \"open('.crane/policies/x.crane','w')\""}}"#,
         r#"{"tool_name":"PowerShell","tool_input":{"command":"Remove-Item -Recurse .crane"}}"#,
         r#"{"tool_name":"mcp__fs__write_file","tool_input":{"path":"./.crane/config.toml"}}"#,

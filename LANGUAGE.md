@@ -1,7 +1,8 @@
 # AgentScript v0.1
 
-AgentScript is the policy language consumed by Crane. Version 0.1 has one
-contract primitive: `preserve --function`. It is deliberately non-recursive:
+AgentScript is the policy language consumed by Crane. It has two contract
+primitives, `preserve` and `target`, each applied to a function, data,
+variable, class, or interface. It is deliberately non-recursive:
 there are no imports, inheritance, policy dependencies, macros, composition,
 databases, or other policy primitives.
 
@@ -9,8 +10,12 @@ databases, or other policy primitives.
 
 ```text
 policy payment_service {
-    checkpoint baseline
-    preserve --function PaymentService.charge
+    checkpoint baseline;
+    preserve --function PaymentService.charge;
+    preserve --function PaymentService.refund scope flow;
+    target --function PaymentService.fee scope file change_type logical_bn;
+    preserve --data PaymentService.RATE;
+    preserve --interface Payable;
 }
 ```
 
@@ -19,15 +24,140 @@ The grammar is:
 ```text
 program := policy
 policy := "policy" identifier "{" statement* "}"
-statement := checkpoint_statement | preserve_statement
+statement := (checkpoint_statement | preserve_statement | target_statement) ";"
 checkpoint_statement := "checkpoint" identifier
-preserve_statement := "preserve" "--function" qualified_name
+preserve_statement := "preserve" item qualified_name [ "scope" scope ]
+target_statement := "target" item qualified_name target_option*
+item := "--function" | "--data" | "--variable" | "--class" | "--interface"
+target_option := "scope" scope | "change_type" change_type
+scope := "block" | "file" | "flow" | "folder" | "all"
+change_type := "logical_bn" | "logical_cn" | "logical_sn" | "semantic"
 qualified_name := identifier (("." | "::") identifier)*
 ```
 
+Every statement must end with `;`, one statement per line. The `policy`
+line and the closing `}` must not have a `;`. A missing, doubled, or misplaced
+`;` makes the policy malformed.
+
 Identifiers contain ASCII letters, digits, `_`, or `-`. A policy contains one
-explicit checkpoint and at least one preserve rule. Policy files are stored as
+explicit checkpoint and at least one preserve or target rule. A target's
+`scope` and `change_type` may appear in either order, each at most once;
+`change_type` is case-insensitive. Policy files are stored as
 `.crane` files under `.crane/policies/`.
+
+## Items
+
+The flag after `preserve` or `target` says what kind of code item the rule
+points at; `scope` and `change_type` work the same for every kind:
+
+| Flag | Covers | Java | JavaScript | Python | Rust |
+|---|---|---|---|---|---|
+| `--function` | the function or method | methods, constructors | functions, methods | `def` | `fn` |
+| `--data` | only the value stored in a variable | field/local initializer | `const`/`let`/`var` value | right side of `NAME = value` | `const`/`static`/`let` value |
+| `--variable` | the whole declaration: name, type, modifiers, value | field or local declaration | `const`/`let`/`var` statement | `NAME = value` | `const`/`static`/`let` item |
+| `--class` | the class as a whole, with its fields and methods | `class` | `class` | `class` | `struct`, `enum` |
+| `--interface` | the interface as a whole | `interface` | none | none | `trait` |
+
+`--data` passes when only the declaration around the value changes, such as
+its type or modifiers; `--variable` does not. Targets are qualified by their
+enclosing classes, interfaces, traits, and impl blocks, so a constant in a
+class is `PaymentService.RATE` and a method in an interface is
+`Payable.pay`. Variables are qualified by type, not by function, so a local
+variable assigned more than once, or reused by name in two methods, is
+ambiguous and fails closed with `duplicate_target`.
+
+With `scope flow`, a function's flow follows its calls; the flow of any other
+item starts from the functions that mention its name.
+
+## Scopes
+
+`scope` goes at the end of a preserve statement (or of `crane protect`) and
+sets how much code around the target is protected. It defaults to `block`.
+
+| Scope | Protected code |
+|---|---|
+| `block` | Only the target function's definition: its braces (Java, JavaScript, Rust) or indented block (Python). |
+| `file` | The whole file that defines the target. |
+| `flow` | The target, every function it calls, and every function that calls it, followed transitively in both directions across the codebase. The target may sit anywhere in the flow. The flow is traced first, then every function in it is compared. |
+| `folder` | Every file in the folder that contains the target, including subfolders. |
+| `all` | Every file in the repository. |
+
+`flow` is traced from source by function name: a call to `validate` links to
+every function or method named `validate` in any supported file, so the flow
+can be larger than the runtime call graph but not smaller. Calls through
+function values, reflection, or constructors (`new Foo()`) are not traced. The
+flow is computed separately in the checkpoint and the worktree, so adding a
+new caller or callee also changes the flow and fails the check.
+
+`flow` finds candidate files with `git grep` for the names being traced and
+parses only those, level by level. A syntax error in a file that mentions a
+traced name fails the check with `parse_failure`; a syntax error in a file
+unrelated to the flow does not affect it.
+
+`file`, `folder`, and `all` compare every file Git sees in that area, tracked
+or untracked but not ignored, so adding or deleting a file is a change. Crane
+first compares Git content hashes of the current files with the checkpoint and
+only reads and compares the files whose contents differ. Hashes are computed
+from the file contents on disk, so file timestamps and the
+`assume-unchanged` / `skip-worktree` index flags cannot hide an edit.
+Supported source files are compared with comments removed (see below); any
+other file is compared exactly, apart from line endings. `.crane/` and
+`.claude/` are tooling metadata and are never part of a scope.
+
+## Targets
+
+`preserve` guarantees code did **not** change; `target` guarantees it **did**.
+A target rule passes only when the code covered by its `scope` differs from
+the checkpoint. `scope` takes the same values as for preserve (default
+`block`, the function itself); for `file`, `folder`, and `all` the change may
+be in any file of that area, and for `flow` in any function of the flow.
+
+`change_type` (optional; any change when omitted) requires a particular kind
+of change. Crane measures each unit of code (a function, or a file for the
+file-based scopes) from its syntax tree and never judges intent:
+
+| Measurement | What it captures |
+|---|---|
+| text | the code as written, line endings and trailing spaces normalized |
+| shape | the token sequence without comments, with identifiers numbered by first appearance, so a consistent rename keeps it and a reorder does not |
+| behaviour | the multiset of literals, operators, and called function names |
+| complexity | loop count, maximum loop nesting depth, and branch count |
+
+| `change_type` | Passes when |
+|---|---|
+| `logical_bn` (business) | behaviour differs: a literal, operator, or called function changed |
+| `logical_cn` (complexity) | complexity differs: a loop or branch was added, removed, or nested differently |
+| `logical_sn` (structure) | shape differs but behaviour and complexity do not: statements reordered or restructured |
+| `semantic` (wording and alignment) | text differs but shape and behaviour do not: renames, comments, layout, or non-code files such as documentation |
+
+A change that also touches behaviour, such as replacing a loop with `sum()`,
+satisfies both `logical_cn` and `logical_bn`, but not `logical_sn` or
+`semantic`, which require that behaviour did not change. Renaming a called
+function counts as `logical_bn`, because Crane cannot tell a rename from
+calling a different function.
+
+A target that is not met yet fails with `target_unchanged` (nothing changed)
+or `change_type_mismatch` (the change is of another kind; the message lists
+what was detected). Both are repaired by the agent. In Claude Code hooks they
+are work still to do rather than mistakes: they never block the user's prompt
+or individual edits, where the agent receives them as context, and they
+block only when the agent tries to stop. A stop that Claude Code is already
+retrying because of a stop hook (`stop_hook_active`) is allowed through with
+a warning, so an unreachable target cannot keep the agent in a loop.
+
+Target rules can be written by hand or created with the CLI, which checks
+that the function exists exactly once in the checkpoint before writing the
+policy:
+
+```text
+crane target --function TARGET [--policy NAME] [--checkpoint NAME] [scope SCOPE] [change_type CHANGE_TYPE]
+```
+
+`scope` and `change_type` may also be written as `--scope` and
+`--change-type` (or `--change_type`). The default policy name is
+`target_<function>`. Unlike `crane protect`, the current code is not
+compared with the checkpoint, because a target is expected to change. Agents
+are blocked from running `crane target`, as they are from `crane protect`.
 
 ## Checkpoints and preservation
 
@@ -58,12 +188,21 @@ matches the requested function name and, for qualified targets, its enclosing
 type/implementation name. Exactly one match must exist in the checkpoint and
 exactly one in the worktree. A duplicate target is ambiguous and fails closed.
 
-The comparison is a canonical token stream derived from the parsed source
-node. Whitespace and comment nodes are ignored; identifiers, literals,
-operators, punctuation, modifiers, annotations, and the remaining syntax are
-retained in source order. Thus formatting-only and comment-only changes pass,
-while code-token changes fail. This is not semantic equivalence: different
-token streams that happen to behave similarly are still different.
+The comparison uses the source text of the parsed node with only comments
+removed. A comment is a syntax node that the grammar marks as a comment and
+whose text starts with the language's comment marker: `#` for Python, and `//`
+or `/*` for Java, JavaScript, and Rust (including `///` and `/** */` doc
+comments). Python docstrings are string literals, not comments, so they stay
+protected.
+
+Everything else is compared as written: indentation, spacing within a line,
+and line breaks are significant, because layout can change meaning (Python
+blocks are defined by indentation). Only trailing whitespace, blank lines, and
+CRLF versus LF line endings are ignored, since removing a comment leaves them
+behind and Git may check files out with either line ending. Thus comment-only
+and blank-line changes pass, while re-indentation, re-wrapping, and any code
+change fail. This is not semantic equivalence: code that behaves the same but
+is written differently is still different.
 
 ## Failure semantics
 
@@ -78,11 +217,13 @@ Crane never returns PASS when it cannot establish compliance:
 - unsupported source language: FAIL with `unsupported_language`
 - parser error in a source file being examined: FAIL with `parse_failure`
 - malformed policy: FAIL with `malformed_policy`
+- target not changed: FAIL with `target_unchanged`
+- target changed in the wrong way: FAIL with `change_type_mismatch`
 - invalid `.crane/config.toml`: FAIL with `verification_error` for the
   configuration-level verification result
 
-Formatting-only changes and comment-only changes pass because v0.1 compares
-canonical code tokens. Changes to unrelated functions or unrelated files do
+Comment-only and blank-line changes pass; indentation and other layout
+changes fail with `source_changed`. Changes to unrelated functions or unrelated files do
 not affect a preserve rule.
 
 The current worktree may be dirty: Crane verifies the current files without

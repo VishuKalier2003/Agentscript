@@ -1,19 +1,20 @@
 use std::fs;
 
-use crate::model::{Rule, Violation};
+use crate::model::{ItemKind, Rule, Scope, Violation};
 use crate::policy::parse_file;
 use crate::repository::{ensure_commit, ensure_initialized, load_checkpoint, root};
 use crate::resolver::{resolve_git, resolve_worktree, supported_extensions, Resolution};
+use crate::scope::{verify_scope, verify_target, ScopeContext};
 use crate::util::{escape_json, io_error};
 
 /** A rule that passed, used only for human-readable output
  * Fields
     - policy_id: String - policy the rule belongs to
-    - target: String - protected function that matched its checkpoint
+    - description: String - the rule in policy syntax
 */
 struct Pass {
     policy_id: String,
-    target: String,
+    description: String,
 }
 
 /** Result of evaluating every policy; the check passes only when violations is empty
@@ -69,26 +70,27 @@ pub(crate) fn run(json: bool, agent: bool) -> Result<(), String> {
 }
 
 /** Run verification for a Claude Code hook, by first building a report (turning setup errors into
- * a setup violation), then blocking with HOOK_BLOCK if any violation is agent-repairable, passing
- * silently when there are none, and otherwise printing non-blocking hook JSON so human-only
- * failures cannot trap the agent in a repair loop
+ * a setup violation), then deciding which violations block: agent-repairable violations always
+ * block, except unmet target rules, which are work still to do and block only at stop (and not
+ * on a stop that is already a forced retry, so an unreachable target cannot loop forever);
+ * anything left is reported with non-blocking hook JSON so human-only failures and pending
+ * targets never trap the agent
  * Input
     - event: &str - hook event name (user-prompt-submit, post-tool-use, or stop)
+    - stop_hook_active: bool - Claude Code is already continuing because a stop hook blocked
  * Output
     - Result<(), String>
-    - HOOK_BLOCK error if the agent must repair a violation
+    - HOOK_BLOCK error if the agent must repair a violation now
 */
-pub(crate) fn run_hook(event: &str) -> Result<(), String> {
-    // Block the agent only for violations it can repair; human-only failures would block forever
+pub(crate) fn run_hook(event: &str, stop_hook_active: bool) -> Result<(), String> {
     let report = match ensure_initialized().and_then(|()| evaluate()) {
         Ok(report) => report,
         Err(error) => setup_report(&error),
     };
-    if report
-        .violations
-        .iter()
-        .any(|violation| repair_owner(violation) == "agent")
-    {
+    let enforce_targets = event == "stop" && !stop_hook_active;
+    if report.violations.iter().any(|violation| {
+        repair_owner(violation) == "agent" && (enforce_targets || !is_pending_target(violation))
+    }) {
         print_json(&report);
         eprintln!("{}", render_json(&report));
         return Err("HOOK_BLOCK:one or more Crane policies failed".into());
@@ -97,32 +99,60 @@ pub(crate) fn run_hook(event: &str) -> Result<(), String> {
         print_json(&report);
         return Ok(());
     }
-    println!("{}", render_human_repair_hook(event, &report));
+    println!("{}", render_non_blocking_hook(event, &report));
     Ok(())
 }
 
-/** Build the non-blocking hook JSON for human-only failures, by joining every violation into a
- * systemMessage warning for the user, and for events that support it adding additionalContext
- * that tells the agent not to retry and includes the full JSON report
+/** Check whether a violation is a target rule that is not met yet (nothing changed, or the change
+ * is of the wrong kind), as opposed to a failure that prevents checking the target at all
+ * Input
+    - violation: &Violation - violation to check
+ * Output
+    - bool, true for target_unchanged and change_type_mismatch
+*/
+fn is_pending_target(violation: &Violation) -> bool {
+    matches!(
+        violation.violation_type.as_str(),
+        "target_unchanged" | "change_type_mismatch"
+    )
+}
+
+/** Build the non-blocking hook JSON for violations that must not block now, by writing a
+ * systemMessage for the user covering human-only failures and pending targets, and for events
+ * that support it adding additionalContext that tells the agent not to touch human-only failures,
+ * lists the targets its task still has to satisfy, and includes the full JSON report
  * Input
     - event: &str - hook event name
-    - report: &Report - report containing only human-owned violations
+    - report: &Report - report whose violations are human-owned or pending targets
  * Output
     - String of Claude Code hook JSON
 */
-fn render_human_repair_hook(event: &str, report: &Report) -> String {
-    // Warn the user and tell the agent to stop retrying, using Claude's non-blocking hook JSON
-    let problems = report
-        .violations
-        .iter()
-        .map(|violation| format!("{}: {}", violation.policy_id, violation.message))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut output = serde_json::json!({
-        "systemMessage": format!(
-            "Crane cannot fully verify this repository until a human repairs .crane metadata: {problems}"
-        ),
-    });
+fn render_non_blocking_hook(event: &str, report: &Report) -> String {
+    let list = |pending: bool| {
+        report
+            .violations
+            .iter()
+            .filter(|violation| is_pending_target(violation) == pending)
+            .map(|violation| format!("{}: {}", violation.policy_id, violation.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let (human, targets) = (list(false), list(true));
+    let mut message = Vec::new();
+    let mut context = Vec::new();
+    if !human.is_empty() {
+        message.push(format!(
+            "Crane cannot fully verify this repository until a human repairs .crane metadata: {human}"
+        ));
+        context.push("Crane reported problems that only a human can repair (repair_owner \"human\"). Agents are blocked from .crane, so do not try to fix or work around them; continue the task and mention them to the user.".to_string());
+    }
+    if !targets.is_empty() {
+        message.push(format!("Crane targets not yet satisfied: {targets}"));
+        context.push(format!(
+            "Crane target rules require these changes before the task is complete: {targets}"
+        ));
+    }
+    let mut output = serde_json::json!({ "systemMessage": message.join(" | ") });
     let hook_event_name = match event {
         "user-prompt-submit" => Some("UserPromptSubmit"),
         "post-tool-use" => Some("PostToolUse"),
@@ -131,10 +161,7 @@ fn render_human_repair_hook(event: &str, report: &Report) -> String {
     if let Some(hook_event_name) = hook_event_name {
         output["hookSpecificOutput"] = serde_json::json!({
             "hookEventName": hook_event_name,
-            "additionalContext": format!(
-                "Crane reported problems that only a human can repair (repair_owner \"human\"). Agents are blocked from .crane, so do not try to fix or work around them; continue the task and mention them to the user.\n{}",
-                render_json(report)
-            ),
+            "additionalContext": format!("{}\n{}", context.join("\n"), render_json(report)),
         });
     }
     output.to_string()
@@ -220,79 +247,160 @@ fn evaluate() -> Result<Report, String> {
     // The parsed policies are sorted again for deterministic behavior
     policies.sort_by(|left, right| left.name.cmp(&right.name));
     // Wrapping up the report
+    // One scope context per run shares Git processes and parsed files across rules
+    let mut scope_context = ScopeContext::new();
     let mut report = Report {
         passes: Vec::new(),
         violations: policy_errors,
     };
     for policy in policies {
         for rule in policy.rules {
-            match rule {
-                // Match the policy with the rule
-                Rule::PreserveFunction { target } => {
-                    let checkpoint_name = policy.checkpoint.clone();
-                    let result = verify_function(&policy.name, &checkpoint_name, &target);
-                    match result {
-                        Ok(()) => report.passes.push(Pass {
-                            policy_id: policy.name.clone(),
-                            target,
-                        }),
-                        Err(message) => report.violations.push(Violation {
-                            policy_id: policy.name.clone(),
-                            rule: "preserve".into(),
-                            target,
-                            checkpoint: checkpoint_name,
-                            violation_type: classify_violation(&message),
-                            message,
-                        }),
-                    }
+            let checkpoint_name = policy.checkpoint.clone();
+            let description = rule.describe();
+            // Match the policy with the rule
+            let (keyword, target, result) = match rule {
+                Rule::Preserve {
+                    kind,
+                    target,
+                    scope,
+                } => {
+                    let result = verify_rule(
+                        &mut scope_context,
+                        &policy.name,
+                        &checkpoint_name,
+                        kind,
+                        &target,
+                        scope,
+                    );
+                    ("preserve", target, result)
                 }
+                Rule::Target {
+                    kind,
+                    target,
+                    scope,
+                    change_type,
+                } => {
+                    let result = load_checkpoint(&checkpoint_name)
+                        .map_err(|error| {
+                            format!("{error} (policy {}, target {target})", policy.name)
+                        })
+                        .and_then(|checkpoint| {
+                            verify_target(
+                                &mut scope_context,
+                                scope,
+                                change_type,
+                                &checkpoint.commit,
+                                kind,
+                                &target,
+                            )
+                        });
+                    ("target", target, result)
+                }
+            };
+            match result {
+                Ok(()) => report.passes.push(Pass {
+                    policy_id: policy.name.clone(),
+                    description,
+                }),
+                Err(message) => report.violations.push(Violation {
+                    policy_id: policy.name.clone(),
+                    rule: keyword.into(),
+                    target,
+                    checkpoint: checkpoint_name,
+                    violation_type: classify_violation(&message),
+                    message,
+                }),
             }
         }
     }
     Ok(report) // Pass the completed report
 }
 
-/** Check that one protected function is unchanged, by first loading the checkpoint and confirming
- * its commit exists, then resolving the target in the checkpoint commit and in the worktree
+/** Verify one preserve rule at its scope, by comparing the item's node directly for block scope
+ * and otherwise loading the checkpoint and delegating to scope::verify_scope
+ * Input
+    - scope_context: &mut ScopeContext - state shared by all rules in this run
+    - policy_id: &str - policy name, used in error messages
+    - checkpoint_name: &str - checkpoint the policy compares against
+    - kind: ItemKind - function, data, variable, class, or interface
+    - target: &str - qualified target
+    - scope: Scope - how much code around the target is protected
+ * Output
+    - Result<(), String>
+    - Error describing why the scope could not be verified or what was modified
+*/
+fn verify_rule(
+    scope_context: &mut ScopeContext,
+    policy_id: &str,
+    checkpoint_name: &str,
+    kind: ItemKind,
+    target: &str,
+    scope: Scope,
+) -> Result<(), String> {
+    if scope == Scope::Block {
+        return verify_item(policy_id, checkpoint_name, kind, target);
+    }
+    let checkpoint = load_checkpoint(checkpoint_name)
+        .map_err(|error| format!("{error} (policy {policy_id}, target {target})"))?;
+    verify_scope(scope_context, scope, &checkpoint.commit, kind, target)
+}
+
+/** Check that one protected item is unchanged, by first loading the checkpoint and confirming
+ * its commit exists, then resolving the item in the checkpoint commit and in the worktree
  * (failing on missing, duplicate, unsupported, or unparsable results), and finally comparing the
  * two canonical snippets
  * Input
     - policy_id: &str - policy name, used in error messages
     - checkpoint_name: &str - checkpoint the policy compares against
-    - target: &str - qualified function target
+    - kind: ItemKind - function, data, variable, class, or interface
+    - target: &str - qualified target
  * Output
     - Result<(), String>
     - Error describing why the target could not be verified or that it was modified
 */
-fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Result<(), String> {
+fn verify_item(
+    policy_id: &str,
+    checkpoint_name: &str,
+    kind: ItemKind,
+    target: &str,
+) -> Result<(), String> {
     // Compare one protected target from the trusted commit against the worktree
     let checkpoint = load_checkpoint(checkpoint_name)
         .map_err(|error| format!("{error} (policy {policy_id}, target {target})"))?;
     ensure_commit(&checkpoint.commit)?;
-    let baseline = match resolve_git(&checkpoint.commit, target)? {
+    let noun = kind.noun();
+    let baseline = match resolve_git(&checkpoint.commit, kind, target)? {
         Resolution::Found(value) => value,
         Resolution::Missing => {
             return Err(format!(
-                "protected function {target} is missing from checkpoint; supported source extensions: {}",
-                supported_extensions()
-            ))
+            "protected {noun} {target} is missing from checkpoint; supported source extensions: {}",
+            supported_extensions()
+        ))
         }
         Resolution::Duplicate(count) => {
-            return Err(format!("protected function {target} is ambiguous in checkpoint ({count} matches)"))
+            return Err(format!(
+                "protected {noun} {target} is ambiguous in checkpoint ({count} matches)"
+            ))
         }
-        Resolution::Unsupported => return Err(format!("checkpoint source language is unsupported for {target}")),
-        Resolution::ParseFailure(error) => return Err(format!("checkpoint source could not be parsed: {error}")),
+        Resolution::Unsupported => {
+            return Err(format!(
+                "checkpoint source language is unsupported for {target}"
+            ))
+        }
+        Resolution::ParseFailure(error) => {
+            return Err(format!("checkpoint source could not be parsed: {error}"))
+        }
     };
-    let current = match resolve_worktree(target)? {
+    let current = match resolve_worktree(kind, target)? {
         Resolution::Found(value) => value,
         Resolution::Missing => {
             return Err(format!(
-                "protected function {target} is missing from the worktree; supported source extensions: {}",
+                "protected {noun} {target} is missing from the worktree; supported source extensions: {}",
                 supported_extensions()
             ))
         }
         Resolution::Duplicate(count) => {
-            return Err(format!("protected function {target} is ambiguous in worktree ({count} matches)"))
+            return Err(format!("protected {noun} {target} is ambiguous in worktree ({count} matches)"))
         }
         Resolution::Unsupported => return Err(format!("worktree source language is unsupported for {target}")),
         Resolution::ParseFailure(error) => return Err(format!("worktree source could not be parsed: {error}")),
@@ -300,7 +408,7 @@ fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Resu
     if baseline.snippet == current.snippet {
         Ok(())
     } else {
-        Err("Protected function was modified.".into())
+        Err(format!("Protected {noun} was modified."))
     }
 }
 
@@ -314,10 +422,7 @@ fn verify_function(policy_id: &str, checkpoint_name: &str, target: &str) -> Resu
 fn print_human(report: &Report) {
     // Render a concise report for interactive terminal use
     for pass in &report.passes {
-        println!(
-            "PASS {}: preserve --function {}",
-            pass.policy_id, pass.target
-        );
+        println!("PASS {}: {}", pass.policy_id, pass.description);
     }
     for violation in &report.violations {
         println!(
@@ -391,7 +496,10 @@ fn render_json(report: &Report) -> String {
 */
 fn repair_owner(violation: &Violation) -> &'static str {
     // Only worktree source problems are agent-repairable; policy, checkpoint, and setup failures need .crane edits
-    if violation.violation_type == "source_changed" || violation.message.contains("worktree") {
+    if violation.violation_type == "source_changed"
+        || is_pending_target(violation)
+        || violation.message.contains("worktree")
+    {
         "agent"
     } else {
         "human"
@@ -407,7 +515,15 @@ fn repair_owner(violation: &Violation) -> &'static str {
 */
 fn classify_violation(message: &str) -> String {
     // Map stable verifier messages to machine-readable failure categories
-    if message.contains("ambiguous") {
+    if message.starts_with("Target ") && message.contains(" was not changed within ") {
+        // Checked first: target messages list changed paths, which may contain any other keyword
+        "target_unchanged"
+    } else if message.starts_with("Target change within ") {
+        "change_type_mismatch"
+    } else if message.starts_with("Protected ") && message.contains(" was modified") {
+        // Checked first: scope messages list changed paths, which may contain any other keyword
+        "source_changed"
+    } else if message.contains("ambiguous") {
         "duplicate_target"
     } else if message.contains("missing from") {
         "target_not_found"

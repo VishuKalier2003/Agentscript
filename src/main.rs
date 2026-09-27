@@ -5,6 +5,7 @@ mod model;
 mod policy;
 mod repository;
 mod resolver;
+mod scope;
 mod util;
 
 /** Entry point of the crane binary, dispatches the command line through commands::run and converts

@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::model::Checkpoint;
 use crate::util::{io_error, json_field};
@@ -125,6 +126,19 @@ pub(crate) fn ensure_repo() -> Result<(), String> {
 */
 pub(crate) fn git(args: &[&str]) -> Result<String, String> {
     // Run Git without shell interpolation so paths and arguments stay isolated
+    git_raw(args).map(|output| output.trim().into())
+}
+
+/** Run a Git command directly (no shell) and keep its output byte-for-byte, by spawning git with
+ * the given arguments and returning stdout untrimmed, so file contents and \0-separated listings
+ * are not altered
+ * Input
+    - args: &[&str] - arguments passed to git
+ * Output
+    - Result<String, String>
+    - Error with trimmed stderr if git cannot be spawned or exits with a failure status
+*/
+pub(crate) fn git_raw(args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
         .output()
@@ -132,7 +146,97 @@ pub(crate) fn git(args: &[&str]) -> Result<String, String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().into());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/** Reads many files from Git commits through one long-lived "git cat-file --batch" process,
+ * instead of starting a "git show" process per file
+ * Fields
+    - child: Child - the running git process
+    - stdin: Option<ChildStdin> - request pipe, closed on drop so git exits
+    - stdout: BufReader<ChildStdout> - response pipe
+*/
+pub(crate) struct BlobReader {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl BlobReader {
+    /** Start the batch reader, by spawning git cat-file --batch with piped stdin and stdout
+     * Input
+        - None
+     * Output
+        - Result<BlobReader, String>
+        - Error if git cannot be started
+    */
+    pub(crate) fn new() -> Result<Self, String> {
+        let mut child = Command::new("git")
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to execute git: {error}"))?;
+        let stdin = child.stdin.take();
+        let stdout = BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    /** Read one file from a commit, by writing "COMMIT:PATH" to the batch process and then reading
+     * the "<oid> <type> <size>" header followed by exactly size bytes and a newline
+     * Input
+        - commit: &str - commit SHA
+        - path: &str - repository-root-relative path
+     * Output
+        - Result<Option<Vec<u8>>, String>, None if the path is missing or not a file in the commit
+        - Error if the batch process fails or its response is malformed
+    */
+    pub(crate) fn read(&mut self, commit: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        if path.contains('\n') {
+            // The batch protocol is line based, so fall back to a single git show
+            return Ok(Some(
+                git_raw(&["show", &format!("{commit}:{path}")])?.into_bytes(),
+            ));
+        }
+        let stdin = self.stdin.as_mut().ok_or("git cat-file stdin is closed")?;
+        writeln!(stdin, "{commit}:{path}").map_err(io_error)?;
+        stdin.flush().map_err(io_error)?;
+        let mut header = String::new();
+        self.stdout.read_line(&mut header).map_err(io_error)?;
+        let header = header.trim_end();
+        if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+            return Ok(None);
+        }
+        let fields = header.split(' ').collect::<Vec<_>>();
+        let [_, kind, size] = fields.as_slice() else {
+            return Err(format!("unexpected git cat-file response '{header}'"));
+        };
+        let size = size
+            .parse::<usize>()
+            .map_err(|_| format!("unexpected git cat-file response '{header}'"))?;
+        let mut content = vec![0; size + 1]; // content plus the terminating newline
+        self.stdout.read_exact(&mut content).map_err(io_error)?;
+        content.truncate(size);
+        Ok((*kind == "blob").then_some(content))
+    }
+}
+
+impl Drop for BlobReader {
+    /** Stop the batch process, by closing its stdin so git exits and then waiting for it
+     * Input
+        - None (uses self)
+     * Output
+        - None
+    */
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = self.child.wait();
+    }
 }
 
 /** Load a named checkpoint, by first reading .crane/checkpoints/NAME.json and then extracting the
