@@ -74,7 +74,7 @@ impl Rule {
     - Class - a class as a whole, with its fields and methods (--class); Rust structs and enums
     - Interface - an interface as a whole (--interface); Rust traits
 */
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ItemKind {
     Function,
     Data,

@@ -196,11 +196,26 @@ crane agent install --profile claude
 This creates `.claude/settings.local.json` with project-local hooks and makes
 Crane run automatically:
 
-- `SessionStart` prints the deterministic policy context to Claude.
+- `SessionStart` binds the Claude session to a contract session, which fixes
+  the policy versions and checkpoint commits for the whole session, and prints
+  the policy context to Claude.
 - `UserPromptSubmit` verifies the repository whenever the user submits a
-  prompt, before Claude performs new edits.
-- `PostToolUse` verifies after file-editing tools and returns JSON violations.
-- `Stop` verifies again before Claude finishes and reports any final failure.
+  prompt, before Claude makes new edits.
+- `PreToolUse` authorizes every tool call against the bound contract before it
+  runs, and denies writes that would change preserved code (see below).
+- `PostToolUse` journals every tool call and verifies the clauses the call
+  could have affected, which also catches shell commands that changed
+  protected code.
+- `Stop` reconciles the session completely, writes an attestation, and reports
+  any final failure.
+- `SessionEnd` reconciles and closes the contract session.
+
+The model reads the policy context, but it is never the authority. Crane
+enforces the contract on its own: `PreToolUse` prevents, `PostToolUse`
+observes, and `Stop` verifies. `crane agent session list` and
+`crane agent session show ID` print each session's binding, its authorized and
+denied actions, and its latest attestation (see LANGUAGE.md, "Runtime authority
+and contract sessions").
 
 The hooks invoke `crane` from `PATH`, so install a pinned Crane release before
 starting Claude Code. On Windows, restart Claude Code after adding the Crane
@@ -224,8 +239,15 @@ retry, so a broken policy cannot trap the agent in an endless repair loop.
 `PreToolUse` protects the verifier itself. It blocks any non-read-only tool
 call that targets `.crane`, `.claude/settings.json`, or
 `.claude/settings.local.json`, and any shell command that runs
-`crane checkpoint`, `crane protect`, `crane init`, or
-`crane agent init|install`, since re-baselining would hide a violation. The
+`crane checkpoint`, `crane protect`, `crane target`, `crane init`, or
+`crane agent init|install|hook`, because re-baselining or forging hook events
+would hide a violation. It then applies the contract:
+
+- A write whose result would change code a `preserve` rule covers is denied.
+  Restoring the checkpoint version is allowed.
+- `target` rules authorize changes to the code they cover.
+- While a policy is malformed, or a checkpoint or item cannot be resolved,
+  every mutating tool is denied. Read-only tools stay available. The
 installed settings also add matching `permissions.deny` `Edit` rules. Shell
 inspection is best-effort pattern matching; treat it as a guard rail and keep
 `.crane` changes under human code review.
@@ -234,6 +256,68 @@ Crane does not overwrite an existing `.claude/settings.local.json`; merge the
 generated hook entries deliberately if that file already exists. The hooks
 never create or move checkpoints, modify policies, or edit source code, and
 they work for every language supported by the verifier.
+
+### Automatic Codex CLI hooks
+
+Run this once from an application repository:
+
+```text
+crane agent init --profile codex
+```
+
+The command initializes `.crane` if needed, installs the Codex hooks, and
+verifies the repository. To install or repair only the hooks, run
+`crane agent install --profile codex`. To verify on demand, run
+`crane agent verify --profile codex` (or `crane agent check --profile codex`).
+
+The installer adds one Crane-owned hook group per event to
+`<repo>/.codex/hooks.json`, one of the locations where Codex loads project
+hooks. Each group is identified by its command,
+`crane agent hook --event <Event> --profile codex`. The installer is additive:
+- it keeps every other key and hook in the file;
+- it never writes `.codex/config.toml`;
+- it skips any event whose Crane command is already registered, either in
+  `hooks.json` or inline in `config.toml`;
+- running it again changes nothing;
+- it refuses to touch a `hooks.json` that is not a JSON object.
+
+No uninstall command exists yet. To remove the hooks, delete the Crane-owned
+groups by hand. Codex runs project hooks only after they are trusted, so open
+Codex in the repository and review them with `/hooks`.
+
+Codex sends its hook JSON on stdin, and Crane answers in Codex's format:
+
+| Codex event | Crane behavior | Output |
+|---|---|---|
+| `SessionStart` | Binds or loads the contract session (`codex-<session_id>`) | Plain-text policy context |
+| `UserPromptSubmit` | Verifies every clause | `systemMessage` when something fails; never blocks the prompt |
+| `PreToolUse` | Authorizes the call with the shared decision engine; `apply_patch` patches are parsed into the files and edits they propose | Silent allow; deny with exit code `2` and the reason on stderr |
+| `PermissionRequest` | Same decision | `decision.behavior: "deny"` when forbidden; otherwise nothing, so the user's own approval prompt decides |
+| `PostToolUse` | Journals the call and verifies the clauses it could affect | `decision: "block"` with the report as `additionalContext` when the agent broke the contract |
+| `Stop` | Reconciles completely and writes the attestation | `decision: "block"` continues the turn while a violation or unmet target remains; a retry with `stop_hook_active` gets a `systemMessage` instead, so it cannot loop |
+| `SessionEnd` | Reconciles and closes the session | Nothing |
+
+A single hook can be run by hand for debugging:
+
+```text
+crane agent hook --event PreToolUse --profile codex < payload.json
+```
+
+`--event` accepts both Codex's names (`PreToolUse`) and Crane's
+(`pre-tool-use`).
+
+Protection for Codex covers:
+- `.crane`;
+- `.codex/hooks.json` and `.codex/config.toml`;
+- the mutating `crane` commands (`checkpoint`, `protect`, `target`, `init`,
+  `agent init|install|hook`), whether reached through `apply_patch`, `Bash`,
+  or an MCP tool.
+
+A patch Crane cannot parse is denied, because a write whose files are unknown
+cannot be authorized.
+
+Tested against the hook schema in the current Codex documentation, not a
+particular Codex binary. See the limitations below.
 
 The agent-check JSON contract is:
 
@@ -437,6 +521,24 @@ This MVP intentionally keeps the implementation narrow:
   requires a new checkpoint.
 - Duplicate target matches fail closed.
 - Git commit SHA is the immutable baseline; branch is recorded only as metadata.
-- Claude Code project hooks are supported through `crane agent install`; other
-  agent hosts still require their own hook, MCP, or wrapper integration.
+- Claude Code and Codex CLI project hooks are supported through
+  `crane agent install --profile claude|codex`. Other agent hosts must call
+  `crane agent hook --profile generic` with Crane's neutral action JSON from
+  their own hook, MCP, or wrapper integration.
+- Codex support follows the hook schema documented by OpenAI and was verified
+  by tests that replay that schema. It has not been run against a live Codex
+  binary here. Codex fails open when a hook crashes or times out, so Crane
+  denies with exit code `2`. Codex does not support `permissionDecision: "ask"`
+  in `PreToolUse` yet, so any approval requirement is surfaced as a denial
+  there. The `apply_patch` simulation matches hunks by exact text, so a hunk
+  Codex would place with fuzzy matching may be judged as unknown and denied
+  when it touches protected code.
+- Pre-execution authorization simulates file writes. Shell commands and unknown
+  tools cannot be simulated, so their effects are caught after they run (at
+  post-tool-use and stop) rather than prevented. Shell inspection for `.crane`
+  access is pattern matching, not a sandbox.
+- Attestations are evidence objects and are not cryptographically signed.
+- Hooks installed by earlier versions lack the `SessionEnd` hook and the `*`
+  matcher on `PostToolUse`. Reinstall them, or merge the generated settings,
+  so that every tool call is journaled and verified.
 - `deny-read`, `deny-write`, `require-read`, `require-write`, and `static-database` are intentionally not implemented yet.

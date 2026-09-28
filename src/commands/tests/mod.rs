@@ -567,3 +567,207 @@ fn parses_every_item_flag() {
         );
     }
 }
+
+/** Test the SHA-256 digest used for contract versions against the standard test vectors
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn sha256_matches_standard_vectors() {
+    use crate::util::sha256;
+    assert_eq!(
+        sha256(b""),
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256(b"abc"),
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "sha256:248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+}
+
+/** Test that preserve compiles to deny-write plus unchanged and target to permit-write plus
+ * changed, and that a clause turns back into the same rule
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn rules_compile_to_runtime_and_postcondition() {
+    use crate::ir::{Clause, Permission, Postcondition};
+    let preserve = Clause::from_rule(&parse_rule("preserve --function A.b scope flow;").unwrap());
+    assert_eq!(preserve.permission, Permission::DenyWrite);
+    assert_eq!(preserve.postcondition, Postcondition::Unchanged);
+    let target =
+        Clause::from_rule(&parse_rule("target --class A change_type logical_sn;").unwrap());
+    assert_eq!(target.permission, Permission::PermitWrite);
+    assert_eq!(
+        target.postcondition,
+        Postcondition::Changed(Some(ChangeType::LogicalSn))
+    );
+    assert_eq!(
+        target.rule().describe(),
+        "target --class A scope block change_type logical_sn"
+    );
+    assert_eq!(preserve.scope, Scope::Flow);
+}
+
+/** Test that a contract set survives a session-file round trip and that edited contents or an
+ * unknown IR format are rejected
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn contract_ir_round_trips_and_rejects_tampering() {
+    use crate::ir::{Clause, Contract, ContractSet};
+    let contract = Contract {
+        policy_id: "payment".into(),
+        version: crate::util::sha256(b"policy"),
+        checkpoint: "baseline".into(),
+        checkpoint_sha: Ok("abc123".into()),
+        clauses: vec![Clause::from_rule(
+            &parse_rule("preserve --function A.b;").unwrap(),
+        )],
+    };
+    let set = ContractSet::new(vec![contract], Vec::new());
+    let value = set.to_json();
+    assert_eq!(ContractSet::from_json(&value).unwrap(), set);
+
+    let mut tampered = value.clone();
+    tampered["contracts"][0]["clauses"][0]["runtime"] = serde_json::json!("permit_write");
+    assert!(ContractSet::from_json(&tampered).is_err());
+    let mut rebased = value.clone();
+    rebased["contracts"][0]["checkpoint_sha"] = serde_json::json!("def456");
+    let error = ContractSet::from_json(&rebased).unwrap_err();
+    assert!(error.contains("version does not match"), "{error}");
+    let mut future = value;
+    future["ir_format"] = serde_json::json!(2);
+    assert!(ContractSet::from_json(&future).is_err());
+}
+
+/** Test that the agent adapters hold no policy semantics: their source never names clauses,
+ * permissions, postconditions, scopes, change types, or verification of contracts
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn adapters_contain_no_policy_semantics() {
+    let source = include_str!("../../adapter.rs");
+    for word in [
+        "Permission::",
+        "crate::ir",
+        "Postcondition",
+        "Clause",
+        "ContractSet",
+        "Scope",
+        "ChangeType",
+        "ItemKind",
+        "verify_contracts",
+        "matches_target",
+        "footprint",
+        "Rule::",
+        "preserve",
+    ] {
+        assert!(!source.contains(word), "adapter.rs mentions {word}");
+    }
+}
+
+/** Test the metadata guard's path and command matching, including the hook subcommand that could
+ * forge session events
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn metadata_guard_matches_paths_and_commands() {
+    use crate::authority::{references_protected_path, runs_mutating_crane};
+    assert!(references_protected_path(r"D:\Repo\.CRANE\x", &[]));
+    assert!(!references_protected_path("src/my.crane", &[]));
+    assert!(!references_protected_path(".craneignore", &[]));
+    assert!(references_protected_path(
+        ".claude/settings.local.json",
+        &[".claude/settings.local.json"]
+    ));
+    assert!(!references_protected_path(
+        ".claude/settings.local.json",
+        &[]
+    ));
+    assert!(runs_mutating_crane("crane agent hook --event stop"));
+    assert!(runs_mutating_crane("x && ./bin/crane.exe checkpoint"));
+    assert!(!runs_mutating_crane("crane agent session show claude-1"));
+    assert!(!runs_mutating_crane("crane check --agent"));
+}
+
+/** Test that Codex apply_patch text is parsed into the file changes it proposes: added, deleted,
+ * and updated files (one edit per hunk, resolved against the cwd), moves, and malformed patches
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn parses_codex_apply_patch() {
+    use crate::adapter::parse_patch;
+    use crate::authority::{Proposed, TextEdit};
+    let patch = "*** Begin Patch\n*** Add File: docs/new.md\n+hello\n+world\n*** Delete File: old.py\n*** Update File: pay.py\n@@ def charge():\n     total = 1\n-    return total\n+    return total * 2\n@@\n-x = 1\n+x = 2\n*** End of File\n*** End Patch\n";
+    let changes = parse_patch(patch, None).unwrap();
+    assert_eq!(changes.len(), 3);
+    assert_eq!(changes[0].path, "docs/new.md");
+    assert_eq!(
+        changes[0].proposed,
+        Proposed::Content("hello\nworld\n".into())
+    );
+    assert_eq!(changes[1].proposed, Proposed::Delete);
+    assert_eq!(
+        changes[2].proposed,
+        Proposed::Edits(vec![
+            TextEdit {
+                old: "    total = 1\n    return total".into(),
+                new: "    total = 1\n    return total * 2".into(),
+                all: false,
+            },
+            TextEdit {
+                old: "x = 1".into(),
+                new: "x = 2".into(),
+                all: false,
+            },
+        ])
+    );
+
+    let moved = parse_patch(
+        "*** Begin Patch\n*** Update File: a.py\n*** Move to: b.py\n@@\n-x\n+y\n*** End Patch",
+        Some("/repo"),
+    )
+    .unwrap();
+    assert_eq!(moved[0].proposed, Proposed::Delete);
+    assert_eq!(moved[1].proposed, Proposed::Unknown);
+    assert!(moved[1].path.ends_with("b.py") && moved[1].path.starts_with("/repo"));
+
+    let insertion = parse_patch(
+        "*** Begin Patch\n*** Update File: a.py\n@@\n+new line\n*** End Patch",
+        None,
+    )
+    .unwrap();
+    assert_eq!(insertion[0].proposed, Proposed::Unknown);
+
+    for malformed in [
+        "",
+        "*** Begin Patch\n*** End Patch",
+        "*** Begin Patch\n*** Update File: a.py\n-x\n",
+        "*** Begin Patch\n*** Update File: a.py\n?x\n*** End Patch",
+        "diff --git a/x b/x",
+    ] {
+        assert!(parse_patch(malformed, None).is_none(), "{malformed:?}");
+    }
+}

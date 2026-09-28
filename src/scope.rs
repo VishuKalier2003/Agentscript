@@ -15,7 +15,7 @@ use crate::resolver::{
 use crate::util::io_error;
 
 /** Metadata directories that belong to tooling rather than the codebase, excluded from every scope */
-const EXCLUDED_PREFIXES: &[&str] = &[".crane/", ".claude/"];
+pub(crate) const EXCLUDED_PREFIXES: &[&str] = &[".crane/", ".claude/"];
 
 /** Maximum number of changed paths or functions listed in one violation message */
 const REPORTED_CHANGES: usize = 10;
@@ -277,6 +277,95 @@ pub(crate) fn locate_target(
     context.state(commit)?.locate(kind, target)
 }
 
+/** Where a clause's item lives in the checkpoint, used to derive runtime authority once per
+ * session instead of on every tool call
+ * Fields
+    - location: String - repository-relative path of the file that defines the item
+    - baseline: String - canonical text of the item at the checkpoint
+    - flow: Option<FlowFootprint> - the checkpoint flow, for flow-scope clauses only
+*/
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Footprint {
+    pub(crate) location: String,
+    pub(crate) baseline: String,
+    pub(crate) flow: Option<FlowFootprint>,
+}
+
+/** The flow around an item at the checkpoint, and the names through which new code would join it
+ * Fields
+    - members: BTreeSet<String> - flow members keyed "path#qualified.name", like flow verification
+    - callers_of: BTreeSet<String> - names of upstream functions; a new caller joins the flow
+    - users_of: BTreeSet<String> - names of upstream non-function items; a function that mentions
+      one joins the flow
+    - callees: BTreeSet<String> - names called downstream; a new function with one of these
+      names joins the flow
+*/
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FlowFootprint {
+    pub(crate) members: BTreeSet<String>,
+    pub(crate) callers_of: BTreeSet<String>,
+    pub(crate) users_of: BTreeSet<String>,
+    pub(crate) callees: BTreeSet<String>,
+}
+
+/** Find a clause's item in the checkpoint and, for flow scope, trace its checkpoint flow, by
+ * loading the files that mention the item's name, requiring exactly one definition, and then
+ * tracing downstream and upstream on the checkpoint side only (runtime authority is derived from
+ * the trusted checkpoint, never from the worktree the agent is editing)
+ * Input
+    - context: &mut ScopeContext - shared state for this run
+    - scope: Scope - the clause's scope
+    - commit: &str - checkpoint commit SHA
+    - kind: ItemKind - kind of the item
+    - target: &str - qualified target
+ * Output
+    - Result<Footprint, String>
+    - Error if the commit is missing, the item is missing or ambiguous, or a file does not parse
+*/
+pub(crate) fn footprint(
+    context: &mut ScopeContext,
+    scope: Scope,
+    commit: &str,
+    kind: ItemKind,
+    target: &str,
+) -> Result<Footprint, String> {
+    let state = context.state(commit)?;
+    let mut graphs = [Graph::default(), Graph::default()];
+    state.load(&mut graphs, [vec![function_name(target)], Vec::new()])?;
+    let start = find_start(&graphs[0], Side::Checkpoint, kind, target)?;
+    let mut footprint = Footprint {
+        location: graphs[0].files[start.0].0.clone(),
+        baseline: graphs[0].get(start).snippet.clone(),
+        flow: None,
+    };
+    if scope == Scope::Flow {
+        let mut trace = Trace::new(start);
+        while !trace.is_done() {
+            let names = trace.needed_names(&graphs[0]);
+            state.load(&mut graphs, [names, Vec::new()])?;
+            trace.expand(&graphs[0]);
+        }
+        let graph = &graphs[0];
+        let key = |id: DefinitionId| format!("{}#{}", graph.files[id.0].0, graph.get(id).qualified);
+        let mut flow = FlowFootprint::default();
+        for &id in &trace.upstream {
+            let definition = graph.get(id);
+            flow.members.insert(key(id));
+            if definition.kind == ItemKind::Function {
+                flow.callers_of.insert(definition.name.clone());
+            } else {
+                flow.users_of.insert(definition.name.clone());
+            }
+        }
+        for &id in &trace.downstream {
+            flow.members.insert(key(id));
+            flow.callees.extend(graph.get(id).calls.iter().cloned());
+        }
+        footprint.flow = Some(flow);
+    }
+    Ok(footprint)
+}
+
 /** How the code covered by a target rule changed, summed over every unit (function or file)
  * Fields
     - changed: Vec<String> - units whose text differs, including added and removed units
@@ -401,7 +490,7 @@ fn judge(
  * Output
     - String folder path without a trailing slash
 */
-fn folder_of(path: &str) -> String {
+pub(crate) fn folder_of(path: &str) -> String {
     path.rsplit_once('/')
         .map(|(folder, _)| folder.to_string())
         .unwrap_or_default()
@@ -413,7 +502,7 @@ fn folder_of(path: &str) -> String {
  * Output
     - String prefix ending in "/", or empty
 */
-fn folder_prefix(folder: &str) -> String {
+pub(crate) fn folder_prefix(folder: &str) -> String {
     if folder.is_empty() {
         String::new()
     } else {
@@ -1098,7 +1187,7 @@ fn hash_files(root: &PathBuf, paths: &[String]) -> Result<Vec<String>, String> {
  * Output
     - String function name
 */
-fn function_name(target: &str) -> String {
+pub(crate) fn function_name(target: &str) -> String {
     target
         .rsplit(['.', ':'])
         .next()

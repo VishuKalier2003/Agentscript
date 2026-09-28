@@ -1,13 +1,9 @@
-use std::fs;
-
-use crate::model::{ChangeType, Rule};
-use crate::policy::parse_file;
-use crate::repository::{ensure_initialized, root};
-use crate::util::io_error;
+use crate::ir::{compile, ContractSet, Permission, Postcondition};
+use crate::model::ChangeType;
+use crate::repository::ensure_initialized;
 
 /** Print policy context for an agent session, by first confirming Crane is initialized, then
- * parsing every .crane file in the policies directory, sorting them by name, and finally printing
- * each policy's checkpoint and preserve targets in a stable CRANE_CONTEXT_V1 format
+ * compiling every policy (failing on the first malformed one), and finally printing the context
  * Input
     - None
  * Output
@@ -17,53 +13,70 @@ use crate::util::io_error;
 pub(crate) fn run() -> Result<(), String> {
     // Emit deterministic policy context that an agent can consume at session start
     ensure_initialized()?;
-    let directory = root()?.join("policies");
-    let paths = fs::read_dir(directory)
-        .map_err(io_error)?
-        .filter_map(|entry| entry.ok().map(|value| value.path()))
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("crane"))
-        .collect::<Vec<_>>();
-    let mut policies = paths
-        .into_iter()
-        .map(|path| parse_file(&path))
-        .collect::<Result<Vec<_>, _>>()?;
-    policies.sort_by(|left, right| left.name.cmp(&right.name));
-    println!("CRANE_CONTEXT_V1");
-    for policy in policies {
-        println!(
-            "\npolicy_id: {}\ncheckpoint: {}",
-            policy.name, policy.checkpoint
-        );
-        for rule in policy.rules {
-            match rule {
-                Rule::Preserve {
-                    kind,
-                    target,
-                    scope,
-                } => {
-                    println!(
-                        "rule: preserve\nkind: {}\ntarget: {target}\nscope: {}",
-                        kind.noun(),
-                        scope.name()
-                    );
-                }
-                Rule::Target {
-                    kind,
-                    target,
-                    scope,
-                    change_type,
-                } => {
-                    // Targets tell the agent which change its task must make
-                    println!(
-                        "rule: target\nkind: {}\ntarget: {target}\nscope: {}\nchange_type: {}",
-                        kind.noun(),
-                        scope.name(),
-                        change_type.map_or("any", ChangeType::name)
-                    );
-                }
+    let set = compile()?;
+    if let Some(policy) = set.malformed.first() {
+        return Err(policy.message.clone());
+    }
+    print!("{}", render(&set));
+    Ok(())
+}
+
+/** Render the model-readable context of a contract set: the stable CRANE_CONTEXT_V1 listing of
+ * every policy's checkpoint and rules, followed by the contract version and a plain summary of
+ * what must not and what must change; it holds no runtime authority material, the model only
+ * reads it while Crane enforces the contract on its own
+ * Input
+    - set: &ContractSet - compiled contracts, from disk or from a session
+ * Output
+    - String ending in a newline
+*/
+pub(crate) fn render(set: &ContractSet) -> String {
+    let mut output = String::from("CRANE_CONTEXT_V1\n");
+    let mut preserved = Vec::new();
+    let mut required = Vec::new();
+    for contract in &set.contracts {
+        output.push_str(&format!(
+            "\npolicy_id: {}\ncheckpoint: {}\n",
+            contract.policy_id, contract.checkpoint
+        ));
+        for clause in &contract.clauses {
+            let (kind, target, scope) = (clause.kind.noun(), &clause.target, clause.scope.name());
+            output.push_str(&format!(
+                "rule: {}\nkind: {kind}\ntarget: {target}\nscope: {scope}\n",
+                clause.keyword()
+            ));
+            if let Postcondition::Changed(change_type) = clause.postcondition {
+                // Targets tell the agent which change its task must make
+                let change_type = change_type.map_or("any", ChangeType::name);
+                output.push_str(&format!("change_type: {change_type}\n"));
+                required.push(format!(
+                    "- {kind} {target} (scope {scope}; change_type {change_type}; policy {})",
+                    contract.policy_id
+                ));
+            }
+            if clause.permission == Permission::DenyWrite {
+                preserved.push(format!(
+                    "- {kind} {target} (scope {scope}; policy {})",
+                    contract.policy_id
+                ));
             }
         }
     }
-    println!("\nverification: crane check --agent");
-    Ok(())
+    output.push_str("\nverification: crane check --agent\n");
+    output.push_str(&format!("contract_version: {}\n", set.version));
+    output.push_str(
+        "\nACTIVE CONTRACT (informational; Crane enforces it independently of this text)\n",
+    );
+    for (title, lines) in [("Do not modify:", preserved), ("Must modify:", required)] {
+        if !lines.is_empty() {
+            output.push_str(&format!("{title}\n{}\n", lines.join("\n")));
+        }
+    }
+    if !set.malformed.is_empty() {
+        output.push_str("Unavailable policies (a human must repair them; mutating tools are denied until then):\n");
+        for policy in &set.malformed {
+            output.push_str(&format!("- {}\n", policy.policy_id));
+        }
+    }
+    output
 }

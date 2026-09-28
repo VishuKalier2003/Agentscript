@@ -297,3 +297,121 @@ invoke the `crane` executable from `PATH`. They do not change policy files,
 checkpoints, or source code. Installation refuses to overwrite an existing
 settings file. A passing hook exits `0`; a blocked prompt/edit/stop hook exits
 `2` and emits the structured verification result.
+
+## Runtime authority and contract sessions
+
+Every rule compiles into a two-sided contract (the Policy IR, `src/ir.rs`):
+
+| Rule | Runtime authority (before a tool runs) | Postcondition (after the agent is done) |
+|---|---|---|
+| `preserve` | `deny_write` over the covered code | covered code equals the checkpoint version |
+| `target` | `permit_write` over the covered code | covered code differs from the checkpoint (with `change_type`, in that way) |
+
+`permit_write` is not an allowlist: code that no clause covers stays writable.
+The covered code is the rule's item plus its scope (the file, the folder, the
+flow, or the whole repository).
+
+For each policy, the IR records the policy id, its version (the SHA-256 of the
+policy file), the checkpoint name and commit, and its clauses. The contract
+version is a SHA-256 over every policy version and checkpoint commit, so editing
+any policy or re-baselining any checkpoint produces a new version. A malformed
+policy stays in the IR, marked malformed, so that it fails closed.
+
+A contract session (`.crane/runtime/sessions/<agent>-<session id>/`) binds one
+agent session to one contract version. It is created on the first hook event
+that carries a provider session id, and it is never replaced or refreshed:
+
+- `session.json` holds the session id, the agent, the provider session id, the
+  creation time and optional expiry, the repository root, the bound IR, and the
+  runtime grants derived from the checkpoint (where each item lives, and each
+  flow's members). It is written once.
+- `state` is `active` or `closed`. It is the only thing that changes.
+- `journal.jsonl` has one line per event: sequence, time, session, agent,
+  contract version, checkpoints, tool, normalized operation and resources,
+  decision, reasons, result, and a SHA-256 of the tool arguments. The
+  arguments themselves are never stored.
+- `attestation.json` holds the latest reconciled outcome.
+
+`.crane/runtime/` ignores itself in Git. Agents cannot write to it because it
+is inside `.crane`.
+
+Lifecycle:
+
+1. **Session start** binds or loads the session and prints the model context:
+   the `CRANE_CONTEXT_V1` listing plus an `ACTIVE CONTRACT` summary. The context
+   is informational only and carries no authority material.
+2. **Pre-tool-use** authorizes the proposed action without running the
+   verifier. The checks apply in this order:
+   - Read-only tools are allowed.
+   - Any action that touches `.crane`, the hook settings, or runs a mutating
+     `crane` command (`checkpoint`, `protect`, `target`, `init`,
+     `agent init|install|hook`) is denied.
+   - While the contract is incomplete (a malformed policy, a missing
+     checkpoint, a missing or ambiguous item), or the session has expired or
+     is closed, every mutating action is denied.
+   - A write is simulated on the file's current text and diffed item by item.
+     It is denied if it would change code that a `preserve` clause covers,
+     unless it restores the checkpoint version. Comment-only edits never count
+     as changes.
+   - Shell commands and unknown tools are allowed, because their effects cannot
+     be known in advance.
+3. **Post-tool-use** journals the action and verifies only the clauses it could
+   have affected:
+   - none for reads;
+   - all of them for shell commands and unknown tools;
+   - for writes, the clauses whose covered code includes the file or whose
+     names the file mentions.
+
+   This is how an allowed shell command that modifies protected code is still
+   caught.
+4. **Stop** reconciles completely:
+   - it verifies every postcondition with the bound IR;
+   - it fails with `contract_drift` if the contract on disk no longer matches
+     the bound version;
+   - it fails with `journal_error` if the journal has lines that do not belong
+     to the session;
+   - it writes the attestation.
+
+   Blocking follows the verification rules: agent-repairable violations block,
+   pending targets block only on a first stop, and human-only problems never
+   block.
+5. **Session end** reconciles, writes the attestation, and closes the session.
+   A resumed provider session reactivates it with the same binding.
+
+Hooks that do not carry a provider session id use a transient session. It makes
+the same decisions but keeps no journal and writes no attestation.
+
+The attestation contains:
+
+- the session and agent ids;
+- the bound, verification, and repository contract versions;
+- each contract's id, version, checkpoint, and commit;
+- the authorized and denied actions;
+- a result for each `preserve` and `target` clause, plus any other findings;
+- answers to the reconciliation questions: `forbidden_mutations_attempted`,
+  `required_targets_changed`, `preserve_invariants_satisfied`,
+  `change_types_satisfied`, `same_contract_version`, `fully_reconciled`;
+- `final_status` (`PASS` or `FAIL`);
+- evidence ids: the journal event count and SHA-256, the Git HEAD, and the
+  verification time.
+
+The attestation is an evidence object and is not signed.
+
+The `codex` profile reads Codex hook JSON: `session_id`, `cwd`,
+`stop_hook_active`, `tool_name`, and `tool_input.command`. An `apply_patch`
+patch is parsed into the files it adds, deletes, updates, or moves. It also
+handles the `permission-request` event: a forbidden call is denied, and any
+other call is left to the user's approval prompt.
+
+The `generic` profile sends the neutral action format on stdin to
+`crane agent hook`:
+
+```json
+{"session_id": "run-1", "tool": "apply_patch", "operation": "write",
+ "path": "src/pay.py", "edits": [{"old": "a", "new": "b", "all": false}]}
+```
+
+`operation` is `read`, `write`, `execute`, or `other`. A write gives `content`,
+`edits`, or `"delete": true`. An `execute` action gives `command`. Stop events
+may send `stop_hook_active`. For pre-tool-use, the verdict is printed as
+`{"decision", "reasons", "resources"}`, and a denial exits `2`.
