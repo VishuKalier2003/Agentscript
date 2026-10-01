@@ -602,13 +602,13 @@ fn sha256_matches_standard_vectors() {
 fn rules_compile_to_runtime_and_postcondition() {
     use crate::ir::{Clause, Permission, Postcondition};
     let preserve = Clause::from_rule(&parse_rule("preserve --function A.b scope flow;").unwrap());
-    assert_eq!(preserve.permission, Permission::DenyWrite);
-    assert_eq!(preserve.postcondition, Postcondition::Unchanged);
+    assert_eq!(preserve.permission(), Permission::DenyWrite);
+    assert_eq!(preserve.postcondition(), Postcondition::Unchanged);
     let target =
         Clause::from_rule(&parse_rule("target --class A change_type logical_sn;").unwrap());
-    assert_eq!(target.permission, Permission::PermitWrite);
+    assert_eq!(target.permission(), Permission::PermitWrite);
     assert_eq!(
-        target.postcondition,
+        target.postcondition(),
         Postcondition::Changed(Some(ChangeType::LogicalSn))
     );
     assert_eq!(
@@ -618,8 +618,37 @@ fn rules_compile_to_runtime_and_postcondition() {
     assert_eq!(preserve.scope, Scope::Flow);
 }
 
-/** Test that a contract set survives a session-file round trip and that edited contents or an
- * unknown IR format are rejected
+/** Full commit SHA used as the checkpoint of contracts built by the tests below */
+const SHA_A: &str = "1111111111111111111111111111111111111111";
+
+/** Second full commit SHA, used as a re-baselined checkpoint */
+const SHA_B: &str = "2222222222222222222222222222222222222222";
+
+/** Build a contract from policy statements, the way compile binds a parsed policy
+ * Input
+    - policy_id: &str - contract id
+    - source: &str - policy file content used as the policy version
+    - rules: &[&str] - statements including their ';'
+    - sha: &str - checkpoint commit
+ * Output
+    - Contract
+*/
+fn contract(policy_id: &str, source: &str, rules: &[&str], sha: &str) -> crate::ir::Contract {
+    crate::ir::Contract {
+        policy_id: policy_id.into(),
+        version: crate::util::sha256(source.as_bytes()),
+        checkpoint: "baseline".into(),
+        checkpoint_sha: Ok(sha.into()),
+        clauses: rules
+            .iter()
+            .map(|rule| crate::ir::Clause::from_rule(&parse_rule(rule).unwrap()))
+            .collect(),
+    }
+}
+
+/** Test that a contract set survives a session-file round trip and that edited contents (a
+ * clause side, a clause target, a checkpoint commit, the set version) or an unknown IR format
+ * are rejected
  * Input
     - None
  * Output
@@ -627,30 +656,271 @@ fn rules_compile_to_runtime_and_postcondition() {
 */
 #[test]
 fn contract_ir_round_trips_and_rejects_tampering() {
-    use crate::ir::{Clause, Contract, ContractSet};
-    let contract = Contract {
-        policy_id: "payment".into(),
-        version: crate::util::sha256(b"policy"),
-        checkpoint: "baseline".into(),
-        checkpoint_sha: Ok("abc123".into()),
-        clauses: vec![Clause::from_rule(
-            &parse_rule("preserve --function A.b;").unwrap(),
-        )],
-    };
-    let set = ContractSet::new(vec![contract], Vec::new());
+    use crate::ir::{ContractSet, IR_FORMAT};
+    let bound = contract("payment", "policy", &["preserve --function A.b;"], SHA_A);
+    let set = ContractSet::new(vec![bound], Vec::new());
     let value = set.to_json();
     assert_eq!(ContractSet::from_json(&value).unwrap(), set);
 
     let mut tampered = value.clone();
     tampered["contracts"][0]["clauses"][0]["runtime"] = serde_json::json!("permit_write");
     assert!(ContractSet::from_json(&tampered).is_err());
+
+    // Moving a preserve onto another item keeps the clause self-consistent, so only the contract
+    // hash can catch it
+    let mut retargeted = value.clone();
+    retargeted["contracts"][0]["clauses"][0]["target"] = serde_json::json!("A.other");
+    let error = ContractSet::from_json(&retargeted).unwrap_err();
+    assert!(error.contains("hash does not match"), "{error}");
+
     let mut rebased = value.clone();
-    rebased["contracts"][0]["checkpoint_sha"] = serde_json::json!("def456");
+    rebased["contracts"][0]["checkpoint_sha"] = serde_json::json!(SHA_B);
+    let error = ContractSet::from_json(&rebased).unwrap_err();
+    assert!(error.contains("hash does not match"), "{error}");
+
+    // Even with a recomputed contract hash, the set version still pins the old contract
+    let moved = contract("payment", "policy", &["preserve --function A.b;"], SHA_B);
+    rebased["contracts"][0]["contract_hash"] = serde_json::json!(moved.hash());
     let error = ContractSet::from_json(&rebased).unwrap_err();
     assert!(error.contains("version does not match"), "{error}");
+
     let mut future = value;
-    future["ir_format"] = serde_json::json!(2);
+    future["ir_format"] = serde_json::json!(IR_FORMAT + 1);
     assert!(ContractSet::from_json(&future).is_err());
+}
+
+/** Test that the contract hash and set version are stable: equal for equal contracts however
+ * they were produced (built twice, or read back from a session file), pinned to a known value
+ * so a change to the canonical form is noticed, and different for every authority-defining
+ * change (clause target, scope, rule, change type, checkpoint commit, policy version)
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn contract_hash_is_stable() {
+    use crate::ir::ContractSet;
+    let rules = [
+        "preserve --function PaymentService.charge;",
+        "target --function PaymentService.calculate change_type semantic;",
+    ];
+    let first = contract("payment", "policy", &rules, SHA_A);
+    let second = contract("payment", "policy", &rules, SHA_A);
+    assert_eq!(first.hash(), second.hash());
+    let set = ContractSet::new(vec![first.clone()], Vec::new());
+    let reread = ContractSet::from_json(&set.to_json()).unwrap();
+    assert_eq!(reread.contracts[0].hash(), first.hash());
+    assert_eq!(reread.version, set.version);
+    assert_eq!(
+        ContractSet::new(vec![second], Vec::new()).version,
+        set.version
+    );
+    assert_eq!(
+        first.hash(),
+        "sha256:e102961a2482f12cdd23d1215a0ceb05c62972a7e1209b22427c1dd3ead17c4a",
+        "the canonical contract form changed; bump IR_FORMAT if that was intended"
+    );
+
+    let variants = [
+        contract("payment", "policy", &rules, SHA_B),
+        contract("payment", "policy v2", &rules, SHA_A),
+        contract("billing", "policy", &rules, SHA_A),
+        contract(
+            "payment",
+            "policy",
+            &["preserve --function PaymentService.refund;", rules[1]],
+            SHA_A,
+        ),
+        contract(
+            "payment",
+            "policy",
+            &[
+                "preserve --function PaymentService.charge scope file;",
+                rules[1],
+            ],
+            SHA_A,
+        ),
+        contract(
+            "payment",
+            "policy",
+            &["target --function PaymentService.charge;", rules[1]],
+            SHA_A,
+        ),
+        contract(
+            "payment",
+            "policy",
+            &[rules[0], "target --function PaymentService.calculate;"],
+            SHA_A,
+        ),
+    ];
+    let mut hashes = variants
+        .iter()
+        .map(|variant| variant.hash())
+        .collect::<Vec<_>>();
+    hashes.push(first.hash());
+    let count = hashes.len();
+    hashes.sort();
+    hashes.dedup();
+    assert_eq!(hashes.len(), count, "every variant must hash differently");
+}
+
+/** Test that preserve and target are two-sided constraints whatever their scope or change type:
+ * preserve denies runtime mutation and requires the code unchanged, target permits runtime
+ * mutation and requires a change (keeping its change type), and a session file cannot pair one
+ * rule's runtime side with the other rule's postcondition
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn preserve_and_target_are_two_sided_constraints() {
+    use crate::ir::{Clause, ContractSet, Permission, Postcondition};
+    for scope in ["block", "file", "folder", "flow", "all"] {
+        let preserve = Clause::from_rule(
+            &parse_rule(&format!("preserve --function A.b scope {scope};")).unwrap(),
+        );
+        assert_eq!(
+            (preserve.permission(), preserve.postcondition()),
+            (Permission::DenyWrite, Postcondition::Unchanged),
+            "{scope}"
+        );
+        assert_eq!(preserve.keyword(), "preserve");
+        let target = Clause::from_rule(
+            &parse_rule(&format!("target --function A.b scope {scope};")).unwrap(),
+        );
+        assert_eq!(
+            (target.permission(), target.postcondition()),
+            (Permission::PermitWrite, Postcondition::Changed(None)),
+            "{scope}"
+        );
+        assert_eq!(target.keyword(), "target");
+    }
+    let typed =
+        Clause::from_rule(&parse_rule("target --function A.b change_type logical_cn;").unwrap());
+    assert_eq!(
+        typed.postcondition(),
+        Postcondition::Changed(Some(ChangeType::LogicalCn))
+    );
+
+    let set = ContractSet::new(
+        vec![contract(
+            "p",
+            "policy",
+            &[
+                "preserve --function A.b;",
+                "target --function A.c change_type logical_cn;",
+            ],
+            SHA_A,
+        )],
+        Vec::new(),
+    );
+    let value = set.to_json();
+    let reread = ContractSet::from_json(&value).unwrap();
+    assert_eq!(
+        reread.contracts[0].clauses[1].postcondition(),
+        Postcondition::Changed(Some(ChangeType::LogicalCn))
+    );
+    for (index, key, forged) in [
+        (0, "runtime", "permit_write"),
+        (0, "postcondition", "changed"),
+        (1, "runtime", "deny_write"),
+        (1, "postcondition", "unchanged"),
+        (1, "change_type", "semantic"),
+    ] {
+        let mut tampered = value.clone();
+        tampered["contracts"][0]["clauses"][index][key] = serde_json::json!(forged);
+        assert!(
+            ContractSet::from_json(&tampered).is_err(),
+            "clause {index} with {key} {forged} must be rejected"
+        );
+    }
+}
+
+/** Test that drift between a bound contract set and the one on disk names each changed policy,
+ * moved or swapped checkpoint, and added or removed policy, and is empty for the same contract
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn contract_drift_names_what_changed() {
+    use crate::ir::ContractSet;
+    let rules = ["preserve --function A.b;"];
+    let bound = ContractSet::new(
+        vec![
+            contract("billing", "billing", &rules, SHA_A),
+            contract("payment", "payment", &rules, SHA_A),
+        ],
+        Vec::new(),
+    );
+    assert!(bound.drift(&bound.clone()).is_empty());
+    let mut renamed = contract("payment", "payment", &rules, SHA_A);
+    renamed.checkpoint = "release".into();
+    let disk = ContractSet::new(
+        vec![
+            contract("billing", "billing v2", &rules, SHA_B),
+            renamed,
+            contract("refunds", "refunds", &rules, SHA_A),
+        ],
+        Vec::new(),
+    );
+    let drift = bound.drift(&disk);
+    let joined = drift.join("\n");
+    assert!(joined.contains("policy billing changed"), "{joined}");
+    assert!(
+        joined.contains(
+            "checkpoint baseline of policy billing moved from 111111111111 to 222222222222"
+        ),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("policy payment now uses checkpoint release instead of baseline"),
+        "{joined}"
+    );
+    assert!(joined.contains("policy refunds was added"), "{joined}");
+    let removed = ContractSet::new(
+        vec![contract("billing", "billing", &rules, SHA_A)],
+        Vec::new(),
+    );
+    assert_eq!(bound.drift(&removed), ["policy payment was removed"]);
+}
+
+/** Test that a checkpoint is bound only to a full, lowercase commit SHA recorded under its own
+ * name; moving references and abbreviated ids are rejected
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn checkpoint_commit_requires_a_full_immutable_sha() {
+    use crate::ir::checkpoint_commit;
+    assert_eq!(
+        checkpoint_commit("baseline", "baseline", SHA_A).unwrap(),
+        SHA_A
+    );
+    let sha256 = "a".repeat(64);
+    assert_eq!(
+        checkpoint_commit("baseline", "baseline", &sha256).unwrap(),
+        sha256
+    );
+    for commit in [
+        "HEAD",
+        "main",
+        "refs/heads/main",
+        "1111111",
+        &"A".repeat(40),
+        &format!("{SHA_A}^"),
+        "",
+    ] {
+        let error = checkpoint_commit("baseline", "baseline", commit).unwrap_err();
+        assert!(error.contains("not a full commit SHA"), "{commit}: {error}");
+    }
+    let error = checkpoint_commit("baseline", "release", SHA_A).unwrap_err();
+    assert!(error.contains("records checkpoint 'release'"), "{error}");
 }
 
 /** Test that the agent adapters hold no policy semantics: their source never names clauses,
@@ -707,6 +977,48 @@ fn metadata_guard_matches_paths_and_commands() {
     assert!(runs_mutating_crane("x && ./bin/crane.exe checkpoint"));
     assert!(!runs_mutating_crane("crane agent session show claude-1"));
     assert!(!runs_mutating_crane("crane check --agent"));
+    for review in ["approve p", "reject p", "edit p", "regenerate p"] {
+        assert!(
+            runs_mutating_crane(&format!("crane policy {review}")),
+            "{review}"
+        );
+    }
+    assert!(!runs_mutating_crane("crane policy propose --name p"));
+    assert!(!runs_mutating_crane("crane policy show p"));
+    assert!(!runs_mutating_crane("crane discover --policies"));
+    for operation in [
+        "ingest --source jira",
+        "sync",
+        "advance PAY-1 --to MERGED",
+        "serve",
+    ] {
+        assert!(
+            runs_mutating_crane(&format!("crane task {operation}")),
+            "{operation}"
+        );
+    }
+    assert!(!runs_mutating_crane("crane task status"));
+    for operation in [
+        "start --session x",
+        "resume s",
+        "cancel s",
+        "finalize s",
+        "sweep",
+        "quarantine s",
+        "extend s --actions 5",
+    ] {
+        assert!(
+            runs_mutating_crane(&format!("crane agent session {operation}")),
+            "{operation}"
+        );
+    }
+    assert!(runs_mutating_crane("crane agent session cleanup s"));
+    assert!(!runs_mutating_crane(
+        "crane agent session verify s --level fast"
+    ));
+    assert!(!runs_mutating_crane("crane agent session show s"));
+    assert!(!runs_mutating_crane("crane agent session list"));
+    assert!(!runs_mutating_crane("crane task plan PAY-1"));
 }
 
 /** Test that Codex apply_patch text is parsed into the file changes it proposes: added, deleted,

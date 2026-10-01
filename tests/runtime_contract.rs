@@ -985,3 +985,565 @@ fn preserve_scopes_are_enforced_before_execution() {
         }
     }
 }
+
+/** Run a Claude Code hook bound to a session and a task identity, as a hook configured with
+ * --task would
+ * Input
+    - fixture: &Fixture - repository
+    - event: &str - hook event name
+    - session: &str - Claude session id
+    - task: &str - task identity
+    - payload: Value - extra payload fields
+ * Output
+    - Output of the hook process
+*/
+fn claude_task(
+    fixture: &Fixture,
+    event: &str,
+    session: &str,
+    task: &str,
+    mut payload: Value,
+) -> Output {
+    payload["session_id"] = json!(session);
+    payload["hook_event_name"] = json!(event);
+    fixture.crane(
+        &[
+            "agent",
+            "hook",
+            "--event",
+            event,
+            "--profile",
+            "claude",
+            "--task",
+            task,
+        ],
+        &payload.to_string(),
+    )
+}
+
+/** Ask the Claude PreToolUse hook about an edit no contract covers, which a usable session allows
+ * Input
+    - fixture: &Fixture - repository
+    - session: &str - Claude session id
+ * Output
+    - Output of the hook process
+*/
+fn unrelated_edit(fixture: &Fixture, session: &str) -> Output {
+    fixture.edit(session, "    return 1", "    return 2")
+}
+
+/** An edit applied to a stored session document */
+type Tamper = fn(&mut Value);
+
+/** Rewrite a session's session.json through a JSON edit, the way a tool bypassing the metadata
+ * guard could
+ * Input
+    - fixture: &Fixture - repository
+    - session: &str - Crane session id
+    - change: Tamper - edit applied to the stored document
+ * Output
+    - None
+*/
+fn rewrite_session(fixture: &Fixture, session: &str, change: Tamper) {
+    let path = format!(".crane/runtime/sessions/{session}/session.json");
+    let mut document: Value = serde_json::from_str(&fixture.read(&path)).unwrap();
+    change(&mut document);
+    fixture.write(&path, &document.to_string());
+}
+
+/** Session immutability: every authority-defining field of a stored session (expiry, agent,
+ * task, root, repository, grants, clause target, checkpoint commit, contract version) is covered
+ * by the binding digest, so rewriting any of them denies every mutating tool until the original
+ * binding is back; a session file copied under another session id is rejected as well
+ */
+#[test]
+fn session_binding_is_immutable_and_tamper_evident() {
+    let fixture = Fixture::new(POLICY);
+    assert!(fixture
+        .claude("session-start", "b1", json!({}))
+        .status
+        .success());
+    let path = ".crane/runtime/sessions/claude-b1/session.json";
+    let original = fixture.read(path);
+    let stored: Value = serde_json::from_str(&original).unwrap();
+    assert!(stored["binding_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(stored["session_format"], 3);
+    assert!(stored["repository_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(unrelated_edit(&fixture, "b1").status.success());
+
+    let cases: [(&str, Tamper); 11] = [
+        ("expiry", |document| {
+            document["expires_at"] = json!(4_102_444_800u64)
+        }),
+        ("autonomy", |document| {
+            document["governance"]["autonomy"] = json!("autonomous")
+        }),
+        ("budget", |document| {
+            document["governance"]["budget"]["mutating_actions"] = json!(1_000_000)
+        }),
+        ("agent", |document| document["agent"] = json!("generic")),
+        ("task", |document| document["task_id"] = json!("other-task")),
+        ("root", |document| document["root"] = json!("C:/elsewhere")),
+        ("repository", |document| {
+            document["repository_id"] = json!("sha256:0")
+        }),
+        ("grant", |document| {
+            document["grants"][0]["baseline"] = json!("def charge(self, amount): pass")
+        }),
+        ("clause target", |document| {
+            document["contracts"]["contracts"][0]["clauses"][0]["target"] =
+                json!("PaymentService.calculate")
+        }),
+        ("checkpoint", |document| {
+            document["contracts"]["contracts"][0]["checkpoint_sha"] =
+                json!("2222222222222222222222222222222222222222")
+        }),
+        ("contract version", |document| {
+            document["contracts"]["version"] = json!("sha256:0")
+        }),
+    ];
+    for (name, change) in cases {
+        rewrite_session(&fixture, "claude-b1", change);
+        let denied = unrelated_edit(&fixture, "b1");
+        assert_eq!(denied.status.code(), Some(2), "{name}");
+        assert!(
+            text(&denied.stderr).contains("is invalid"),
+            "{name}: {}",
+            text(&denied.stderr)
+        );
+        let listing = text(&fixture.crane(&["agent", "session", "list"], "").stdout);
+        assert!(listing.contains("claude-b1 invalid"), "{name}: {listing}");
+        fixture.write(path, &original);
+        assert!(unrelated_edit(&fixture, "b1").status.success(), "{name}");
+    }
+
+    // A valid session file planted under another session id does not grant that session anything
+    fixture.write(".crane/runtime/sessions/claude-b2/session.json", &original);
+    let planted = unrelated_edit(&fixture, "b2");
+    assert_eq!(planted.status.code(), Some(2));
+    assert!(text(&planted.stderr).contains("belongs to another agent session"));
+    assert_eq!(fixture.read(path), original);
+}
+
+/** Policy version and checkpoint consistency: after a session is bound, flipping the policy and
+ * replacing the checkpoint with a moving reference changes neither runtime authority nor
+ * verification; the drift is named policy by policy and checkpoint by checkpoint, and the
+ * replaced checkpoint cannot be bound by a new session either
+ */
+#[test]
+fn agent_cannot_alter_policy_version_or_checkpoint_of_its_session() {
+    let fixture = Fixture::new(POLICY);
+    assert!(fixture
+        .claude("session-start", "d1", json!({}))
+        .status
+        .success());
+    let bound = fixture.show("claude-d1");
+    let version = bound["contracts"]["version"].as_str().unwrap().to_string();
+    let sha = bound["contracts"]["contracts"][0]["checkpoint_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(bound["drift"], json!([]));
+
+    // Written directly, as if the metadata guard had been bypassed
+    fixture.write(
+        ".crane/policies/payment.crane",
+        &POLICY
+            .replace(
+                "preserve --function PaymentService.charge",
+                "target --function PaymentService.charge",
+            )
+            .replace(
+                "target --function PaymentService.calculate",
+                "preserve --function PaymentService.calculate",
+            ),
+    );
+    fixture.write(
+        ".crane/checkpoints/baseline.json",
+        "{\"name\":\"baseline\",\"commit\":\"HEAD\",\"branch\":\"main\",\"created_at_unix\":0}\n",
+    );
+
+    // Runtime authority keeps the bound sides: charge stays preserved, calculate stays a target
+    assert_eq!(
+        fixture
+            .edit("d1", "return amount * 3", "return amount * 4")
+            .status
+            .code(),
+        Some(2)
+    );
+    assert!(fixture
+        .edit("d1", "return amount + 1", "return amount + 2")
+        .status
+        .success());
+
+    let shown = fixture.show("claude-d1");
+    assert_eq!(shown["contracts"]["version"], version.as_str());
+    let drift = shown["drift"].to_string();
+    assert!(drift.contains("policy payment changed"), "{drift}");
+    assert!(
+        drift.contains(&format!(
+            "checkpoint baseline of policy payment moved from {} to unavailable",
+            &sha[..12]
+        )),
+        "{drift}"
+    );
+
+    satisfy_target(&fixture);
+    // Drift is human-owned, so stop reports it without trapping the agent
+    let stop = fixture.claude("stop", "d1", json!({"stop_hook_active": false}));
+    assert!(stop.status.success(), "{}", text(&stop.stdout));
+    let attestation = &fixture.show("claude-d1")["attestation"];
+    assert_eq!(attestation["final_status"], "FAIL");
+    assert_eq!(
+        attestation["findings"][0]["violation_type"],
+        "contract_drift"
+    );
+    assert_eq!(attestation["findings"][0]["repair_owner"], "human");
+    for key in [
+        "contract_version",
+        "runtime_contract_version",
+        "verification_contract_version",
+    ] {
+        assert_eq!(attestation[key], version.as_str(), "{key}");
+    }
+    assert_eq!(attestation["preserve_results"][0]["status"], "pass");
+    assert_eq!(
+        attestation["preserve_results"][0]["checkpoint_sha"],
+        sha.as_str()
+    );
+    assert_eq!(attestation["target_results"][0]["status"], "pass");
+    assert_eq!(attestation["drift"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        attestation["reconciliation"]["same_contract_version"],
+        false
+    );
+
+    // The moving checkpoint is never bound: a new session fails closed and check fails
+    let fresh = unrelated_edit(&fixture, "d2");
+    assert_eq!(fresh.status.code(), Some(2));
+    assert!(
+        text(&fresh.stderr).contains("not a full commit SHA"),
+        "{}",
+        text(&fresh.stderr)
+    );
+    let check = fixture.crane(&["check", "--json"], "");
+    assert!(!check.status.success());
+    assert!(text(&check.stdout).contains("not a full commit SHA"));
+}
+
+/** Runtime authority and verification use one binding: the same contract version, contract
+ * hash, checkpoint commit, repository, and binding digest appear in the session, in every
+ * journal event, and in the attestation of a passing session
+ */
+#[test]
+fn runtime_and_verification_share_one_binding() {
+    let fixture = Fixture::new(POLICY);
+    let start = fixture.claude("session-start", "e1", json!({}));
+    assert!(start.status.success());
+    let bound = fixture.show("claude-e1");
+    let version = bound["contracts"]["version"].as_str().unwrap();
+    let digest = bound["binding_digest"].as_str().unwrap();
+    let contract = &bound["contracts"]["contracts"][0];
+    assert!(text(&start.stdout).contains(&format!("contract_version: {version}")));
+
+    assert!(fixture
+        .edit("e1", "return amount + 1", "return amount + 2")
+        .status
+        .success());
+    satisfy_target(&fixture);
+    let edit = json!({"tool_name": "Edit", "tool_input": {"file_path": "payment.py"}});
+    assert!(fixture.claude("post-tool-use", "e1", edit).status.success());
+    let stop = fixture.claude("stop", "e1", json!({"stop_hook_active": false}));
+    assert!(stop.status.success(), "{}", text(&stop.stdout));
+
+    let attestation = &fixture.show("claude-e1")["attestation"];
+    assert_eq!(attestation["final_status"], "PASS");
+    assert_eq!(attestation["binding_digest"], digest);
+    assert_eq!(attestation["repository_id"], bound["repository_id"]);
+    for key in [
+        "contract_version",
+        "runtime_contract_version",
+        "verification_contract_version",
+        "repository_contract_version",
+    ] {
+        assert_eq!(attestation[key], version, "{key}");
+    }
+    assert_eq!(
+        attestation["contracts"][0]["contract_hash"],
+        contract["contract_hash"]
+    );
+    assert_eq!(
+        attestation["contracts"][0]["checkpoint_sha"],
+        contract["checkpoint_sha"]
+    );
+    assert_eq!(
+        attestation["preserve_results"][0]["checkpoint_sha"],
+        contract["checkpoint_sha"]
+    );
+    assert_eq!(
+        attestation["target_results"][0]["checkpoint_sha"],
+        contract["checkpoint_sha"]
+    );
+    assert_eq!(attestation["drift"], json!([]));
+    assert_eq!(attestation["reconciliation"]["same_repository"], true);
+    assert_eq!(attestation["reconciliation"]["fully_reconciled"], true);
+    let journal = fixture.journal("claude-e1");
+    assert_eq!(journal.len(), 4);
+    for event in journal {
+        assert_eq!(event["binding"], digest);
+        assert_eq!(event["contract_version"], version);
+    }
+}
+
+/** Task identity is bound when the session is created: it is recorded in the binding and the
+ * attestation, a hook presenting another task is refused, and a hook presenting none is not a
+ * claim and keeps working
+ */
+#[test]
+fn task_identity_is_bound_at_creation() {
+    let fixture = Fixture::new(POLICY);
+    assert!(
+        claude_task(&fixture, "session-start", "t1", "TASK-1", json!({}))
+            .status
+            .success()
+    );
+    assert_eq!(fixture.show("claude-t1")["task_id"], "TASK-1");
+    let edit = json!({"tool_name": "Edit", "tool_input": {
+        "file_path": "payment.py", "old_string": "    return 1", "new_string": "    return 2"}});
+    assert!(
+        claude_task(&fixture, "pre-tool-use", "t1", "TASK-1", edit.clone())
+            .status
+            .success()
+    );
+    let other = claude_task(&fixture, "pre-tool-use", "t1", "TASK-2", edit.clone());
+    assert_eq!(other.status.code(), Some(2));
+    assert!(text(&other.stderr).contains("is bound to task TASK-1, not TASK-2"));
+    assert!(unrelated_edit(&fixture, "t1").status.success());
+    let unusable = claude_task(&fixture, "pre-tool-use", "t2", "bad task", edit);
+    assert_eq!(unusable.status.code(), Some(2));
+    assert!(text(&unusable.stderr).contains("unusable task id"));
+
+    satisfy_target(&fixture);
+    assert!(fixture
+        .claude("stop", "t1", json!({"stop_hook_active": false}))
+        .status
+        .success());
+    assert_eq!(
+        fixture.show("claude-t1")["attestation"]["task_id"],
+        "TASK-1"
+    );
+}
+
+/** Target authorizes mutation without becoming an allowlist or an override: one write that
+ * changes the target and unrelated code is allowed, while one write that changes the target and
+ * preserved code is denied because target never overrides preserve
+ */
+#[test]
+fn target_authority_is_neither_allowlist_nor_override() {
+    let fixture = Fixture::new(POLICY);
+    let write = |content: String| {
+        fixture.claude(
+            "pre-tool-use",
+            "a1",
+            json!({"tool_name": "Write", "tool_input": {"file_path": "payment.py", "content": content}}),
+        )
+    };
+    let with_unrelated = PAYMENT
+        .replace("return amount + 1", "return amount + 2")
+        .replace("    return 1", "    return 9");
+    assert!(write(with_unrelated).status.success());
+    let with_preserved = PAYMENT
+        .replace("return amount + 1", "return amount + 2")
+        .replace("return amount * 3", "return amount * 4");
+    let denied = write(with_preserved);
+    assert_eq!(denied.status.code(), Some(2));
+    let reason = text(&denied.stderr);
+    assert!(
+        reason.contains("would modify code protected by preserve function PaymentService.charge"),
+        "{reason}"
+    );
+    let decisions = fixture
+        .journal("claude-a1")
+        .iter()
+        .map(|event| event["decision"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, ["allow", "deny"]);
+}
+
+/** Failed and partial session recovery: files a crashed attempt left without a session.json are
+ * moved aside so a new session starts active with a clean journal; a truncated or old-format
+ * session.json fails closed until a human removes it; a journal line cut short by a crash fails
+ * reconciliation; and a failed session keeps its binding while the agent repairs it
+ */
+#[test]
+fn failed_and_partial_sessions_recover_or_fail_closed() {
+    let fixture = Fixture::new(POLICY);
+
+    // Leftovers of an attempt that crashed before session.json was linked
+    let orphan = ".crane/runtime/sessions/claude-r1";
+    fixture.write(
+        &format!("{orphan}/journal.jsonl"),
+        "{\"event\":\"forged\"}\n{\"event\":",
+    );
+    fixture.write(&format!("{orphan}/state"), "closed\n");
+    fixture.write(
+        &format!("{orphan}/attestation.json"),
+        "{\"final_status\":\"PASS\"}",
+    );
+    fixture.write(&format!("{orphan}/session.json.99999"), "{");
+    assert!(fixture
+        .claude("session-start", "r1", json!({}))
+        .status
+        .success());
+    let shown = fixture.show("claude-r1");
+    assert_eq!(shown["lifecycle"], "active");
+    assert_eq!(shown["attestation"], Value::Null);
+    assert_eq!(fixture.journal("claude-r1").len(), 1);
+    let recovered = fs::read_dir(fixture.root.join(orphan))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("recovered-")
+        })
+        .expect("leftovers are kept as evidence");
+    assert!(recovered.path().join("journal.jsonl").is_file());
+    satisfy_target(&fixture);
+    let stop = fixture.claude("stop", "r1", json!({"stop_hook_active": false}));
+    assert!(stop.status.success(), "{}", text(&stop.stdout));
+    assert_eq!(
+        fixture.show("claude-r1")["attestation"]["final_status"],
+        "PASS"
+    );
+    fixture.write("payment.py", PAYMENT);
+
+    // A session.json cut short fails closed and names the human repair
+    assert!(fixture
+        .claude("session-start", "r2", json!({}))
+        .status
+        .success());
+    let path = ".crane/runtime/sessions/claude-r2/session.json";
+    let content = fixture.read(path);
+    fixture.write(path, &content[..content.len() / 2]);
+    let denied = unrelated_edit(&fixture, "r2");
+    assert_eq!(denied.status.code(), Some(2));
+    let reason = text(&denied.stderr);
+    assert!(reason.contains("is invalid"), "{reason}");
+    assert!(
+        reason.contains("removes .crane/runtime/sessions/claude-r2"),
+        "{reason}"
+    );
+    assert!(!fixture
+        .claude("session-start", "r2", json!({}))
+        .status
+        .success());
+    fs::remove_dir_all(fixture.root.join(".crane/runtime/sessions/claude-r2")).unwrap();
+    assert!(fixture
+        .claude("session-start", "r2", json!({}))
+        .status
+        .success());
+    assert!(unrelated_edit(&fixture, "r2").status.success());
+
+    // A session written by an older layout is not trusted
+    rewrite_session(&fixture, "claude-r2", |document| {
+        document["session_format"] = json!(1)
+    });
+    let old = unrelated_edit(&fixture, "r2");
+    assert_eq!(old.status.code(), Some(2));
+    assert!(text(&old.stderr).contains("unsupported session format"));
+
+    // A journal line cut short by a crash fails reconciliation
+    assert!(fixture
+        .claude("session-start", "r3", json!({}))
+        .status
+        .success());
+    let journal = root_path(&fixture, ".crane/runtime/sessions/claude-r3/journal.jsonl");
+    let mut content = fs::read_to_string(&journal).unwrap();
+    content.push_str("{\"event\":\"pre_tool_use\",\"seq\":");
+    fs::write(&journal, content).unwrap();
+    satisfy_target(&fixture);
+    assert!(fixture
+        .claude("stop", "r3", json!({"stop_hook_active": false}))
+        .status
+        .success());
+    let attestation = &fixture.show("claude-r3")["attestation"];
+    assert_eq!(attestation["final_status"], "FAIL");
+    assert_eq!(
+        attestation["findings"][0]["violation_type"],
+        "journal_error"
+    );
+    assert_eq!(attestation["reconciliation"]["fully_reconciled"], false);
+    fixture.write("payment.py", PAYMENT);
+
+    // A failed session keeps its binding while the agent repairs it, also across a resume
+    assert!(fixture
+        .claude("session-start", "r4", json!({}))
+        .status
+        .success());
+    let digest = fixture.show("claude-r4")["binding_digest"].clone();
+    let failed = fixture.claude("stop", "r4", json!({"stop_hook_active": false}));
+    assert_eq!(failed.status.code(), Some(2));
+    assert_eq!(
+        fixture.show("claude-r4")["attestation"]["final_status"],
+        "FAIL"
+    );
+    assert!(fixture
+        .claude("session-end", "r4", json!({}))
+        .status
+        .success());
+    assert!(fixture
+        .claude("session-start", "r4", json!({"source": "resume"}))
+        .status
+        .success());
+    satisfy_target(&fixture);
+    assert!(fixture
+        .claude("stop", "r4", json!({"stop_hook_active": false}))
+        .status
+        .success());
+    let repaired = fixture.show("claude-r4");
+    assert_eq!(repaired["binding_digest"], digest);
+    assert_eq!(repaired["attestation"]["final_status"], "PASS");
+    assert_eq!(repaired["attestation"]["binding_digest"], digest);
+}
+
+/** A session is bound to its repository: a valid session file copied into another repository
+ * denies every mutating tool there and fails reconciliation instead of resolving paths against
+ * the wrong root
+ */
+#[test]
+fn sessions_are_bound_to_their_repository() {
+    let origin = Fixture::new(POLICY);
+    let other = Fixture::new(POLICY);
+    assert!(origin
+        .claude("session-start", "m1", json!({}))
+        .status
+        .success());
+    let path = ".crane/runtime/sessions/claude-m1/session.json";
+    other.write(path, &origin.read(path));
+    let denied = unrelated_edit(&other, "m1");
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(
+        text(&denied.stderr).contains("not to this one"),
+        "{}",
+        text(&denied.stderr)
+    );
+    satisfy_target(&other);
+    other.claude("stop", "m1", json!({"stop_hook_active": false}));
+    let attestation = &other.show("claude-m1")["attestation"];
+    assert_eq!(attestation["final_status"], "FAIL");
+    assert_eq!(attestation["reconciliation"]["same_repository"], false);
+    assert!(attestation["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["violation_type"] == "repository_mismatch"));
+    assert!(unrelated_edit(&origin, "m1").status.success());
+}

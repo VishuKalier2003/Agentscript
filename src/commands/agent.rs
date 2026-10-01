@@ -5,15 +5,17 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::context;
 use crate::adapter::{adapter, AgentAdapter, AgentKind, HookEvent, ProviderEvent};
-use crate::authority::{AgentAction, Operation, Runtime, Verdict};
+use crate::agent_session::{self, SessionOptions};
+use crate::authority::{AgentAction, Operation, Runtime, Usage};
+use crate::effects;
 use crate::ir::ContractSet;
 use crate::repository::ensure_initialized;
 use crate::scope::ScopeContext;
 use crate::session::{read_attestation, session_ids, ContractSession, Lifecycle};
 use crate::util::option;
 use crate::verify::{assess, setup_report, verify_contracts, Assessment, Report};
+use crate::zones::model::SafetyState;
 
 /** Handle the agent subcommands, by first reading the operation (default verify) and the
  * --profile/--agent value, building the matching adapter, and then routing to install, hook,
@@ -43,16 +45,10 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             let event = option(args, "--event").ok_or(
                 "agent hook requires --event session-start|user-prompt-submit|pre-tool-use|post-tool-use|permission-request|stop|session-end (or the host spelling, such as PreToolUse)",
             )?;
-            let ttl = option(args, "--ttl")
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| format!("--ttl must be a number of seconds, not '{value}'"))
-                })
-                .transpose()?;
-            hook(HookEvent::parse(&event)?, adapter.as_ref(), ttl)
+            let options = SessionOptions::from_args(args)?;
+            hook(HookEvent::parse(&event)?, adapter.as_ref(), &options)
         }
-        "session" => session(&args[1..]),
+        "session" => session(&args[1..], selected),
         "init" => {
             if selected == AgentKind::Codex {
                 // Codex installation is additive and idempotent, so init can always (re)install it
@@ -81,12 +77,17 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
  * Input
     - event: HookEvent - lifecycle event
     - adapter: &dyn AgentAdapter - provider adapter
-    - ttl: Option<u64> - session lifetime in seconds, used only when the session is created
+    - options: &SessionOptions - lifetime, idle timeout, task, autonomy mode, and budget, used
+      only when the session is created (a task given later must match the bound one)
  * Output
     - Result<(), String>
     - HOOK_BLOCK error when the action is denied or the agent must repair something now
 */
-fn hook(event: HookEvent, adapter: &dyn AgentAdapter, ttl: Option<u64>) -> Result<(), String> {
+fn hook(
+    event: HookEvent,
+    adapter: &dyn AgentAdapter,
+    options: &SessionOptions,
+) -> Result<(), String> {
     let result = read_payload(event).and_then(|payload| {
         let provider = adapter.translate(event, &payload);
         if let Err(error) = ensure_initialized() {
@@ -94,9 +95,9 @@ fn hook(event: HookEvent, adapter: &dyn AgentAdapter, ttl: Option<u64>) -> Resul
         }
         let session = match &provider.session {
             Some(id) => {
-                ContractSession::establish(adapter.kind(), id, ttl).map(|(session, _)| session)
+                agent_session::establish(adapter.kind(), id, options).map(|(session, _)| session)
             }
-            None => ContractSession::transient(adapter.kind()),
+            None => agent_session::transient(adapter.kind(), options),
         };
         match session {
             Ok(session) => handle(event, adapter, provider, &session),
@@ -111,11 +112,14 @@ fn hook(event: HookEvent, adapter: &dyn AgentAdapter, ttl: Option<u64>) -> Resul
     }
 }
 
-/** Handle an event under its contract session: session-start reactivates the session and prints
- * model context; user-prompt-submit verifies every clause; pre-tool-use authorizes the action and
- * journals the decision; post-tool-use journals the action and verifies only the clauses it could
- * have affected; stop reconciles completely and writes the attestation (targets are enforced
- * unless this stop is already a forced retry); session-end reconciles and closes the session
+/** Handle an event under its contract session through the provider-neutral session manager:
+ * session-start reactivates a resumable session and prints the concise context; user-prompt-submit
+ * verifies every clause (and restores lapsed authority, since a human is present); pre-tool-use and
+ * permission-request authorize the action through the common policy engine (contract, zones,
+ * autonomy, budget, safety) and journal it; post-tool-use journals the action, verifies only the
+ * clauses it could have affected, and degrades the session if the contract drifted; stop
+ * reconciles completely and writes the attestation (targets are enforced unless this stop is
+ * already a forced retry); session-end reconciles and closes the session (resumable)
  * Input
     - event: HookEvent - lifecycle event
     - adapter: &dyn AgentAdapter - provider adapter
@@ -134,15 +138,16 @@ fn handle(
     let protected = adapter.protected_paths();
     match event {
         HookEvent::SessionStart => {
-            if session.lifecycle() == Lifecycle::Closed {
-                session.set_lifecycle(Lifecycle::Active)?;
-            }
-            session.record(json!({ "event": "session_start" }))?;
-            print!("{}", context::render(&session.contracts));
+            let context = agent_session::on_start(
+                session,
+                provider.model.as_deref(),
+                provider.source.as_deref(),
+            )?;
+            print!("{context}");
             Ok(())
         }
         HookEvent::UserPromptSubmit => {
-            let report = verify_contracts(&session.contracts, &mut ScopeContext::new(), &|_| true);
+            let report = verify_contracts(session.contracts(), &mut ScopeContext::new(), &|_| true);
             session.record(json!({
                 "event": "user_prompt_submit",
                 "verification": outcome(&report),
@@ -151,22 +156,29 @@ fn handle(
         }
         HookEvent::PreToolUse => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            let verdict = session.runtime(protected).decide(&action);
-            session.record(action_event("pre_tool_use", &action, &verdict))?;
+            let verdict = agent_session::authorize(session, protected, &action, "pre_tool_use")?;
             adapter.respond_action(&verdict)
         }
         HookEvent::PermissionRequest => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            let verdict = session.runtime(protected).decide(&action);
-            session.record(action_event("permission_request", &action, &verdict))?;
+            let verdict =
+                agent_session::authorize(session, protected, &action, "permission_request")?;
             adapter.respond_permission(&verdict)
         }
         HookEvent::PostToolUse => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            let relevant = session.runtime(protected).relevant(&action);
-            let report = verify_contracts(&session.contracts, &mut ScopeContext::new(), &|index| {
-                relevant.get(index).copied().unwrap_or(true)
-            });
+            // Reads change nothing; everything else is judged by what actually changed
+            let (report, effect) = if action.operation == Operation::Read {
+                (
+                    Report {
+                        passes: Vec::new(),
+                        violations: Vec::new(),
+                    },
+                    Value::Null,
+                )
+            } else {
+                effects::observe(session, &action, protected)?
+            };
             session.record(json!({
                 "event": "post_tool_use",
                 "tool": action.tool,
@@ -174,18 +186,21 @@ fn handle(
                 "resources": action.files.iter().map(|change| format!("file:{}", change.path)).collect::<Vec<_>>(),
                 "arguments_digest": action.digest,
                 "result": "executed",
-                "verified_clauses": relevant.iter().filter(|selected| **selected).count(),
+                "verified_clauses": effect["clauses_checked"].as_u64().unwrap_or(0),
                 "verification": outcome(&report),
+                "effect": effect,
             }))?;
+            agent_session::after_tool(session)?;
             adapter.respond_verification(event, assess(&report, false), &report)
         }
         HookEvent::Stop => {
-            let (report, attestation) = session.reconcile();
+            let (report, attestation) = effects::validate(session)?;
             session.write_attestation(&attestation)?;
             session.record(json!({
                 "event": "stop",
                 "stop_hook_active": provider.stop_hook_active,
                 "final_status": attestation["final_status"],
+                "tests": attestation["tests"].as_array().map(|tests| tests.iter().map(|test| json!({"language": test["language"], "status": test["status"]})).collect::<Vec<_>>()),
             }))?;
             adapter.respond_verification(
                 event,
@@ -229,17 +244,17 @@ fn unbound(
     match event {
         HookEvent::SessionStart => Err(error.into()),
         HookEvent::PreToolUse | HookEvent::PermissionRequest => {
-            let empty = ContractSet {
-                version: String::new(),
-                contracts: Vec::new(),
-                malformed: Vec::new(),
-            };
+            let empty = ContractSet::new(Vec::new(), Vec::new());
             let runtime = Runtime {
                 contracts: &empty,
                 grants: &[],
                 root: env::current_dir().map_err(|error| error.to_string())?,
                 protected: adapter.protected_paths(),
                 problem: fail_closed.then(|| error.to_string()),
+                governance: None,
+                usage: Usage::unlimited(),
+                safety: SafetyState::Active,
+                safety_reason: None,
             };
             let verdict = runtime.decide(&provider.action.unwrap_or_else(unknown_action));
             match event {
@@ -304,31 +319,6 @@ fn unknown_action() -> AgentAction {
     }
 }
 
-/** Build the journal event for an authorization, with the tool, normalized operation and
- * resources, decision, reasons, and a digest of the arguments instead of the arguments themselves
- * Input
-    - name: &str - event name
-    - action: &AgentAction - normalized action
-    - verdict: &Verdict - decision
- * Output
-    - Value JSON object
-*/
-fn action_event(name: &str, action: &AgentAction, verdict: &Verdict) -> Value {
-    json!({
-        "event": name,
-        "tool": action.tool,
-        "operation": action.operation.name(),
-        "resources": verdict.resources,
-        "decision": verdict.decision.name(),
-        "reasons": verdict.reasons,
-        "arguments_digest": action.digest,
-        "result": match verdict.decision.name() {
-            "allow" => "authorized",
-            _ => "blocked",
-        },
-    })
-}
-
 /** Summarize a report for the journal
  * Input
     - report: &Report - verification report
@@ -343,17 +333,27 @@ fn outcome(report: &Report) -> &'static str {
     }
 }
 
-/** List contract sessions or show one, for humans and CI reading the evidence: "list" prints one
- * line per session and "show ID" prints the binding and the latest attestation as JSON; the
- * command only reads, it cannot create, refresh, or close a session
+/** Manage contract sessions: "list" prints one line per session (an unreadable or tampered session
+ * is listed as invalid) and "show ID" prints the binding, its digest, governance, activity, drift,
+ * and the latest attestation as JSON; "start", "resume", "cancel", "finalize", "sweep",
+ * "quarantine", and "extend" run the session lifecycle (refused to agents by the pre-tool hook,
+ * and resume, extend, and start also in an agent environment)
  * Input
     - args: &[String] - arguments after "agent session"
+    - profile: AgentKind - --profile value, used by start
  * Output
     - Result<(), String>
     - Error if not initialized, the session is unknown, or the subcommand is invalid
 */
-fn session(args: &[String]) -> Result<(), String> {
+fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
     ensure_initialized()?;
+    let id = || {
+        args.get(1)
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+            .ok_or_else(|| "this session operation requires a session id".to_string())
+    };
+    let reason = || option(args, "--reason").unwrap_or_else(|| "by a human".into());
     match args.first().map(String::as_str) {
         None | Some("list") | Some("--profile") | Some("--agent") => {
             let ids = session_ids()?;
@@ -364,40 +364,125 @@ fn session(args: &[String]) -> Result<(), String> {
                 let status = read_attestation(&id)?
                     .and_then(|attestation| attestation["final_status"].as_str().map(String::from))
                     .unwrap_or_else(|| "not reconciled".into());
-                let lifecycle = match ContractSession::load(&id)? {
-                    Some(session) if session.lifecycle() == Lifecycle::Closed => "closed",
-                    Some(_) => "active",
-                    None => "missing",
+                let lifecycle = match ContractSession::load(&id) {
+                    Ok(Some(session)) => session.lifecycle().name(),
+                    Ok(None) => "missing",
+                    Err(_) => "invalid",
                 };
                 println!("{id} {lifecycle} {status}");
             }
             Ok(())
         }
         Some("show") => {
-            let id = args.get(1).ok_or("agent session show requires a session id")?;
-            let session = ContractSession::load(id)?
+            let id = id()?;
+            let session = ContractSession::load(&id)?
                 .ok_or_else(|| format!("no contract session '{id}'"))?;
-            let output = json!({
-                "session_id": session.id,
-                "agent": session.agent.name(),
-                "provider_session": session.provider_session,
-                "created_at": session.created_at,
-                "expires_at": session.expires_at,
-                "lifecycle": match session.lifecycle() {
-                    Lifecycle::Active => "active",
-                    Lifecycle::Closed => "closed",
-                },
-                "contracts": session.contracts.to_json(),
-                "attestation": read_attestation(id)?,
-            });
+            let mut output = session.describe();
+            output["attestation"] = json!(read_attestation(&id)?);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?
             );
             Ok(())
         }
+        Some("start") => {
+            let provider = option(args, "--session")
+                .ok_or("crane agent session start requires --session PROVIDER_SESSION_ID")?;
+            let options = SessionOptions::from_args(args)?;
+            let (session, context) = agent_session::start(profile, &provider, &options)?;
+            println!("Contract session {} is ready.", session.describe()["session_id"].as_str().unwrap_or_default());
+            if options.isolate {
+                println!("Isolated worktree: {} (run the agent there)", session.root_path().display());
+            }
+            print!("{context}");
+            Ok(())
+        }
+        Some("resume") => {
+            let id = id()?;
+            agent_session::resume(&id)?;
+            println!("Resumed contract session {id}.");
+            Ok(())
+        }
+        Some("cancel") => {
+            let id = id()?;
+            let cancelled = agent_session::cancel(&id, &reason())?;
+            println!(
+                "{}",
+                if cancelled { format!("Cancelled contract session {id}; it can never act again.") } else { format!("Contract session {id} had already ended.") }
+            );
+            Ok(())
+        }
+        Some("finalize") => {
+            let id = id()?;
+            let attestation = agent_session::finalize(&id)?;
+            println!("Finalized contract session {id}: {}", attestation["final_status"].as_str().unwrap_or("unknown"));
+            Ok(())
+        }
+        Some("verify") => {
+            let id = id()?;
+            let session = ContractSession::load(&id)?.ok_or_else(|| format!("no contract session '{id}'"))?;
+            let level = option(args, "--level").unwrap_or_else(|| "fast".into());
+            let output = match level.as_str() {
+                "fast" => {
+                    let (report, effect) = effects::within(&effects::workspace_of(&session).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()), || {
+                        effects::observe(&session, &unknown_action(), &[])
+                    })?;
+                    json!({"level": "fast", "effect": effect, "violations": report.violations.iter().map(|violation| json!({"type": violation.violation_type, "target": violation.target, "message": violation.message})).collect::<Vec<_>>()})
+                }
+                "tests" => {
+                    let tests = effects::within(&effects::workspace_of(&session).unwrap_or_else(|| std::env::current_dir().unwrap_or_default()), || {
+                        let (_, changed, _) = effects::cumulative(&session)?;
+                        effects::affected_tests(&session, &changed)
+                    })?;
+                    json!({"level": "tests", "tests": tests})
+                }
+                "full" => {
+                    let (_, attestation) = effects::validate(&session)?;
+                    session.write_attestation(&attestation)?;
+                    json!({"level": "full", "attestation": attestation})
+                }
+                other => return Err(format!("unknown verification level '{other}'; use fast, tests, or full")),
+            };
+            session.record(json!({"event": "verification", "level": level}))?;
+            println!("{}", serde_json::to_string_pretty(&output).map_err(|error| error.to_string())?);
+            Ok(())
+        }
+        Some("cleanup") => {
+            let id = id()?;
+            let branch = agent_session::cleanup(&id)?;
+            println!("Removed the worktree of contract session {id}; its branch {branch} is kept.");
+            Ok(())
+        }
+        Some("sweep") => {
+            let timed_out = agent_session::sweep()?;
+            if timed_out.is_empty() {
+                println!("No session timed out.");
+            }
+            for id in timed_out {
+                println!("Timed out contract session {id}; it keeps no authority until resumed.");
+            }
+            Ok(())
+        }
+        Some("quarantine") => {
+            let id = id()?;
+            agent_session::quarantine(&id, &reason())?;
+            println!("Quarantined contract session {id}; a human must resume it.");
+            Ok(())
+        }
+        Some("extend") => {
+            let id = id()?;
+            let number = |key: &str| {
+                option(args, key)
+                    .map(|value| value.parse::<u64>().map_err(|_| format!("{key} must be a number")))
+                    .transpose()
+                    .map(Option::unwrap_or_default)
+            };
+            agent_session::extend(&id, number("--actions")?, number("--files")?)?;
+            println!("Extended the budget of contract session {id}.");
+            Ok(())
+        }
         Some(other) => Err(format!(
-            "unknown agent session operation '{other}'; use 'crane agent session list' or 'crane agent session show ID'"
+            "unknown agent session operation '{other}'; use list, show, start, resume, cancel, finalize, verify, cleanup, sweep, quarantine, or extend"
         )),
     }
 }

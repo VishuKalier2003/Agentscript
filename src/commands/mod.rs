@@ -5,14 +5,20 @@ mod agent;
 mod check;
 mod checkpoint;
 mod context;
+mod discover;
 mod init;
 mod parse;
+mod policy;
 mod protect;
 mod status;
 mod target;
+mod task;
+mod zones;
 
 #[cfg(test)] // Compile the module only when running tests, not in production builds
 mod tests;
+
+pub(crate) use context::render as render_context;
 
 /** Act as the gateway for every CLI command, by first reading the command name from the process
  * arguments (default help), collecting the remaining arguments, and then matching the name to the
@@ -47,7 +53,11 @@ pub(crate) fn run() -> Result<(), String> {
         "test-all" => check::run(false, false),
         "context" => context::run(),
         "status" => status::run(),
-        "agent" => agent::run(&rest), // agent adapters, hooks, and contract sessions
+        "discover" => discover::run(&rest), // advisory semantic inventory of the repository
+        "policy" => policy::run(&rest), // reviewable policy proposals, activated only by approval
+        "task" => task::run(&rest),     // task-to-contract planning, never activated here
+        "zones" => zones::run(&rest),   // resolved repository zones, an input to authorization
+        "agent" => agent::run(&rest),   // agent adapters, hooks, and contract sessions
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
     }
 }
@@ -110,11 +120,33 @@ Commands:
   agent init [--profile generic|claude|codex]
   agent verify [--profile generic|claude|codex]
   agent install --profile claude|codex
-  agent hook --event EVENT [--profile generic|claude|codex] [--ttl SECONDS]
+  agent hook --event EVENT [--profile generic|claude|codex] [--ttl SECONDS] [--task ID]
+             [--autonomy observe|assisted|delegated|autonomous] [--idle-timeout SECONDS]
+             [--max-actions N] [--max-files N]
   agent session [list | show SESSION_ID]
+  agent session start --profile PROFILE --session ID [--task ID] [--autonomy MODE] [--isolate] [...]
+  agent session verify SESSION_ID [--level fast|tests|full]
+  agent session cleanup SESSION_ID
+  agent session resume|cancel|finalize|quarantine SESSION_ID [--reason TEXT]
+  agent session extend SESSION_ID [--actions N] [--files N]
+  agent session sweep
   test-all
   context
   status
+  discover [--json] [--full] [--policies]
+  policy propose [--name NAME] [--checkpoint NAME] [--min-confidence high|medium|low] [--json]
+  policy proposals | show NAME [--json]
+  policy edit NAME [--file PATH] [--by NAME]
+  policy approve NAME --approver NAME --confirm DIGEST_PREFIX
+  policy reject NAME --approver NAME [--reason TEXT]
+  policy regenerate NAME [--by NAME]
+  zones [ZONE_ID] [--json]
+  task plan TASK_ID|TASK_FILE [--json] [--checkpoint NAME] [--propose]
+  task ingest --source jira|asana [--delivery ID] [EVENT_FILE...] [--json]
+  task sync [TASK_ID] [--json]
+  task status [TASK_ID] [--json]
+  task advance TASK_ID --to STATE [--reason TEXT]
+  task serve [--addr 127.0.0.1:8787] [--once]
 
 TARGET is a language-neutral qualified name, normally Type.member
 (or just the name for a top-level item). The source language is inferred
@@ -128,7 +160,31 @@ EVENT is session-start, user-prompt-submit, pre-tool-use, post-tool-use, permiss
 stop, or session-end; host spellings such as PreToolUse are accepted too. The hook payload is
 read from stdin: Claude Code hook JSON for --profile claude, Codex hook JSON for --profile codex,
 and Crane's neutral action JSON for --profile generic. --ttl only applies when the hook creates
-the session.
+the session. --task (or CRANE_TASK_ID) binds a task id when the hook creates the session.
+Sessions also bind an autonomy mode (default delegated), an autonomy budget, an idle timeout
+(default 1800 s), and a lifetime (default 8 hours), plus the zones and the task scope; every
+tool call is judged by the contract, then by zones, mode, scope, budget, and safety state.
+After a tool runs, its actual effect (files and symbols changed, zones touched) is verified
+incrementally; affected tests (.crane/testing.json) and full validation run at stop. --isolate
+starts a session in its own Git worktree on branch crane/SESSION_ID.
+discover inventories the repository (languages, services, modules, symbols, calls, tests,
+owners, contracts, checkpoints) and suggests critical code to protect; it is advisory and
+enforces nothing. --json prints the full inventory; --full ignores the incremental cache.
+zones resolves the zones in .crane/zones (criticality, autonomy, safety state per semantic
+selector) against the current inventory and shows resolved entities, unresolved selectors, and
+conflicts. Zones only restrict; they never grant permissions or relax a contract.
+discover --policies lists heuristic candidates for protection with reason, confidence, suggested
+rule, and affected entities. policy propose writes them as candidate AgentScript under
+.crane/proposals without activating it; only a human or trusted process can approve (which
+writes .crane/policies/NAME.crane), reject, edit, or regenerate a proposal, never an agent.
+task plan reads .crane/tasks/TASK_ID.json and derives MUST_CHANGE, MUST_NOT_CHANGE, MAY_CHANGE,
+REQUIRES_APPROVAL, TASK_SCOPE, and EXPECTED_TESTS from code references (backticks, Type.method,
+references), or reports task_needs_clarification with what is missing; --propose stores the
+contract as a pending proposal. task ingest replays Jira or Asana webhook deliveries (or stdin)
+through the lifecycle RECEIVED, ANALYZING, CONTRACT_PROPOSED, APPROVED, EXECUTING, VALIDATING,
+PR_READY, REVIEW, MERGED, COMPLETED (or BLOCKED, FAILED, CANCELLED, DEGRADED); task serve accepts
+the same deliveries over HTTP with CRANE_WEBHOOK_TOKEN. Repository mapping and agent assignees
+live in .crane/sources/config.json; agents cannot ingest, sync, advance, or serve.
 agent install --profile codex adds Crane's hooks to .codex/hooks.json without touching other
 hooks; running it again adds nothing. agent init --profile codex also initializes .crane,
 installs those hooks, and verifies."#

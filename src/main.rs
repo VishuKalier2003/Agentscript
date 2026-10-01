@@ -1,16 +1,23 @@
 // fetch the necessary modules
 mod adapter;
+mod agent_session;
 mod authority;
 mod commands;
+mod effects;
+mod inventory;
 mod ir;
 mod model;
+mod orchestration;
 mod policy;
+mod proposals;
 mod repository;
 mod resolver;
 mod scope;
 mod session;
+mod tasks;
 mod util;
 mod verify;
+mod zones;
 
 /** Entry point of the crane binary, dispatches the command line through commands::run and converts
  * any returned error into a printed message and a process exit code, using exit code 2 for errors

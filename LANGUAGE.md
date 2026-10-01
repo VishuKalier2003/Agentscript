@@ -204,6 +204,631 @@ and blank-line changes pass, while re-indentation, re-wrapping, and any code
 change fail. This is not semantic equivalence: code that behaves the same but
 is written differently is still different.
 
+## Repository discovery
+
+`crane discover [--json] [--full]` builds an advisory inventory of the
+repository. It does not change what policies can target, how they resolve, or
+how they are verified.
+
+**Languages.** Discovery reads symbols from Java, JavaScript, Python, Rust,
+TypeScript/TSX, Go, C/C++, and Kotlin. Two parser paths are used:
+
+- For Java, JavaScript, Python, and Rust, it uses the resolver's own item
+  matcher. A discovered symbol's qualified name is therefore exactly what a
+  policy target resolves to. Discovery reports these symbols as `policy_target`.
+- The other languages use discovery-only grammars. They are reported but are
+  not targetable yet.
+
+Discovery tolerates syntax errors and marks such files `partial`. Enforcement
+still rejects them. Files over 1 MB and binary files are counted but not
+parsed. Tool metadata (`.crane`, `.claude`, `.codex`) and vendored folders
+(`node_modules`, `vendor`, `third_party`) are excluded.
+
+**Ids.** Every symbol has an id of the form
+`symbol:LANGUAGE:NAMESPACE.QUALIFIED`. The namespace follows the language's own
+module convention:
+
+| Language | Namespace |
+|---|---|
+| Java, Kotlin | the declared package |
+| Go | the package folder |
+| Python | the dotted module path |
+| JavaScript, TypeScript | the module path |
+| Rust | the crate and module path |
+| C++ | the enclosing namespace, or the folder |
+
+So a Java method keeps its id when its file moves within its package. When
+two symbols share an id (for example, overloads), the later ones get `~2`,
+`~3`, and so on, in path and line order.
+
+Files, modules, folders, and services have ids too: `file:PATH`,
+`module:LANGUAGE:NAME`, `folder:PATH`, and `service:PATH`.
+
+**Relationships.**
+
+- **Calls.** A called name resolves to callables of the same language family
+  (JavaScript with TypeScript, C with C++). One in the same file is preferred,
+  then ones in the same module, then a unique one anywhere. Names matching
+  several candidates are listed as `ambiguous_calls` and are not linked.
+- **Tests.** Tests are found by file convention (`src/test`, `tests/`,
+  `FooTest`, `test_foo`, `foo_test`, `foo.test.ts`, `foo.spec.js`) and by
+  symbol convention (`@Test`, `#[test]`, `test_*`, Go `Test*`). A test links to
+  what it calls. A test file also links, at file level, to the code its
+  callbacks call and to the file it is named after.
+- **Services.** Folders with a build manifest (`pom.xml`, `build.gradle(.kts)`,
+  `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `setup.py`,
+  `requirements.txt`, `CMakeLists.txt`, `Dockerfile`, `*.csproj`) are service
+  candidates, as are the children of `services/`, `apps/`, `cmd/`, and
+  `packages/`.
+- **Folders, modules, and services** carry dependency counts derived from the
+  call links.
+- **Owners** come from `CODEOWNERS` (`.github/`, the root, `docs/`, or
+  `.gitlab/`), and the last matching rule wins.
+
+**Contracts and checkpoints.** When Crane is initialized, each compiled
+clause is mapped onto the inventory with the resolver's matching:
+
+- `resolved`, `missing`, or `ambiguous`, plus the anchor ids;
+- the entities its scope covers (flow scope is approximated from the call
+  graph).
+
+Each checkpoint lists:
+
+- its status;
+- the policies using it;
+- the commits since it;
+- the files changed since it;
+- the covered symbols in those files.
+
+**Risk.** Risk signals are heuristics:
+
+- sensitive names or paths, such as payment, refund, settle, auth, or token;
+- fan-in and callers from other modules;
+- loops and branches;
+- size;
+- entry points;
+- persistence and network calls;
+- missing tests.
+
+A symbol scoring 4 or more is a critical candidate. When the symbol is
+targetable and its qualified name is unique, discovery suggests a `preserve`
+rule. Suggestions are for a human to review. Nothing is written.
+
+**Incremental indexing.** File content ids come from Git: index ids for clean
+tracked files, and `git hash-object` only for modified and untracked files.
+Outlines are cached in `.crane/runtime/inventory/index.json` by content id, so
+an unchanged file is never parsed again, even after a rename.
+
+Resolving a called name depends only on the definitions with that name. A run
+therefore re-resolves only:
+
+- callers in changed files;
+- callers of names defined in a changed file, before or after the change.
+
+Every other caller reuses its stored links. `index` in the JSON reports the
+files parsed and reused, and the symbols relinked. `--full` ignores the cache
+and produces the same inventory.
+
+## Zones
+
+A zone classifies part of the repository so that an organization can say
+"Payments is Critical", "Authentication is Restricted", or "Tests are
+Routine".
+
+Zones live in `.crane/zones/*.zone`. They are persistent and are written in
+terms of meaning rather than file layout. `crane zones` resolves them again
+against the current inventory every time it runs. Zones are an input to
+authorization. They only restrict: a zone never grants a permission and never
+relaxes a contract.
+
+```
+zone payments {
+    criticality critical;          # routine | sensitive | critical | restricted
+    autonomy assisted;             # observe | assisted | delegated | autonomous
+    state active;                  # active | degraded | quarantined (default active)
+    policy payments;               # optional policy reference
+    select subsystem payments;     # one or more selectors
+    select symbol java:com.acme.payments.PaymentService.charge;
+}
+```
+
+Criticality, autonomy, and safety state are three separate concepts:
+
+- **Criticality** says how important the resources are.
+- **Autonomy** says how much an agent may do on its own: observe, propose
+  for approval (assisted), change within its task (delegated), or change
+  freely within its contracts (autonomous).
+- **Safety state** says whether the zone is healthy.
+
+A zone's effective autonomy is its declared autonomy, capped by its
+criticality and its state:
+
+| Cap | Maximum autonomy |
+|---|---|
+| criticality `restricted` | observe |
+| criticality `critical` | assisted |
+| criticality `sensitive` | delegated |
+| state `degraded` | assisted |
+| state `quarantined` | observe |
+
+A zone becomes `degraded` while any of its selectors does not resolve
+cleanly. Where zones overlap, the most restrictive values apply: the highest
+criticality, the lowest autonomy, and the worst state.
+
+| Selector | Matches |
+|---|---|
+| `symbol LANG:ID` or `symbol Type.name` | a symbol by inventory id (without `symbol:`) or by qualified name |
+| `module LANG:NAME` or `module NAME` | every symbol and file in a module |
+| `service PATH` or `service NAME` | every file of a service |
+| `subsystem NAME` | every service, module, and folder with a name segment matching `NAME` (case-insensitive) |
+| `policy POLICY` or `policy POLICY:RULE` | everything that policy's clauses cover |
+| `tests` | every test file and test symbol |
+| `folder PATH` | a folder and everything below it (depends on layout) |
+| `path GLOB` | files matching a glob (depends on layout) |
+
+In values, `*` and `?` match within one `/` segment, and `**` crosses
+segments.
+
+Each selector resolves to one of four statuses:
+
+- `resolved`.
+- `ambiguous`: an exact symbol, module, or service name matched several
+  things. All of them are covered, because zones only restrict.
+- `missing`: the selector resolved before and no longer does. Its target was
+  deleted, renamed, or moved.
+- `unresolved`: the selector never resolved.
+
+For a missing selector, `crane zones` shows what it used to cover. It also
+lists rename candidates:
+
+- for a symbol, a new symbol of the same kind in the file that held it;
+- for a module, service, subsystem, or folder, the place that now holds most
+  of its former content (matched by Git content id).
+
+Candidates are never applied automatically. A human updates the zone.
+
+Each zone's last good resolution is kept in
+`.crane/runtime/zones/resolution.json`.
+
+A zone's `version` is a SHA-256 of its canonical definition. Reformatting or
+reordering a zone file keeps the version. Checkpoints, commits, and policy
+edits do not affect zones or their versions.
+
+Conflicts that `crane zones` reports:
+
+- `autonomy_exceeds_criticality`: the declared autonomy is above the
+  criticality cap. The cap applies.
+- `overlap`: zones covering the same code disagree. The most restrictive
+  values apply.
+- `policy_reference_missing`: the referenced policy does not exist or does
+  not compile.
+- `policy_reference_outside_zone`: the referenced policy covers nothing in the
+  zone.
+- `policy_requires_change`: a `target` rule requires a change to code that its
+  zones only let agents observe.
+
+Malformed zone files and duplicate zone ids are reported, and `crane zones`
+then exits with code 1.
+
+## Policy discovery and proposals
+
+`crane discover --policies [--json]` answers the question "what should this
+organization probably protect?". It uses fixed heuristics over the inventory
+and the zones. It understands names, paths, and graphs, not meaning, and the
+output lists every heuristic it used. Each candidate has a reason, a
+confidence, a suggested rule (or zone), and the entities it affects.
+
+| Signal | Observed when |
+|---|---|
+| `zone_critical`, `zone_restricted`, `zone_sensitive` | a zone gives the code that criticality |
+| `payment_name`, `auth_name`, `secrets_name` | the symbol's own name contains a word from that vocabulary, such as charge, refund, authenticate, password, or "api key" |
+| `payment_context`, `auth_context`, `secrets_context` | the enclosing type, module, service, or folder contains such a word |
+| `high_centrality` | it has 5 or more resolved callers, or 3 from 2 or more other modules |
+| `tested` | a test calls it |
+| `owned` | CODEOWNERS gives it owners other than the repository-wide default |
+| `migration`, `infrastructure`, `production_config`, `secrets_config` | the path follows the convention, such as `migrations/`, `*.tf`, `.github/workflows`, `*-prod.yml`, or `secrets.yml` |
+
+Confidence follows fixed rules:
+
+- **High** for a symbol in a Critical or Restricted zone, or with a vocabulary
+  word in its own name confirmed by context, centrality, tests, or ownership.
+- **Medium** for a vocabulary word in the name alone, a Sensitive zone, or
+  context together with centrality.
+- **Low** for context or centrality alone.
+
+Candidates are non-test functions and methods, plus variables and constants
+whose names concern secrets. Regions holding no targetable code, such as
+migrations or configuration, get a zone suggestion instead of a rule. They are
+High when a zone or a specific owner already marks them, or when they hold
+secrets, and Medium otherwise. Output is sorted by confidence, then kind,
+then id, and contains no times, so the same repository gives the same output.
+
+`crane policy propose [--name NAME] [--checkpoint NAME] [--min-confidence
+high|medium|low]` turns the uncovered candidates (Medium and above by
+default) into candidate AgentScript. It writes two files, and neither is
+active:
+
+- `.crane/proposals/NAME.crane`: the policy.
+- `.crane/proposals/NAME.json`: the reviewable record, `proposal_format` 1.
+  It holds the status, the revision, the policy and its `policy_digest`, the
+  candidates (each marked `included` or not), the zone suggestions, the
+  source state (HEAD, contract version, zone set version, and whether it was
+  generated in an agent environment), a `history` of every action, and the
+  `activation` once approved.
+
+The review commands:
+
+- `crane policy proposals` and `crane policy show NAME [--json]` read
+  proposals.
+- `crane policy edit NAME [--file PATH] [--by NAME]` records an edited policy.
+  The edited policy must parse, keep the proposal's name, and use a valid
+  checkpoint. The edit becomes a new pending revision.
+- `crane policy reject NAME --approver NAME [--reason TEXT]` rejects a
+  proposal.
+- `crane policy regenerate NAME` recomputes the proposal from the current
+  repository as a new pending revision.
+- `crane policy approve NAME --approver NAME --confirm DIGEST_PREFIX`
+  activates a proposal.
+
+`approve` is the only step that activates anything. It writes the policy to
+`.crane/policies/NAME.crane`, and only when all of these hold:
+
+- the proposal is pending;
+- an approver is named;
+- `--confirm` quotes at least the first 12 characters of the reviewed policy
+  digest;
+- the candidate file is exactly the recorded policy. An unrecorded edit is
+  refused until `crane policy edit` records it.
+
+Agent sessions that are already running keep their bound contract.
+
+Agents cannot review or activate proposals:
+
+- `approve`, `reject`, `edit`, and `regenerate` refuse to run when an agent
+  environment marker is set: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+  `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED`, or `CRANE_AGENT`.
+- The pre-tool hook denies those commands.
+- Writes to `.crane` are denied as always.
+
+An agent may still generate proposals. They are marked with the agent marker
+that was found.
+
+These controls stop an agent from approving through its tools. They are not
+a sandbox. A process that can run arbitrary code as the user can bypass them.
+So activation in CI should come from a reviewed change by a trusted process.
+
+## Task contracts
+
+A task is described in a tracker-independent file, `.crane/tasks/ID.json`.
+Agents cannot write it, because it lives in `.crane`. See
+`examples/tasks/PAY-1821.json`.
+
+```json
+{
+  "task_format": 1,
+  "task_id": "PAY-1821",
+  "title": "Reject negative refunds",
+  "description": "Make `PaymentService.refund` reject negative amounts without changing `PaymentService.charge`.",
+  "acceptance_criteria": ["`PaymentService.refund` throws for amounts below zero"],
+  "repositories": ["acme/shop"],
+  "requester": "pm@example.com", "team": "payments", "priority": "high", "labels": ["payments"],
+  "references": {"symbols": [], "must_not_change": [], "files": [], "modules": []}
+}
+```
+
+`crane task plan ID [--json] [--checkpoint NAME] [--propose]` analyzes the
+task against:
+
+- the inventory;
+- the active policies in `.crane/policies`, the policy pack;
+- the zones;
+- the checkpoint;
+- earlier contracts: sessions bound to the task with `--task`, and earlier
+  proposals.
+
+It produces a task contract with six sections:
+
+| Section | Contents |
+|---|---|
+| `MUST_CHANGE` | symbols the task changes, each with a `target` rule |
+| `MUST_NOT_CHANGE` | code the task says to keep, code permanently preserved by a policy in scope, and direct callers or callees of a target outside the task scope, each with a `preserve` rule |
+| `MAY_CHANGE` | the other symbols of the modules in scope |
+| `REQUIRES_APPROVAL` | targets in zones whose autonomy is `assisted` (for example, Critical zones), and tasks spanning several services |
+| `TASK_SCOPE` | the repositories, services, modules, and files in scope |
+| `EXPECTED_TESTS` | tests that already exercise a target and their files, or a test to add when none does |
+
+Only code-like references can give authority:
+
+- `references`;
+- backticked names;
+- qualified names (`Type.method`, `Type::method`);
+- paths;
+- snake_case and camelCase identifiers.
+
+Plain words never do. A reference is negated when its clause says the code
+must stay as it is, for example "without changing `X`", "`X` must not
+change", or "do not touch `X`". Clauses are split at commas, semicolons, and
+words such as "but" and "without". A prose type name only adds its module to
+the scope.
+
+The plan has one of four statuses:
+
+- `planned`: a candidate contract exists. It is never activated by planning.
+  `--propose` stores it as the pending proposal `task_ID`, which needs human
+  approval (`crane policy approve`). `crane policy regenerate` plans the task
+  again.
+- `task_needs_clarification`: `clarifications` lists each missing or unusable
+  item with its field. Possible reasons:
+  - an empty title, description, acceptance criteria, or repositories;
+  - a reference to code that does not exist;
+  - an ambiguous name, listed with every match;
+  - wording that asks for unbounded changes, such as "everywhere" or "as
+    needed";
+  - no identifiable code to change;
+  - code named both to change and to keep.
+- `task_conflicts_with_policy`: a target is permanently preserved by an
+  active policy, or its zones only let agents observe it. Only a human can
+  change the policy or the zone.
+- `task_unrelated`: none of the task's repositories is this one (by folder
+  name or origin remote).
+
+`crane task plan` exits with code 1 unless the plan is `planned`. Plans contain
+no times, so the same task and repository give the same plan.
+
+## Task orchestration (Jira, Asana)
+
+External trackers feed the task-contract machinery through a `TaskSourceAdapter`.
+An adapter only translates:
+
+- webhook events into created, assigned, updated, reopened, closed, or
+  cancelled;
+- the task context into the task as the tracker's API returns it;
+- the task into the common task input (`TaskContractInput`).
+
+Repository mapping, planning, approval, sessions, and state live in one
+lifecycle that is shared by every source.
+
+Two adapters exist:
+
+- `jira`: Jira webhooks. The webhook carries the issue. Descriptions in Atlassian
+  Document Format or wiki markup become text, and inline code becomes
+  backticks, so code references survive.
+- `asana`: Asana webhooks. Asana events only name a task, so its context is read
+  from `.crane/sources/asana/tasks/GID.json`, a stored API response. Live API
+  fetching needs credentials and is not part of this local mode.
+
+Linear and GitHub issues need their own adapters, which are not written yet.
+
+`.crane/sources/config.json` holds:
+
+- `agent_assignees`: the names or ids that mean "assigned to the society";
+- the mapping from tracker projects to repositories and teams;
+- the checkpoint;
+- the agent profile and session lifetime used for task sessions;
+- for Jira, the custom field that holds acceptance criteria.
+
+Acceptance criteria otherwise come from an "Acceptance criteria" section of
+the description.
+
+Events are delivered in either of two ways:
+
+- `crane task ingest --source jira|asana [--delivery ID] FILE...` replays
+  stored deliveries, or reads stdin.
+- `crane task serve [--addr 127.0.0.1:8787]` accepts `POST /webhooks/jira`
+  and `POST /webhooks/asana` with `X-Crane-Token` equal to
+  `CRANE_WEBHOOK_TOKEN`. It handles one request at a time and echoes Asana's
+  handshake.
+
+There is no message bus.
+
+The lifecycle:
+
+```
+RECEIVED -> ANALYZING -> CONTRACT_PROPOSED -> APPROVED -> EXECUTING -> VALIDATING -> PR_READY -> REVIEW -> MERGED -> COMPLETED
+                 |              |                             |  ^           |
+                 v              v                             v  |           v
+              BLOCKED <------ (rejected)                   DEGRADED      EXECUTING (not satisfied yet)
+         any unfinished state -> CANCELLED;  FAILED on unrecoverable errors;  CANCELLED/COMPLETED -> RECEIVED on reopen
+```
+
+1. A task enters the lifecycle when it is created or assigned to one of the
+   `agent_assignees`. Other tickets are ignored.
+2. Analysis normalizes the task, maps its project to repositories, and writes
+   `.crane/tasks/ID.json`, keeping each version in
+   `.crane/runtime/tasks/ID/`. It then plans the task with `crane task plan`
+   and proposes the contract `task_ID_vN`. The task becomes BLOCKED, with the
+   reasons, in any of these cases:
+   - the context is unavailable;
+   - the project has no mapping;
+   - the planner asks for clarification;
+   - the task conflicts with a policy.
+3. A human approves the proposal with `crane policy approve`. Then
+   `crane task sync` (which also runs after every ingest) moves the task to
+   APPROVED and starts its contract session (EXECUTING). The session's provider
+   id is `task-ID-vN` and it is bound to the task id, so the same contract
+   version never gets a second session.
+4. When the session writes an attestation (at stop), sync validates it:
+   - PASS leads to PR_READY;
+   - drift, a repository mismatch, or a journal problem leads to DEGRADED;
+   - anything else returns the task to EXECUTING.
+5. A human or CI advances the task (`crane task advance ID --to
+   REVIEW|MERGED|...`). Only transitions the state machine allows are accepted.
+
+Idempotency and updates:
+
+- Each event is processed once, by its delivery id or by a digest of the event.
+- An update whose normalized task is unchanged keeps the contract version.
+- A changed task gets a new contract version. A pending older proposal is
+  superseded. A session working under an outdated contract is stopped, and the
+  older approved contract stays active until the new version is approved; it
+  is retired then.
+- Closing or cancelling the ticket (or unassigning the society) cancels the
+  task. If the task was MERGED, closing it completes the task instead.
+
+Finishing a task always does three things:
+
+- It closes the task's sessions. This only revokes their runtime authority;
+  the worktree is never touched, so it is always safe.
+- It supersedes any pending contract.
+- It retires the active contract, moving it from `.crane/policies` to
+  `.crane/retired`.
+
+Agents cannot drive the lifecycle. `ingest`, `sync`, `advance`, and `serve`
+refuse to run in an agent environment, and the pre-tool hook denies those
+commands.
+
+## Agent sessions
+
+Claude Code, Codex, and generic agents stay external. Crane neither runs
+models nor changes them. A provider-neutral session manager
+(`src/agent_session.rs`) gives every agent session the same lifecycle:
+
+```
+task -> contract session -> agent adapter -> session start -> agent work -> tool events -> validation -> final reconciliation
+```
+
+A session binds the following when it is created. The binding digest covers
+all of it, so none of it can be changed later:
+
+- the task;
+- the contract and checkpoint;
+- the zone constraints of every file at that moment;
+- the autonomy mode and the autonomy budget (mutating tool calls and distinct
+  files);
+- the task scope (the files of the task plan's modules);
+- the idle timeout and the expiry;
+- the agent identity (profile and provider session).
+
+The journal adds what happened:
+
+- start, last activity, and end times;
+- the model the host reported;
+- the budget used;
+- the safety state.
+
+`crane agent session show ID` prints all of it, and the attestation includes
+it.
+
+Every tool call is translated by its adapter into the common `AgentAction` and
+decided by one engine, in this order:
+
+1. Reads are allowed.
+2. The `.crane` metadata guard applies.
+3. The session must be usable: not expired, closed, cancelled, finalized,
+   lapsed, or displaced.
+4. The contract applies: preserve denies.
+5. Governance applies:
+   - an observe session may only read;
+   - an exhausted budget denies and quarantines the session;
+   - a quarantined session is denied;
+   - a degraded session is capped at assisted;
+   - each written file's zone caps autonomy (restricted means observe,
+     critical means assisted);
+   - in delegated mode, a write outside the task scope needs approval.
+
+   Observe denies, assisted asks for human approval (Claude asks the user,
+   Codex denies, because its PreToolUse cannot ask), and delegated or
+   autonomous allows. Shell and unknown tools get the session-level checks,
+   since their files are not known before they run.
+
+| Mode | Default budget (actions / files) | Behavior |
+|---|---|---|
+| `observe` | 0 / 0 | read only |
+| `assisted` | 100 / 50 | every change needs approval |
+| `delegated` (default) | 300 / 100 | changes outside the task scope need approval |
+| `autonomous` | 1000 / 500 | changes allowed within the contract and zones |
+
+The lifecycle:
+
+- **Start**: the host's session-start, or `crane agent session start` for an
+  orchestrator. The model receives the contract listing plus a short SESSION
+  block: task, mode, budget, scope, expiry, idle timeout, and zones.
+- **Resume**: the host's session-start reactivates a closed session.
+  `crane agent session resume ID` does the same for a human, restores lapsed
+  authority, and lifts a quarantine.
+- **Cancellation**: `crane agent session cancel ID`. A cancelled session
+  never acts or resumes again. Cancelling a task cancels its sessions.
+- **Timeout**: a session expires after its lifetime (8 hours by default) and
+  cannot be resumed. A session idle past its idle timeout (30 minutes by
+  default) loses authority until a session start, a user prompt, or a human
+  resume. `crane agent session sweep` closes such sessions.
+- **Finalization**: `crane agent session finalize ID` reconciles one last time,
+  writes the final attestation, and ends the session. Completing a task
+  finalizes its sessions.
+
+A session degrades when the contract on disk drifts during it, and it is
+quarantined when its budget is exhausted or when a human runs
+`crane agent session quarantine ID`. `crane agent session extend ID --actions N
+--files N` adds budget, which is journaled; the bound budget is never
+rewritten.
+
+Agents cannot manage sessions. The pre-tool hook denies every session command
+except `list` and `show`, and `start`, `resume`, and `extend` also refuse to
+run in an agent environment. Sessions created by earlier versions (session
+format 2) are rejected; remove them to start new ones.
+
+## Isolated execution and effect verification
+
+**Isolation.** `crane agent session start --isolate` creates a Git worktree at
+`.crane/runtime/worktrees/SESSION_ID`. The worktree is on its own branch
+`crane/SESSION_ID`, starts from HEAD, and gets the agent hosts' local hook
+settings copied in. The session is bound to that worktree; run the agent
+there. Its changes never touch the repository until the branch is merged. Hooks
+running inside the worktree use the repository's `.crane` (policies,
+sessions, zones), never a copy of it.
+
+Two more commands complete the picture:
+
+- `crane agent session cleanup ID` removes the worktree of a cancelled or
+  finalized session and keeps the branch.
+- Task orchestration isolates task sessions when `.crane/sources/config.json`
+  sets `"isolate": true`.
+
+**Effects.** A tool is authorized before it runs, by the fast decision. After
+it runs, Crane looks at what actually changed in the session's worktree,
+whatever the tool claimed. It compares every file's Git content id with the
+previous observation, so changes made by shell commands, scripts, and
+generators are seen like edits. Each observation stores its content in Git's
+object store, so earlier versions can be read back.
+
+The journal's `effect` for every tool call lists:
+
+- files added, modified, deleted, and renamed (renames are paired by content);
+- symbols added, modified, removed, or moved, compared by content digest, with
+  only the innermost changed symbols reported;
+- the zones touched;
+- the contract clauses checked, out of the total;
+- the violations;
+- the targets satisfied.
+
+Verification runs at three levels:
+
+1. **Fast effect verification**, after every tool call:
+   - Only the contract clauses that the changed files (including deleted and
+     renamed paths) or the changed symbols can affect are verified. An
+     unrelated change checks nothing.
+   - A change the session could not have made without approval is an
+     `unauthorized_effect` that the agent must revert. That covers a file in a
+     restricted or critical zone, or one outside the task scope in delegated
+     mode, that no authorized or approval-gated tool call named.
+   - Reads are not observed.
+   - A session without an earlier observation (for example, a transient one)
+     verifies every clause.
+2. **Affected test execution**, at stop or with `crane agent session verify ID
+   --level tests`:
+   - The tests that exercise the changed files, through the inventory's test
+     relationships, are run, along with changed test files. Nothing else runs.
+   - The commands come from `.crane/testing.json`:
+     `{"timeout_seconds": 300, "commands": {"python": ["python", "-m", "pytest", "{files}"]}}`.
+     `{files}` expands to the test files. Agents cannot edit this file, since
+     Crane runs these commands.
+   - A failing or timed-out test is a `tests_failed` violation.
+3. **Full session validation**, at stop and finalization, or with
+   `crane agent session verify ID --level full`. It produces the full
+   reconciliation of the bound contract, plus the cumulative effect since the
+   session started (a reverted change leaves nothing), plus the affected tests
+   of everything changed. All of it goes into the attestation.
+
 ## Failure semantics
 
 Crane never returns PASS when it cannot establish compliance:
@@ -308,29 +933,67 @@ Every rule compiles into a two-sided contract (the Policy IR, `src/ir.rs`):
 | `target` | `permit_write` over the covered code | covered code differs from the checkpoint (with `change_type`, in that way) |
 
 `permit_write` is not an allowlist: code that no clause covers stays writable.
-The covered code is the rule's item plus its scope (the file, the folder, the
-flow, or the whole repository).
+It does not override `preserve` either: a write that changes a target and
+preserved code is denied. The covered code is the rule's item plus its scope
+(the file, the folder, the flow, or the whole repository). Both sides of a
+clause are derived from one rule, so they cannot disagree.
 
-For each policy, the IR records the policy id, its version (the SHA-256 of the
-policy file), the checkpoint name and commit, and its clauses. The contract
-version is a SHA-256 over every policy version and checkpoint commit, so editing
-any policy or re-baselining any checkpoint produces a new version. A malformed
-policy stays in the IR, marked malformed, so that it fails closed.
+For each policy, the IR records:
+
+- the contract id (the policy name);
+- the policy version (the SHA-256 of the policy file);
+- the checkpoint name and its commit;
+- the clauses;
+- the contract hash, a SHA-256 over all of the above, including both sides of
+  every clause.
+
+A checkpoint is bound only if its file records its own name and a full commit
+SHA. A branch, a tag, `HEAD`, or an abbreviated id could later resolve to
+another commit, so a checkpoint that records one fails closed. Recreate it with
+`crane checkpoint`.
+
+The contract version is a SHA-256 over every contract hash and malformed
+policy. Editing a policy, changing a clause, or re-baselining a checkpoint
+therefore produces a new version. A malformed policy stays in the IR, marked
+malformed, so that it fails closed.
 
 A contract session (`.crane/runtime/sessions/<agent>-<session id>/`) binds one
 agent session to one contract version. It is created on the first hook event
 that carries a provider session id, and it is never replaced or refreshed:
 
-- `session.json` holds the session id, the agent, the provider session id, the
-  creation time and optional expiry, the repository root, the bound IR, and the
-  runtime grants derived from the checkpoint (where each item lives, and each
-  flow's members). It is written once.
+- `session.json` is written once. It holds:
+  - the session id, the agent, and the provider session id;
+  - the optional task id;
+  - the creation time and optional expiry;
+  - the repository root and the repository id (a SHA-256 of the root commits);
+  - the bound IR;
+  - the runtime grants derived from the checkpoint (where each item lives, and
+    each flow's members);
+  - the binding digest, a SHA-256 over all of the above.
+
+  Each time the file is loaded, Crane recomputes the digest and checks that the
+  file belongs to its session id. A file that fails either check, is partial,
+  or has an older layout denies every mutating tool until a human removes the
+  session directory.
 - `state` is `active` or `closed`. It is the only thing that changes.
 - `journal.jsonl` has one line per event: sequence, time, session, agent,
-  contract version, checkpoints, tool, normalized operation and resources,
-  decision, reasons, result, and a SHA-256 of the tool arguments. The
-  arguments themselves are never stored.
+  contract version, checkpoints, binding digest, tool, normalized operation
+  and resources, decision, reasons, result, and a SHA-256 of the tool
+  arguments. The arguments themselves are never stored.
 - `attestation.json` holds the latest reconciled outcome.
+
+To bind a task, pass `--task ID` to `crane agent hook` in the hook
+configuration, or set `CRANE_TASK_ID` for the agent host. The task is fixed when
+the session is created. A later hook that presents a different task is refused.
+
+A session is used only in the repository it was bound to. If the root or the
+repository id differs, every mutating action is denied and reconciliation fails
+with `repository_mismatch`.
+
+If an earlier attempt crashed before `session.json` was written, it may have
+left a journal, a state, or an attestation behind. Those files are moved to
+`recovered-<time>-<pid>/`, so the new session starts active with a clean
+journal and the evidence is kept.
 
 `.crane/runtime/` ignores itself in Git. Agents cannot write to it because it
 is inside `.crane`.
@@ -346,9 +1009,12 @@ Lifecycle:
    - Any action that touches `.crane`, the hook settings, or runs a mutating
      `crane` command (`checkpoint`, `protect`, `target`, `init`,
      `agent init|install|hook`) is denied.
-   - While the contract is incomplete (a malformed policy, a missing
-     checkpoint, a missing or ambiguous item), or the session has expired or
-     is closed, every mutating action is denied.
+   - Every mutating action is denied while any of these holds:
+     - the contract is incomplete (a malformed policy, a missing or moving
+       checkpoint, a missing or ambiguous item);
+     - the session has expired or is closed;
+     - the session is in another repository;
+     - the session file is invalid.
    - A write is simulated on the file's current text and diffed item by item.
      It is denied if it would change code that a `preserve` clause covers,
      unless it restores the checkpoint version. Comment-only edits never count
@@ -367,7 +1033,10 @@ Lifecycle:
 4. **Stop** reconciles completely:
    - it verifies every postcondition with the bound IR;
    - it fails with `contract_drift` if the contract on disk no longer matches
-     the bound version;
+     the bound version, naming each policy that changed, was added, or was
+     removed, and each checkpoint that moved;
+   - it fails with `repository_mismatch` if the session is in another
+     repository;
    - it fails with `journal_error` if the journal has lines that do not belong
      to the session;
    - it writes the attestation.
@@ -383,14 +1052,18 @@ the same decisions but keeps no journal and writes no attestation.
 
 The attestation contains:
 
-- the session and agent ids;
-- the bound, verification, and repository contract versions;
-- each contract's id, version, checkpoint, and commit;
+- the session, agent, and task ids;
+- the repository id and the binding digest;
+- the bound, runtime, verification, and repository contract versions (the
+  first three are always the same);
+- each contract's id, hash, policy version, checkpoint, and commit;
+- the drift from the contract on disk;
 - the authorized and denied actions;
 - a result for each `preserve` and `target` clause, plus any other findings;
 - answers to the reconciliation questions: `forbidden_mutations_attempted`,
   `required_targets_changed`, `preserve_invariants_satisfied`,
-  `change_types_satisfied`, `same_contract_version`, `fully_reconciled`;
+  `change_types_satisfied`, `same_contract_version`, `same_repository`,
+  `fully_reconciled`;
 - `final_status` (`PASS` or `FAIL`);
 - evidence ids: the journal event count and SHA-256, the Git HEAD, and the
   verification time.

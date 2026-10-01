@@ -1,0 +1,21 @@
+{
+  "task_format": 1,
+  "task_id": "PAY-1821",
+  "title": "Reject negative refunds",
+  "description": "Make `PaymentService.refund` reject negative amounts without changing `PaymentService.charge`.",
+  "acceptance_criteria": [
+    "`PaymentService.refund` throws for amounts below zero",
+    "refunds of positive amounts behave as before"
+  ],
+  "repositories": ["acme/shop"],
+  "requester": "pm@example.com",
+  "team": "payments",
+  "priority": "high",
+  "labels": ["payments", "refunds"],
+  "references": {
+    "symbols": [],
+    "must_not_change": [],
+    "files": [],
+    "modules": []
+  }
+}

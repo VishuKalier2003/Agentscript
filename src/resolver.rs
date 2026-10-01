@@ -148,7 +148,7 @@ pub(crate) fn matches_target(name: &str, qualified: &str, target: &str) -> bool 
 }
 
 /** Syntax node kinds that define a class-like item: classes, and Rust structs and enums */
-const CLASS_KINDS: &[&str] = &[
+pub(crate) const CLASS_KINDS: &[&str] = &[
     "class_declaration",
     "class_definition",
     "struct_item",
@@ -245,9 +245,32 @@ fn parse_tree(source: &str, path: &str) -> Result<Tree, String> {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let tree = PARSERS.with(|parsers| -> Result<Tree, String> {
+    let tree = parse_with(source, &extension, language)?;
+    if tree.root_node().has_error() {
+        return Err("source contains a parser error".into());
+    }
+    Ok(tree)
+}
+
+/** Parse source text with a given grammar through the shared per-thread parser cache, without
+ * judging parse errors; enforcement goes through parse_tree, which rejects them, while discovery
+ * tolerates them and only reports them
+ * Input
+    - source: &str - file contents
+    - key: &str - parser cache key, the lowercase file extension (one grammar per extension)
+    - language: tree_sitter::Language - grammar to use
+ * Output
+    - Result<Tree, String>
+    - Error if the grammar cannot be loaded or tree-sitter returns no tree
+*/
+pub(crate) fn parse_with(
+    source: &str,
+    key: &str,
+    language: tree_sitter::Language,
+) -> Result<Tree, String> {
+    PARSERS.with(|parsers| -> Result<Tree, String> {
         let mut parsers = parsers.borrow_mut();
-        let parser = match parsers.entry(extension) {
+        let parser = match parsers.entry(key.to_string()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let mut parser = Parser::new();
@@ -260,11 +283,7 @@ fn parse_tree(source: &str, path: &str) -> Result<Tree, String> {
         parser
             .parse(source, None)
             .ok_or_else(|| "parser returned no syntax tree".to_string())
-    })?;
-    if tree.root_node().has_error() {
-        return Err("source contains a parser error".into());
-    }
-    Ok(tree)
+    })
 }
 
 /** List the names of the types enclosing a node, outermost first, by climbing its ancestors and
@@ -275,7 +294,7 @@ fn parse_tree(source: &str, path: &str) -> Result<Tree, String> {
  * Output
     - Vec<String> of enclosing type names
 */
-fn enclosing_types(node: Node, bytes: &[u8]) -> Vec<String> {
+pub(crate) fn enclosing_types(node: Node, bytes: &[u8]) -> Vec<String> {
     let mut qualified = Vec::new();
     let mut parent = node.parent();
     while let Some(ancestor) = parent {
@@ -321,7 +340,7 @@ pub(crate) struct Definition {
 }
 
 /** Syntax node kinds that define a callable function or method in the supported grammars */
-const DEFINITION_KINDS: &[&str] = &[
+pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "method_declaration",
     "constructor_declaration",
     "function_declaration",
@@ -417,7 +436,7 @@ fn collect_identifiers(node: Node, bytes: &[u8], output: &mut Vec<String>) {
  * Output
     - None (appends to output)
 */
-fn collect_calls(node: Node, bytes: &[u8], output: &mut Vec<String>) {
+pub(crate) fn collect_calls(node: Node, bytes: &[u8], output: &mut Vec<String>) {
     let callee = match node.kind() {
         "method_invocation" => node.child_by_field_name("name"),
         "call_expression" | "call" => node.child_by_field_name("function").and_then(callee_name),
@@ -507,7 +526,7 @@ pub(crate) struct Complexity {
 }
 
 /** Syntax node kinds that are loops in the supported grammars */
-const LOOP_KINDS: &[&str] = &[
+pub(crate) const LOOP_KINDS: &[&str] = &[
     "for_statement",
     "enhanced_for_statement",
     "while_statement",
@@ -523,7 +542,7 @@ const LOOP_KINDS: &[&str] = &[
 ];
 
 /** Syntax node kinds that branch control flow in the supported grammars */
-const BRANCH_KINDS: &[&str] = &[
+pub(crate) const BRANCH_KINDS: &[&str] = &[
     "if_statement",
     "if_expression",
     "elif_clause",

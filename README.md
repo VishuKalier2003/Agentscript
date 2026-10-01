@@ -343,6 +343,202 @@ deterministically ordered by policy and rule. A failed resolution, missing
 checkpoint, missing commit, or missing protected function is also reported as
 a violation, so verification fails closed.
 
+## Repository discovery
+
+`crane discover` scans the repository and builds a semantic inventory, so you
+can see what deserves a contract without writing policies file by file:
+
+```bash
+crane discover          # human summary
+crane discover --json   # full machine-readable inventory
+crane discover --full   # ignore the incremental cache
+```
+
+The summary covers repository size, languages, services and modules,
+critical candidates (with a suggested `preserve` rule where one would
+resolve), existing contract coverage, and checkpoints. The JSON form also
+includes:
+
+- every file, module, folder, and symbol;
+- call relationships (callers and callees);
+- test relationships;
+- CODEOWNERS owners;
+- risk signals for each symbol.
+
+Each symbol has a stable semantic id, such as
+`symbol:java:com.acme.payments.PaymentService.charge`.
+
+Discovery is advisory. It never creates, changes, or enforces a policy, and it
+works before `crane init`. Once Crane is initialized, discovery keeps a cache
+in `.crane/runtime/inventory/`. The cache is keyed by Git content hashes, so
+later runs parse only the files whose content changed. They also re-resolve
+calls only for code in changed files and for callers of functions defined
+there.
+
+Discovery parses Java, JavaScript, TypeScript/TSX, Python, Rust, Go, C/C++,
+and Kotlin, and counts common other file types. Policies can still target only
+Java, JavaScript, Python, and Rust, so discovery marks the other languages as
+"discovery only".
+
+## Repository zones
+
+Zones in `.crane/zones/*.zone` classify the repository by meaning, so that an
+organization can say "Payments is Critical", "Authentication is Restricted",
+or "Tests are Routine":
+
+```
+zone payments {
+    criticality critical;
+    autonomy assisted;
+    select subsystem payments;
+}
+```
+
+Each zone has three separate settings:
+
+- a criticality: routine, sensitive, critical, or restricted;
+- a default autonomy: observe, assisted, delegated, or autonomous;
+- a safety state: active, degraded, or quarantined.
+
+Selectors name symbols, modules, services, subsystems, policies, or tests, so
+zones survive moves and are resolved again after every repository change.
+Zones are an input to authorization and can only restrict: criticality and
+state cap autonomy, and overlapping zones take the most restrictive values.
+Zones never grant permissions or relax contracts.
+
+```bash
+crane zones               # zones, selector resolution, unresolved selectors, conflicts
+crane zones payments      # one zone with every resolved symbol and file
+crane zones --json
+```
+
+See LANGUAGE.md, "Zones", for selectors, statuses, and conflicts.
+
+## Policy proposals
+
+`crane discover --policies` lists what the organization should probably
+protect. Each candidate comes with a reason, a confidence, a suggested rule,
+and the entities it affects. For example:
+
+```
+PaymentService.charge
+  reason: criticality=Critical (zone payments) + payment name 'charge' + payment subsystem (...)
+  suggested rule: preserve --function PaymentService.charge;
+```
+
+The candidates come from fixed heuristics (zones, payment, auth, and secret
+vocabularies, centrality, tests, CODEOWNERS, and migration, infrastructure,
+and production-configuration paths), not from semantic understanding.
+
+`crane policy propose` writes them as candidate AgentScript under
+`.crane/proposals/`, together with a JSON record a dashboard can review.
+Nothing is active until a human or trusted process approves it:
+
+```bash
+crane policy propose --name payments_guard
+crane policy show payments_guard
+crane policy edit payments_guard          # after editing .crane/proposals/payments_guard.crane
+crane policy approve payments_guard --approver alice --confirm <first 12 digest characters>
+crane policy reject payments_guard --approver alice --reason "too broad"
+crane policy regenerate payments_guard
+```
+
+Agents cannot approve, reject, edit, or regenerate proposals (see
+LANGUAGE.md, "Policy discovery and proposals").
+
+## Task contracts
+
+`crane task plan PAY-1821` reads a tracker-independent task file,
+`.crane/tasks/PAY-1821.json` (see `examples/tasks/`). It derives a proposed
+task contract with six sections:
+
+- MUST_CHANGE (targets);
+- MUST_NOT_CHANGE (preserves);
+- MAY_CHANGE;
+- REQUIRES_APPROVAL (Critical zones, cross-service work);
+- TASK_SCOPE (services and modules);
+- EXPECTED_TESTS.
+
+The contract comes with candidate AgentScript. Only code references in the
+task (backticked names, `Type.method`, or explicit references) become
+authority. A vague or ambiguous task returns `task_needs_clarification` with
+exactly what is missing. A task that must change permanently protected code
+returns `task_conflicts_with_policy`. `--json` prints the plan, and
+`--propose` stores the contract as a pending proposal that only a human can
+approve.
+
+## Jira and Asana
+
+Jira and Asana tickets assigned to the society run through one lifecycle:
+
+```
+RECEIVED -> ANALYZING -> CONTRACT_PROPOSED -> APPROVED -> EXECUTING -> VALIDATING -> PR_READY -> REVIEW -> MERGED -> COMPLETED
+```
+
+The lifecycle also has BLOCKED, FAILED, CANCELLED, and DEGRADED states. Each
+ticket becomes a versioned task contract that a human approves. Its agent
+session starts exactly once per contract version. Cancelling the ticket stops
+the session and retires the contract.
+
+```bash
+crane task ingest --source jira tests/fixtures/orchestration/jira/01-created-PAY-1821.json
+crane policy approve task_pay_1821_v1 --approver alice --confirm <digest>
+crane task sync PAY-1821              # APPROVED -> EXECUTING (session task-PAY-1821-v1)
+crane task status
+CRANE_WEBHOOK_TOKEN=... crane task serve --addr 127.0.0.1:8787
+```
+
+Repository mapping lives in `.crane/sources/config.json` (see the fixture in
+`tests/fixtures/orchestration/config.json`). Replayable Jira and Asana
+deliveries are in `tests/fixtures/orchestration/`. See LANGUAGE.md, "Task
+orchestration".
+
+## Agent sessions
+
+Claude Code and Codex stay your agents: Crane wraps each of their sessions in a
+contract session through their hooks. The session binds:
+
+- the task, contract, and checkpoint;
+- the zones;
+- an autonomy mode (observe, assisted, delegated, or autonomous) and budget;
+- timeouts.
+
+Every tool call is decided by the same engine. The contract denies first.
+Then zones, the autonomy mode, the task scope, the budget, and the safety
+state decide: allow, ask for approval, or deny.
+
+```bash
+crane agent hook --event pre-tool-use --profile claude --task PAY-1821 --autonomy delegated
+crane agent session list
+crane agent session show claude-SESSION
+crane agent session resume|cancel|finalize|quarantine claude-SESSION
+crane agent session extend claude-SESSION --actions 50
+crane agent session sweep          # closes expired and idle sessions
+```
+
+Interrupted agents do not keep authority. Sessions expire after 8 hours,
+authority lapses after 30 idle minutes until the user returns or a human
+resumes, and cancelled or finalized sessions never act again. Recorded Claude
+and Codex sessions in `tests/fixtures/sessions/` replay end to end. See
+LANGUAGE.md, "Agent sessions".
+
+## Isolated execution and effect verification
+
+Agent sessions can run in their own Git worktree, with
+`crane agent session start --isolate`. After every tool call, Crane checks
+what actually changed, not what the tool claimed. It records the files and
+symbols changed, the zones touched, and the targets satisfied, and it
+re-verifies only the contract clauses those changes can affect. A shell script
+that rewrites `PaymentService.charge` is caught right after it runs, even
+though the command was allowed. Affected tests (configured in
+`.crane/testing.json`) and full validation run when the agent stops.
+
+```bash
+crane agent session start --profile claude --session s1 --isolate --task PAY-1821
+crane agent session verify claude-s1 --level fast|tests|full
+crane agent session finalize claude-s1 && crane agent session cleanup claude-s1
+```
+
 ## Installation
 
 Prebuilt binaries for Linux, macOS (Intel and Apple Silicon), and Windows are
@@ -537,7 +733,29 @@ This MVP intentionally keeps the implementation narrow:
   tools cannot be simulated, so their effects are caught after they run (at
   post-tool-use and stop) rather than prevented. Shell inspection for `.crane`
   access is pattern matching, not a sandbox.
-- Attestations are evidence objects and are not cryptographically signed.
+- Attestations are evidence objects and are not cryptographically signed. The
+  session binding digest is an unkeyed SHA-256. It catches edited and partial
+  session files, but someone who can write `.crane/runtime` can recompute it.
+- Discovery resolves calls by name, not by type, so dynamic dispatch and
+  calls through variables can be missed or left ambiguous. Its risk signals
+  and service candidates are heuristics. The pinned Kotlin grammar (0.3.1, the
+  last one built for tree-sitter 0.20) reports some single-line class and
+  object bodies as syntax errors. Those files are marked `partial`, but their
+  symbols are still read.
+- Task orchestration runs in local mode. Asana task context comes from stored
+  API responses (live fetching is not implemented), and the webhook endpoint
+  is a minimal single-threaded HTTP server for localhost or a trusted proxy.
+  Asana webhooks are authenticated with the shared token, and their HMAC
+  signatures are not verified. Task state lives in `.crane/runtime/tasks`,
+  which Git ignores. Stopping a session revokes its runtime authority, but it
+  cannot terminate the agent process.
+- Zones constrain writes whose files are known before they run; a shell command's effect on
+  a zoned file is caught right after it runs (as an unauthorized effect), not prevented.
+- Isolation uses Git worktrees, not containers: an agent process can still reach files outside
+  its worktree, which effect verification of the worktree does not observe.
+- Sessions created by Crane 0.2.0 or earlier (session format 1) are rejected
+  with "unsupported session format". Remove
+  `.crane/runtime/sessions/<id>` to start a new session for that agent.
 - Hooks installed by earlier versions lack the `SessionEnd` hook and the `*`
   matcher on `PostToolUse`. Reinstall them, or merge the generated settings,
   so that every tool call is journaled and verified.

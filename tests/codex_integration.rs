@@ -361,8 +361,20 @@ fn malformed_events_fail_closed() {
 #[test]
 fn post_tool_use_records_evidence_and_blocks_on_violation() {
     let fixture = Fixture::new();
+    // Verification follows actual effects: a command that changed nothing has nothing to verify
+    let idle = fixture.bash("PostToolUse", "c5", "ls");
+    assert!(idle.status.success());
+    assert!(String::from_utf8_lossy(&idle.stdout).trim().is_empty());
     // The unmet target is work still to do: reported as context, never as a block
-    let pending = fixture.bash("PostToolUse", "c5", "ls");
+    fixture.write(
+        "payment.py",
+        &format!(
+            "{PAYMENT}
+# reviewed
+"
+        ),
+    );
+    let pending = fixture.bash("PostToolUse", "c5", "python annotate.py");
     assert!(pending.status.success());
     let advisory = stdout_json(&pending);
     assert!(advisory.get("decision").is_none());
@@ -390,12 +402,17 @@ fn post_tool_use_records_evidence_and_blocks_on_violation() {
         .contains("\"violation_type\":\"source_changed\""));
 
     let journal = fixture.journal("codex-c5");
-    assert_eq!(journal.len(), 2);
-    assert_eq!(journal[1]["event"], "post_tool_use");
-    assert_eq!(journal[1]["tool"], "Bash");
-    assert_eq!(journal[1]["operation"], "execute");
-    assert_eq!(journal[1]["verification"], "fail");
-    assert!(journal[1]["arguments_digest"]
+    assert_eq!(journal.len(), 3);
+    assert_eq!(journal[0]["effect"]["clauses_checked"], 0);
+    assert_eq!(journal[2]["event"], "post_tool_use");
+    assert_eq!(journal[2]["tool"], "Bash");
+    assert_eq!(journal[2]["operation"], "execute");
+    assert_eq!(journal[2]["verification"], "fail");
+    assert_eq!(
+        journal[2]["effect"]["files"]["modified"],
+        json!(["payment.py"])
+    );
+    assert!(journal[2]["arguments_digest"]
         .as_str()
         .unwrap()
         .starts_with("sha256:"));

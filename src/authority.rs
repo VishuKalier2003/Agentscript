@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::agent_session::Governance;
 use crate::ir::{Clause, ContractSet, Permission};
 use crate::model::{ItemKind, Scope};
 use crate::repository::git_raw;
@@ -13,6 +14,42 @@ use crate::scope::{
     folder_of, folder_prefix, footprint, function_name, FlowFootprint, Footprint, ScopeContext,
     EXCLUDED_PREFIXES,
 };
+use crate::zones::model::{Autonomy, SafetyState};
+
+/** Start of the denial reason when a session's autonomy budget is used up */
+pub(crate) const BUDGET_EXHAUSTED: &str = "autonomy budget exhausted";
+
+/** What a session has used of its autonomy budget, and the budget
+ * Fields
+    - actions: u64 - mutating tool calls authorized so far
+    - files: BTreeSet<String> - distinct files those calls wrote
+    - max_actions: u64 - action budget
+    - max_files: u64 - file budget
+*/
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Usage {
+    pub(crate) actions: u64,
+    pub(crate) files: BTreeSet<String>,
+    pub(crate) max_actions: u64,
+    pub(crate) max_files: u64,
+}
+
+impl Usage {
+    /** Return a usage without limits, for runtimes that have no session
+     * Input
+        - None
+     * Output
+        - Usage
+    */
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            actions: 0,
+            files: BTreeSet::new(),
+            max_actions: u64::MAX,
+            max_files: u64::MAX,
+        }
+    }
+}
 
 /** What a proposed tool call does, as far as can be told before it runs
  * Variants
@@ -128,7 +165,6 @@ pub(crate) struct AgentAction {
 pub(crate) enum Decision {
     Allow,
     Deny,
-    #[allow(dead_code)]
     ApprovalRequired,
 }
 
@@ -304,6 +340,11 @@ impl Effect {
     - protected: &[&str] - provider-specific settings files that also count as protected metadata
     - problem: Option<String> - why the authority is unusable (session expired or could not be
       established), which denies every mutating action
+    - governance: Option<&Governance> - the session's autonomy mode, budget, zones, and scope;
+      None when there is no session
+    - usage: Usage - what the session used of its budget
+    - safety: SafetyState - the session's safety state
+    - safety_reason: Option<String> - why the session is not active
 */
 pub(crate) struct Runtime<'a> {
     pub(crate) contracts: &'a ContractSet,
@@ -311,6 +352,10 @@ pub(crate) struct Runtime<'a> {
     pub(crate) root: PathBuf,
     pub(crate) protected: &'a [&'a str],
     pub(crate) problem: Option<String>,
+    pub(crate) governance: Option<&'a Governance>,
+    pub(crate) usage: Usage,
+    pub(crate) safety: SafetyState,
+    pub(crate) safety_reason: Option<String>,
 }
 
 impl Runtime<'_> {
@@ -358,13 +403,16 @@ impl Runtime<'_> {
             return verdict(
                 Decision::Deny,
                 vec![format!(
-                    "Crane cannot establish runtime authority ({}); mutating tools are denied until a human repairs .crane, read-only tools remain available",
+                    "Crane cannot establish runtime authority ({}); mutating tools are denied and read-only tools remain available",
                     problems.join("; ")
                 )],
                 resources,
             );
         }
         if action.operation != Operation::Write {
+            if let Some((decision, reasons)) = self.govern(&[]) {
+                return verdict(decision, reasons, resources);
+            }
             return verdict(
                 Decision::Allow,
                 vec!["the effects of this tool are not known before it runs; Crane verifies the repository after it runs".into()],
@@ -383,13 +431,129 @@ impl Runtime<'_> {
         for change in &action.files {
             self.check_change(change, &mut denied, &mut allowed, &mut resources);
         }
-        if denied.is_empty() {
-            if allowed.is_empty() {
-                allowed.push("no contract clause covers this change".into());
+        if !denied.is_empty() {
+            return verdict(Decision::Deny, denied, resources);
+        }
+        let paths = action
+            .files
+            .iter()
+            .filter_map(|change| self.relative(&change.path))
+            .map(|path| {
+                let exists = self.root.join(&path).exists();
+                (path, exists)
+            })
+            .collect::<Vec<_>>();
+        if let Some((decision, reasons)) = self.govern(&paths) {
+            return verdict(decision, reasons, resources);
+        }
+        if allowed.is_empty() {
+            allowed.push("no contract clause covers this change".into());
+        }
+        verdict(Decision::Allow, allowed, resources)
+    }
+
+    /** Apply the session's governance to a mutating action the contract allows: deny when the
+     * autonomy budget is used up or the session is quarantined; otherwise take the lowest
+     * autonomy of the session mode, its safety state (degraded caps at assisted), the zones of
+     * every written file, and the task scope (in delegated mode, a write outside the scope needs
+     * approval); observe denies, assisted needs human approval, delegated and autonomous allow
+     * Input
+        - paths: &[(String, bool)] - repository-relative paths written and whether each exists;
+          empty for shell and unknown tools, whose files are not known before they run
+     * Output
+        - Option<(Decision, Vec<String>)> a denial or approval requirement with reasons, None to
+          allow
+    */
+    fn govern(&self, paths: &[(String, bool)]) -> Option<(Decision, Vec<String>)> {
+        let governance = self.governance?;
+        if governance.autonomy == Autonomy::Observe {
+            // Checked before the budget: an observing session has no budget to exhaust
+            return Some((
+                Decision::Deny,
+                vec!["the session's autonomy mode is observe, so it may only read".into()],
+            ));
+        }
+        let usage = &self.usage;
+        if usage.actions >= usage.max_actions {
+            return Some((
+                Decision::Deny,
+                vec![format!(
+                    "{BUDGET_EXHAUSTED}: {} of {} mutating actions used; a human must extend or resume the session",
+                    usage.actions, usage.max_actions
+                )],
+            ));
+        }
+        let new_files = paths
+            .iter()
+            .filter(|(path, _)| !usage.files.contains(path))
+            .count() as u64;
+        if usage.files.len() as u64 + new_files > usage.max_files {
+            return Some((
+                Decision::Deny,
+                vec![format!(
+                    "{BUDGET_EXHAUSTED}: this change would write {} files in all, more than the {} allowed; a human must extend or resume the session",
+                    usage.files.len() as u64 + new_files,
+                    usage.max_files
+                )],
+            ));
+        }
+        let why = self.safety_reason.clone().unwrap_or_default();
+        if self.safety == SafetyState::Quarantined {
+            return Some((
+                Decision::Deny,
+                vec![format!(
+                    "the session is quarantined ({why}); a human must resume it"
+                )],
+            ));
+        }
+        let mut level = governance.autonomy;
+        let mut reasons = Vec::new();
+        if level == Autonomy::Assisted {
+            reasons.push(
+                "the session's autonomy mode is assisted, so every change needs human approval"
+                    .to_string(),
+            );
+        }
+        if self.safety == SafetyState::Degraded && level > Autonomy::Assisted {
+            level = Autonomy::Assisted;
+            reasons.push(format!(
+                "the session is degraded ({why}), so changes need human approval"
+            ));
+        }
+        for (path, exists) in paths {
+            if let Some(constraint) = governance.constraint(path) {
+                let cap = constraint.autonomy.min(constraint.state.autonomy_cap());
+                if cap <= Autonomy::Assisted {
+                    reasons.push(format!(
+                        "{path}: zones {} ({}, {}) allow agents to {}",
+                        constraint.zones.join(", "),
+                        constraint.criticality.name(),
+                        constraint.state.name(),
+                        if cap == Autonomy::Observe {
+                            "only observe it"
+                        } else {
+                            "change it only with human approval"
+                        }
+                    ));
+                }
+                level = level.min(cap);
             }
-            verdict(Decision::Allow, allowed, resources)
-        } else {
-            verdict(Decision::Deny, denied, resources)
+            if governance.autonomy == Autonomy::Delegated && !governance.in_scope(path, *exists) {
+                reasons.push(format!(
+                    "{path}: outside the task scope ({}), so it needs human approval",
+                    if governance.scope_modules.is_empty() {
+                        "no module".to_string()
+                    } else {
+                        governance.scope_modules.join(", ")
+                    }
+                ));
+                level = level.min(Autonomy::Assisted);
+            }
+        }
+        match level {
+            Autonomy::Observe => Some((Decision::Deny, reasons)),
+            Autonomy::Assisted => Some((Decision::ApprovalRequired, reasons)),
+            _ => None,
         }
     }
 
@@ -503,7 +667,7 @@ impl Runtime<'_> {
                 contract.policy_id
             );
             let effect = self.effect(clause, footprint, commit, &path, &before, &after, &items);
-            match (clause.permission, effect) {
+            match (clause.permission(), effect) {
                 (_, Effect::None) => {}
                 (Permission::PermitWrite, _) => {
                     allowed.push(format!("{path}: authorized by {label}"))
@@ -983,8 +1147,11 @@ pub(crate) fn references_protected_path(value: &str, extra: &[&str]) -> bool {
 
 /** Detect shell commands that change Crane metadata or authority through the CLI, by splitting
  * the command on whitespace and shell separators, finding tokens whose program name is crane or
- * crane.exe, and checking whether the next tokens are checkpoint, protect, target, init, or
- * agent init/install/hook (a forged hook call could open or close a contract session)
+ * crane.exe, and checking whether the next tokens are checkpoint, protect, target, init, agent
+ * init/install/hook (a forged hook call could open or close a contract session), agent session
+ * start/resume/cancel/finalize/sweep/quarantine/extend (session authority is a human's), or policy
+ * approve/reject/edit/regenerate (an agent must never review or activate a policy proposal), or
+ * task ingest/sync/advance/serve (an agent must never drive its own task lifecycle)
  * Input
     - command: &str - shell command text
  * Output
@@ -1004,9 +1171,31 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
         }
         match tokens.get(index + 1).copied() {
             Some("checkpoint" | "protect" | "target" | "init") => true,
-            Some("agent") => matches!(
+            Some("agent") => match tokens.get(index + 2).copied() {
+                Some("init" | "install" | "hook") => true,
+                // Session management changes who holds authority; listing and showing only read
+                Some("session") => matches!(
+                    tokens.get(index + 3).copied(),
+                    Some(
+                        "start"
+                            | "resume"
+                            | "cancel"
+                            | "finalize"
+                            | "sweep"
+                            | "quarantine"
+                            | "extend"
+                            | "cleanup"
+                    )
+                ),
+                _ => false,
+            },
+            Some("policy") => matches!(
                 tokens.get(index + 2).copied(),
-                Some("init" | "install" | "hook")
+                Some("approve" | "reject" | "edit" | "regenerate")
+            ),
+            Some("task") => matches!(
+                tokens.get(index + 2).copied(),
+                Some("ingest" | "sync" | "advance" | "serve")
             ),
             _ => false,
         }

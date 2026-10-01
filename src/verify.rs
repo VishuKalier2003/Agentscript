@@ -124,7 +124,7 @@ pub(crate) fn verify_contracts(
     - Error describing why the postcondition does not hold or could not be checked
 */
 fn verify_clause(context: &mut ScopeContext, commit: &str, clause: &Clause) -> Result<(), String> {
-    match clause.postcondition {
+    match clause.postcondition() {
         Postcondition::Unchanged if clause.scope == Scope::Block => {
             verify_item(commit, clause.kind, &clause.target)
         }

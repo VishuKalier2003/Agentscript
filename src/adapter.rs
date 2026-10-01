@@ -165,11 +165,16 @@ impl HookEvent {
     - session: Option<String> - provider session id, None when the provider sent none
     - action: Option<AgentAction> - the tool call, for events where has_action is true
     - stop_hook_active: bool - the agent is already continuing because a stop was blocked
+    - model: Option<String> - model the agent host reported, if any
+    - source: Option<String> - why the session started (startup, resume, clear, compact), if
+      reported
 */
 pub(crate) struct ProviderEvent {
     pub(crate) session: Option<String>,
     pub(crate) action: Option<AgentAction>,
     pub(crate) stop_hook_active: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) source: Option<String>,
 }
 
 /** Common interface for agent integrations: an adapter only translates its provider's hook
@@ -391,6 +396,14 @@ impl AgentAdapter for ClaudeAdapter {
                 .get("stop_hook_active")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(String::from),
+            source: payload
+                .get("source")
+                .and_then(Value::as_str)
+                .map(String::from),
         }
     }
 
@@ -499,6 +512,14 @@ impl AgentAdapter for CodexAdapter {
                 .get("stop_hook_active")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(String::from),
+            source: payload
+                .get("source")
+                .and_then(Value::as_str)
+                .map(String::from),
         }
     }
 
@@ -740,6 +761,14 @@ fn neutral_event(event: HookEvent, payload: &Value) -> ProviderEvent {
             .get("stop_hook_active")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        model: payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from),
+        source: payload
+            .get("source")
+            .and_then(Value::as_str)
+            .map(String::from),
     }
 }
 

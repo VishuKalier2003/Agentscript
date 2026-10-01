@@ -1,0 +1,18 @@
+{
+  "timestamp": 1790000400000,
+  "webhookEvent": "jira:issue_created",
+  "issue_event_type_name": "issue_created",
+  "issue": {
+    "id": "10070",
+    "key": "OPS-7",
+    "fields": {
+      "summary": "Rotate the deploy key",
+      "project": {"key": "OPS", "name": "Operations"},
+      "assignee": {"displayName": "Crane Bot", "accountId": "557058:crane-bot"},
+      "status": {"name": "To Do", "statusCategory": {"key": "new"}},
+      "resolution": null,
+      "customfield_10050": "the key is rotated",
+      "description": "Rotate the key used by {{deploy_key}}."
+    }
+  }
+}

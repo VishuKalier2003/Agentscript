@@ -45,7 +45,7 @@ pub(crate) fn render(set: &ContractSet) -> String {
                 "rule: {}\nkind: {kind}\ntarget: {target}\nscope: {scope}\n",
                 clause.keyword()
             ));
-            if let Postcondition::Changed(change_type) = clause.postcondition {
+            if let Postcondition::Changed(change_type) = clause.postcondition() {
                 // Targets tell the agent which change its task must make
                 let change_type = change_type.map_or("any", ChangeType::name);
                 output.push_str(&format!("change_type: {change_type}\n"));
@@ -54,7 +54,7 @@ pub(crate) fn render(set: &ContractSet) -> String {
                     contract.policy_id
                 ));
             }
-            if clause.permission == Permission::DenyWrite {
+            if clause.permission() == Permission::DenyWrite {
                 preserved.push(format!(
                     "- {kind} {target} (scope {scope}; policy {})",
                     contract.policy_id

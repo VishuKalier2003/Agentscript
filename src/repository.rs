@@ -8,7 +8,8 @@ use crate::model::Checkpoint;
 use crate::util::{io_error, json_field};
 
 /** Locate the nearest initialized .crane directory from the current path, by first fetching the
- * current directory and then looping through its ancestors until a .crane directory is found
+ * current directory (inside an isolated session worktree, the .crane holding that worktree) and
+ * then looping through its ancestors until a .crane directory is found
  * Input
     - None
  * Output
@@ -18,6 +19,17 @@ use crate::util::{io_error, json_field};
 pub(crate) fn root() -> Result<PathBuf, String> {
     // Locate the nearest initialized Crane directory from the current path
     let mut directory = env::current_dir().map_err(io_error)?;
+    // An isolated session worktree lives in .crane/runtime/worktrees; it belongs to that .crane,
+    // never to a copy of .crane checked out inside the worktree
+    let components = directory.components().collect::<Vec<_>>();
+    let marker = components.windows(3).position(|window| {
+        window[0].as_os_str() == ".crane"
+            && window[1].as_os_str() == "runtime"
+            && window[2].as_os_str() == "worktrees"
+    });
+    if let Some(index) = marker {
+        return Ok(components[..=index].iter().collect());
+    }
     loop {
         let candidate = directory.join(".crane");
         if candidate.is_dir() {

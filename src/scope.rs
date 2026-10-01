@@ -1148,7 +1148,7 @@ fn find_start(
     - Result<Vec<String>, String> of blob ids, one per path
     - Error if git fails or returns the wrong number of ids
 */
-fn hash_files(root: &PathBuf, paths: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn hash_files(root: &PathBuf, paths: &[String]) -> Result<Vec<String>, String> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
