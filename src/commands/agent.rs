@@ -15,7 +15,7 @@ use crate::scope::ScopeContext;
 use crate::session::{read_attestation, session_ids, ContractSession, Lifecycle};
 use crate::util::option;
 use crate::verify::{assess, setup_report, verify_contracts, Assessment, Report};
-use crate::zones::model::SafetyState;
+use crate::zones::model::{Autonomy, SafetyState};
 
 /** Handle the agent subcommands, by first reading the operation (default verify) and the
  * --profile/--agent value, building the matching adapter, and then routing to install, hook,
@@ -147,9 +147,11 @@ fn handle(
             Ok(())
         }
         HookEvent::UserPromptSubmit => {
+            let released = crate::budget::manage::pending(session);
             let report = verify_contracts(session.contracts(), &mut ScopeContext::new(), &|_| true);
             session.record(json!({
                 "event": "user_prompt_submit",
+                "budget_released": released,
                 "verification": outcome(&report),
             }))?;
             adapter.respond_verification(event, assess(&report, false), &report)
@@ -179,7 +181,8 @@ fn handle(
             } else {
                 effects::observe(session, &action, protected)?
             };
-            session.record(json!({
+            let consumption = crate::budget::manage::consumption(session, &action);
+            let mut entry = json!({
                 "event": "post_tool_use",
                 "tool": action.tool,
                 "operation": action.operation.name(),
@@ -189,15 +192,23 @@ fn handle(
                 "verified_clauses": effect["clauses_checked"].as_u64().unwrap_or(0),
                 "verification": outcome(&report),
                 "effect": effect,
-            }))?;
+            });
+            if let Some(amount) = consumption {
+                entry["budget_consume"] = json!({"amount": amount, "compliant": agent_session::behaviour(&report).is_empty()});
+            }
+            session.record(entry)?;
             agent_session::after_tool(session)?;
+            agent_session::after_effect(session, &report)?;
+            crate::budget::manage::reward_compliance(session)?;
             adapter.respond_verification(event, assess(&report, false), &report)
         }
         HookEvent::Stop => {
+            let released = crate::budget::manage::pending(session);
             let (report, attestation) = effects::validate(session)?;
             session.write_attestation(&attestation)?;
             session.record(json!({
                 "event": "stop",
+                "budget_released": released,
                 "stop_hook_active": provider.stop_hook_active,
                 "final_status": attestation["final_status"],
                 "tests": attestation["tests"].as_array().map(|tests| tests.iter().map(|test| json!({"language": test["language"], "status": test["status"]})).collect::<Vec<_>>()),
@@ -255,6 +266,7 @@ fn unbound(
                 usage: Usage::unlimited(),
                 safety: SafetyState::Active,
                 safety_reason: None,
+                autonomy: Autonomy::Observe,
             };
             let verdict = runtime.decide(&provider.action.unwrap_or_else(unknown_action));
             match event {
@@ -399,8 +411,11 @@ fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
         }
         Some("resume") => {
             let id = id()?;
-            agent_session::resume(&id)?;
-            println!("Resumed contract session {id}.");
+            let state = agent_session::resume(&id)?;
+            println!("Resumed contract session {id}; autonomy {}, safety {}.", state.autonomy.name(), state.safety.name());
+            if let Some(reason) = &state.reason {
+                println!("Still {}: {reason}. Run 'crane autonomy status {id}' for what recovery needs.", state.safety.name());
+            }
             Ok(())
         }
         Some("cancel") => {
@@ -416,6 +431,10 @@ fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
             let id = id()?;
             let attestation = agent_session::finalize(&id)?;
             println!("Finalized contract session {id}: {}", attestation["final_status"].as_str().unwrap_or("unknown"));
+            let tests = &attestation["contract_tests"];
+            if !tests.is_null() {
+                println!("Contract tests (mandatory): {} passed, {} failed, {} not applicable", tests["passed"], tests["failed"], tests["not_applicable"]);
+            }
             Ok(())
         }
         Some("verify") => {
@@ -466,7 +485,7 @@ fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
         Some("quarantine") => {
             let id = id()?;
             agent_session::quarantine(&id, &reason())?;
-            println!("Quarantined contract session {id}; a human must resume it.");
+            println!("Quarantined contract session {id}; 'crane autonomy status {id}' lists what recovery needs.");
             Ok(())
         }
         Some("extend") => {

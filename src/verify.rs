@@ -153,7 +153,7 @@ fn verify_clause(context: &mut ScopeContext, commit: &str, clause: &Clause) -> R
     - Result<(), String>
     - Error describing why the target could not be verified or that it was modified
 */
-fn verify_item(commit: &str, kind: ItemKind, target: &str) -> Result<(), String> {
+pub(crate) fn verify_item(commit: &str, kind: ItemKind, target: &str) -> Result<(), String> {
     ensure_commit(commit)?;
     let noun = kind.noun();
     let baseline = match resolve_git(commit, kind, target)? {

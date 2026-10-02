@@ -2,6 +2,7 @@ use std::env;
 use std::path::Path;
 
 mod agent;
+mod autonomy;
 mod check;
 mod checkpoint;
 mod context;
@@ -13,6 +14,7 @@ mod protect;
 mod status;
 mod target;
 mod task;
+mod test_contract;
 mod zones;
 
 #[cfg(test)] // Compile the module only when running tests, not in production builds
@@ -56,8 +58,10 @@ pub(crate) fn run() -> Result<(), String> {
         "discover" => discover::run(&rest), // advisory semantic inventory of the repository
         "policy" => policy::run(&rest), // reviewable policy proposals, activated only by approval
         "task" => task::run(&rest),     // task-to-contract planning, never activated here
-        "zones" => zones::run(&rest),   // resolved repository zones, an input to authorization
-        "agent" => agent::run(&rest),   // agent adapters, hooks, and contract sessions
+        "test-contract" => test_contract::run(&rest), // contract compliance, apart from ordinary tests
+        "zones" => zones::run(&rest), // resolved repository zones, an input to authorization
+        "autonomy" => autonomy::run(&rest), // autonomy and safety state machine of sessions
+        "agent" => agent::run(&rest), // agent adapters, hooks, and contract sessions
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
     }
 }
@@ -140,6 +144,14 @@ Commands:
   policy approve NAME --approver NAME --confirm DIGEST_PREFIX
   policy reject NAME --approver NAME [--reason TEXT]
   policy regenerate NAME [--by NAME]
+  test-contract [--json] [--plan] [--session ID] [--no-ordinary]
+  autonomy status [SESSION_ID] [--json]
+  autonomy history SESSION_ID [--json]
+  autonomy promote|demote SESSION_ID --to MODE [--reason TEXT]
+  autonomy approve SESSION_ID [--reason TEXT]
+  autonomy budget SESSION_ID [--json]
+  autonomy refill SESSION_ID --amount N --reason TEXT --approver NAME --expires DURATION
+  autonomy credit SESSION_ID --event task_milestone|human_review|merge --reference REF --approver NAME
   zones [ZONE_ID] [--json]
   task plan TASK_ID|TASK_FILE [--json] [--checkpoint NAME] [--propose]
   task ingest --source jira|asana [--delivery ID] [EVENT_FILE...] [--json]
@@ -167,6 +179,22 @@ tool call is judged by the contract, then by zones, mode, scope, budget, and saf
 After a tool runs, its actual effect (files and symbols changed, zones touched) is verified
 incrementally; affected tests (.crane/testing.json) and full validation run at stop. --isolate
 starts a session in its own Git worktree on branch crane/SESSION_ID.
+test-contract turns every active contract clause into contract tests (preserve: checkpoint,
+identity, scope; target: changed, change type, scope), decided by Crane from the code, never by
+test files, then runs the ordinary tests split into organizational and agent-authored ones.
+--plan lists the tests without running them; --session ID tests that session's bound contract in
+its worktree. Contract tests are mandatory when a session is finalized.
+autonomy runs each session's state machine with two separate dimensions: autonomy (observe,
+assisted, delegated, autonomous; changed only by a human promotion, one step at a time, or
+demotion) and safety (active, degraded, quarantined; violations degrade, critical violations
+quarantine, and recovery needs the evidence sets in .crane/autonomy.json: verified_repair,
+human_approval, new_session, new_risk_budget). An agent can never change either; trying
+quarantines its session. status shows the policy and states; history shows every transition.
+Each session also has a risk budget (not tokens, compute, or money): autonomous actions cost
+points from the risk-cost model in .crane/budget.json (operation, criticality, environment, scope,
+reversibility, policy sensitivity, privilege escalation); violations cost points and critical ones
+zero it; controlled events regenerate it up to its maximum. When it runs out, actions need human
+approval and a refill is requested; refill adds temporary points with an approver and an expiry.
 discover inventories the repository (languages, services, modules, symbols, calls, tests,
 owners, contracts, checkpoints) and suggests critical code to protect; it is advisory and
 enforces nothing. --json prints the full inventory; --full ignores the incremental cache.

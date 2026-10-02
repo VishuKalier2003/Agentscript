@@ -402,7 +402,14 @@ fn post_tool_use_records_evidence_and_blocks_on_violation() {
         .contains("\"violation_type\":\"source_changed\""));
 
     let journal = fixture.journal("codex-c5");
-    assert_eq!(journal.len(), 3);
+    assert_eq!(journal.len(), 4);
+    // The unmet target is not a violation; the broken preserve degrades the session
+    assert_eq!(journal[3]["event"], "autonomy");
+    assert_eq!(journal[3]["kind"], "source_changed");
+    assert_eq!(
+        journal[3]["changes"],
+        json!([{"dimension": "safety", "from": "active", "to": "degraded"}])
+    );
     assert_eq!(journal[0]["effect"]["clauses_checked"], 0);
     assert_eq!(journal[2]["event"], "post_tool_use");
     assert_eq!(journal[2]["tool"], "Bash");
@@ -723,7 +730,12 @@ fn codex_end_to_end_from_agent_init() {
             "pre_tool_use:deny",
             "pre_tool_use:allow",
             "post_tool_use:-",
+            // The passing contract regenerates the risk budget the change consumed
+            "budget:-",
             "stop:-"
         ]
     );
+    let journal = fixture.journal("codex-c15");
+    assert_eq!(journal[4]["kind"], "regenerate");
+    assert_eq!(journal[4]["source"], "contract_completed");
 }

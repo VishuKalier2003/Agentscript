@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::adapter::AgentKind;
 use crate::agent_session::Governance;
 use crate::authority::{derive_grants, grant_from_json, grant_to_json, Grant, Runtime, Usage};
+use crate::autonomy::{step, Actor, State, Trigger};
 use crate::ir::{compile, ContractSet};
 use crate::model::Violation;
 use crate::repository::{git, root};
@@ -70,6 +71,7 @@ impl Lifecycle {
     - max_files: u64 - file budget including human extensions
     - safety: SafetyState - current safety state
     - safety_reason: Option<String> - why it is not active
+    - state: State - autonomy and safety, replayed through the autonomy state machine
     - started_at: Option<u64> - first start
     - last_at: Option<u64> - last journaled event
     - ended_at: Option<u64> - cancellation or finalization
@@ -83,6 +85,7 @@ pub(crate) struct Activity {
     pub(crate) max_files: u64,
     pub(crate) safety: SafetyState,
     pub(crate) safety_reason: Option<String>,
+    pub(crate) state: State,
     pub(crate) started_at: Option<u64>,
     pub(crate) last_at: Option<u64>,
     pub(crate) ended_at: Option<u64>,
@@ -433,8 +436,10 @@ impl ContractSession {
     }
 
     /** Derive what the session has done from its journal: authorized mutating actions and the
-     * files they wrote, budget extensions, the latest safety state, start, last activity, end,
-     * the reported model, and whether authority lapsed after the last reauthorizing event
+     * files they wrote, budget extensions, the autonomy and safety state (by replaying every
+     * autonomy event through the state machine under the bound autonomy policy), start, last
+     * activity, end, the reported model, and whether authority lapsed after the last
+     * reauthorizing event
      * Input
         - None (uses self)
      * Output
@@ -448,12 +453,14 @@ impl ContractSession {
             max_files: self.governance.max_files,
             safety: SafetyState::Active,
             safety_reason: None,
+            state: State::initial(self.governance.autonomy),
             started_at: None,
             last_at: None,
             ended_at: None,
             model: None,
             lapsed: false,
         };
+        let policy = self.governance.autonomy_policy.clone().unwrap_or_default();
         for event in self.journal().0 {
             let at = event["at"].as_u64();
             activity.last_at = at.or(activity.last_at);
@@ -491,21 +498,62 @@ impl ContractSession {
                     activity.max_actions += event["mutating_actions"].as_u64().unwrap_or(0);
                     activity.max_files += event["files"].as_u64().unwrap_or(0);
                 }
+                "autonomy" => {
+                    let replayed = Trigger::from_json(&event).and_then(|trigger| {
+                        let actor = Actor::parse(event["actor"].as_str().unwrap_or_default())?;
+                        step(&policy, &activity.state, &trigger, actor)
+                    });
+                    // A journaled transition that no longer replays is tampering: fail closed
+                    activity.state = match replayed {
+                        Ok((state, _)) => state,
+                        Err(error) => State {
+                            safety: SafetyState::Quarantined,
+                            reason: Some(format!(
+                                "autonomy event {} does not replay: {error}",
+                                event["seq"]
+                            )),
+                            ..activity.state.clone()
+                        },
+                    };
+                }
+                // Sessions written before the state machine journaled safety states directly
                 "safety" => {
-                    activity.safety =
+                    activity.state.safety =
                         SafetyState::parse(event["state"].as_str().unwrap_or("active"))
                             .unwrap_or(SafetyState::Quarantined);
-                    activity.safety_reason = event["reason"]
+                    activity.state.reason = event["reason"]
                         .as_str()
                         .map(String::from)
-                        .filter(|_| activity.safety != SafetyState::Active);
+                        .filter(|_| activity.state.safety != SafetyState::Active);
                 }
                 "authority_lapsed" => activity.lapsed = true,
                 "session_cancelled" | "session_finalized" => activity.ended_at = at,
                 _ => {}
             }
         }
+        activity.safety = activity.state.safety;
+        activity.safety_reason = activity.state.reason.clone();
         activity
+    }
+
+    /** Return who and what the session belongs to, for state inherited across sessions
+     * Input
+        - None (uses self)
+     * Output
+        - (AgentKind, Option<&str>, u64) agent profile, task, and creation time
+    */
+    pub(crate) fn identity(&self) -> (AgentKind, Option<&str>, u64) {
+        (self.agent, self.task.as_deref(), self.created_at)
+    }
+
+    /** Return the session id
+     * Input
+        - None (uses self)
+     * Output
+        - &str
+    */
+    pub(crate) fn id(&self) -> &str {
+        &self.id
     }
 
     /** Let the session's authority lapse when it sat idle past its idle timeout: journal the lapse
@@ -584,7 +632,8 @@ impl ContractSession {
             "last_activity_at": activity.last_at,
             "ended_at": activity.ended_at,
             "model": activity.model,
-            "autonomy": self.governance.autonomy.name(),
+            "autonomy": activity.state.autonomy.name(),
+            "initial_autonomy": self.governance.autonomy.name(),
             "safety_state": activity.safety.name(),
             "safety_reason": activity.safety_reason,
             "authority_lapsed": activity.lapsed,
@@ -682,6 +731,7 @@ impl ContractSession {
             },
             safety: activity.safety,
             safety_reason: activity.safety_reason,
+            autonomy: activity.state.autonomy,
         }
     }
 
@@ -846,6 +896,16 @@ impl ContractSession {
         checkpoints.sort();
         checkpoints.dedup();
         checkpoints
+    }
+
+    /** Return the session's journal events (lines that do not belong to the session are left out)
+     * Input
+        - None (uses self)
+     * Output
+        - Vec<Value>
+    */
+    pub(crate) fn events(&self) -> Vec<Value> {
+        self.journal().0
     }
 
     /** Read the journal, by parsing every line and reporting (not skipping) any line that is not a

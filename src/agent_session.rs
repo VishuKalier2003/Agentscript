@@ -10,11 +10,15 @@ use std::fs;
 use serde_json::{json, Value};
 
 use crate::adapter::AgentKind;
-use crate::authority::{AgentAction, Decision, Verdict, BUDGET_EXHAUSTED};
+use crate::authority::{changes_own_autonomy, AgentAction, Decision, Verdict, BUDGET_EXHAUSTED};
+use crate::autonomy::manage::{apply, inherit, load_policy};
+use crate::autonomy::{Actor, AutonomyPolicy, Condition, State, Trigger, SELF_ESCALATION};
+use crate::budget::BudgetModel;
 use crate::commands::render_context;
 use crate::proposals::store::require_human;
 use crate::repository::root;
 use crate::session::{session_ids, ContractSession, Lifecycle};
+use crate::verify::Report;
 use crate::zones::model::{Autonomy, Criticality, SafetyState};
 
 /** Session lifetime when none is given: authority never outlives a working day */
@@ -27,8 +31,9 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: u64 = 30 * 60;
  * Fields
     - zones: Vec<String> - zones covering it
     - criticality: Criticality - highest criticality
-    - autonomy: Autonomy - lowest effective autonomy
+    - autonomy: Autonomy - lowest effective autonomy (with organizational grants applied)
     - state: SafetyState - worst effective state
+    - grant: Option<String> - the organizational grants that opened a restricted zone, if any
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileConstraint {
@@ -36,6 +41,7 @@ pub(crate) struct FileConstraint {
     pub(crate) criticality: Criticality,
     pub(crate) autonomy: Autonomy,
     pub(crate) state: SafetyState,
+    pub(crate) grant: Option<String>,
 }
 
 /** Everything a session is governed by besides its contract, fixed at creation and covered by the
@@ -52,6 +58,10 @@ pub(crate) struct FileConstraint {
     - task_title: Option<String> - title of the bound task
     - scope: Option<BTreeSet<String>> - files in the task scope, None without a task
     - scope_modules: Vec<String> - modules in the task scope
+    - autonomy_policy: Option<AutonomyPolicy> - the autonomy policy bound at creation (None for
+      sessions created before the autonomy state machine, which use the default policy)
+    - budget_model: Option<BudgetModel> - the risk-cost model bound at creation (None for sessions
+      created before the autonomy budget, which use the default model)
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Governance {
@@ -65,6 +75,8 @@ pub(crate) struct Governance {
     pub(crate) task_title: Option<String>,
     pub(crate) scope: Option<BTreeSet<String>>,
     pub(crate) scope_modules: Vec<String>,
+    pub(crate) autonomy_policy: Option<AutonomyPolicy>,
+    pub(crate) budget_model: Option<BudgetModel>,
 }
 
 impl Governance {
@@ -102,6 +114,8 @@ impl Governance {
             task_title: None,
             scope: None,
             scope_modules: Vec::new(),
+            autonomy_policy: None,
+            budget_model: None,
         }
     }
 
@@ -132,6 +146,7 @@ impl Governance {
                 criticality: left.criticality.max(right.criticality),
                 autonomy: left.autonomy.min(right.autonomy),
                 state: left.state.max(right.state),
+                grant: None,
             })
     }
 
@@ -165,22 +180,36 @@ impl Governance {
         - Value JSON object
     */
     pub(crate) fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "autonomy": self.autonomy.name(),
             "budget": {"mutating_actions": self.max_actions, "files": self.max_files},
             "idle_timeout": self.idle_timeout,
             "zone_set_version": self.zone_set_version,
             "zones": self.zones,
-            "files": self.files.iter().map(|(path, constraint)| (path.clone(), json!({
-                "zones": constraint.zones,
-                "criticality": constraint.criticality.name(),
-                "autonomy": constraint.autonomy.name(),
-                "state": constraint.state.name(),
-            }))).collect::<serde_json::Map<_, _>>(),
+            "files": self.files.iter().map(|(path, constraint)| {
+                let mut entry = json!({
+                    "zones": constraint.zones,
+                    "criticality": constraint.criticality.name(),
+                    "autonomy": constraint.autonomy.name(),
+                    "state": constraint.state.name(),
+                });
+                // Written only when present, so bindings made before grants keep their digest
+                if let Some(grant) = &constraint.grant {
+                    entry["grant"] = json!(grant);
+                }
+                (path.clone(), entry)
+            }).collect::<serde_json::Map<_, _>>(),
             "task_title": self.task_title,
             "scope": self.scope,
             "scope_modules": self.scope_modules,
-        })
+        });
+        if let Some(policy) = &self.autonomy_policy {
+            value["autonomy_policy"] = policy.to_json();
+        }
+        if let Some(model) = &self.budget_model {
+            value["budget_model"] = model.to_json();
+        }
+        value
     }
 
     /** Read back from a session binding
@@ -221,6 +250,7 @@ impl Governance {
                     )?,
                     autonomy: Autonomy::parse(constraint["autonomy"].as_str().unwrap_or_default())?,
                     state: SafetyState::parse(constraint["state"].as_str().unwrap_or_default())?,
+                    grant: constraint["grant"].as_str().map(String::from),
                 },
             );
         }
@@ -237,6 +267,14 @@ impl Governance {
                 .as_array()
                 .map(|_| strings(&value["scope"]).into_iter().collect()),
             scope_modules: strings(&value["scope_modules"]),
+            autonomy_policy: match value.get("autonomy_policy") {
+                Some(policy) => Some(AutonomyPolicy::from_json(policy)?),
+                None => None,
+            },
+            budget_model: match value.get("budget_model") {
+                Some(model) => Some(BudgetModel::from_json(model)?),
+                None => None,
+            },
         })
     }
 }
@@ -312,13 +350,20 @@ impl SessionOptions {
         - Error if zones or the task cannot be resolved
     */
     pub(crate) fn governance(&self, task: Option<&str>) -> Result<Governance, String> {
-        let autonomy = self.autonomy.unwrap_or(Autonomy::Delegated);
+        // The organization's maximum caps what a session may start with
+        let policy = load_policy()?;
+        let autonomy = self
+            .autonomy
+            .unwrap_or(Autonomy::Delegated)
+            .min(policy.max_autonomy);
         let (actions, files) = Governance::default_budget(autonomy);
         let mut governance = Governance {
             autonomy,
             max_actions: self.max_actions.unwrap_or(actions),
             max_files: self.max_files.unwrap_or(files),
             idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
+            autonomy_policy: Some(policy.clone()),
+            budget_model: Some(crate::budget::manage::load_model()?),
             ..Governance::plain()
         };
         let zoned = fs::read_dir(root()?.join("zones"))
@@ -337,16 +382,45 @@ impl SessionOptions {
         let zones = crate::zones::inspect()?;
         let snapshot = &zones.inventory.snapshot;
         governance.zone_set_version = zoned.then(|| zones.version.clone());
-        for result in &zones.resolution.zones {
-            governance.zones.push(json!({
+        // A restricted zone is closed to every autonomy mode unless an organizational grant opens
+        // it, and then only as far as the grant and the zone's own safety state allow
+        let granted = |index: usize| {
+            let result = &zones.resolution.zones[index];
+            (result.zone.criticality == Criticality::Restricted)
+                .then(|| policy.grant_for(&result.zone.zone_id, task))
+                .flatten()
+                .map(|grant| (grant, grant.autonomy.min(result.state.autonomy_cap())))
+        };
+        for (index, result) in zones.resolution.zones.iter().enumerate() {
+            let mut summary = json!({
                 "zone_id": result.zone.zone_id,
                 "criticality": result.zone.criticality.name(),
                 "autonomy": result.autonomy.name(),
                 "state": result.state.name(),
                 "files": result.files.len(),
-            }));
+            });
+            if let Some((grant, level)) = granted(index) {
+                summary["granted"] = json!({"autonomy": level.name(), "approved_by": grant.approved_by, "reason": grant.reason, "task": grant.task});
+            }
+            governance.zones.push(summary);
         }
         for (file, effective) in &zones.resolution.files {
+            let mut autonomy = Autonomy::Autonomous;
+            let mut grants = Vec::new();
+            for index in &effective.zones {
+                match granted(*index) {
+                    Some((grant, level)) => {
+                        autonomy = autonomy.min(level);
+                        grants.push(format!(
+                            "{} ({} by {})",
+                            grant.zone,
+                            level.name(),
+                            grant.approved_by
+                        ));
+                    }
+                    None => autonomy = autonomy.min(zones.resolution.zones[*index].autonomy),
+                }
+            }
             governance.files.insert(
                 snapshot.files[*file].path.clone(),
                 FileConstraint {
@@ -356,8 +430,9 @@ impl SessionOptions {
                         .map(|index| zones.resolution.zones[*index].zone.zone_id.clone())
                         .collect(),
                     criticality: effective.criticality,
-                    autonomy: effective.autonomy,
+                    autonomy,
                     state: effective.state,
+                    grant: (!grants.is_empty()).then(|| grants.join(", ")),
                 },
             );
         }
@@ -417,6 +492,8 @@ pub(crate) fn establish(
     if created {
         // The starting point every later effect is measured against
         crate::effects::baseline(&session)?;
+        // A new session never escapes the quarantine of the same agent's last session on the task
+        inherit(&session)?;
     }
     Ok((session, created))
 }
@@ -572,9 +649,13 @@ pub(crate) fn on_start(
     if resumable {
         session.set_lifecycle(Lifecycle::Active)?;
     }
-    session.record(
-        json!({"event": "session_start", "model": model, "source": source, "resumed": resumable}),
-    )?;
+    session.record(json!({
+        "event": "session_start",
+        "model": model,
+        "source": source,
+        "resumed": resumable,
+        "budget_released": crate::budget::manage::pending(session),
+    }))?;
     Ok(context(session))
 }
 
@@ -605,7 +686,7 @@ pub(crate) fn context(session: &ContractSession) -> String {
                 .map_or(String::new(), |title| format!(" - {title}"))
         ));
     }
-    let mode = match governance.autonomy {
+    let mode = match activity.state.autonomy {
         Autonomy::Observe => "observe (read-only)",
         Autonomy::Assisted => "assisted (every change needs human approval)",
         Autonomy::Delegated if governance.scope.is_some() => {
@@ -673,16 +754,23 @@ pub(crate) fn authorize(
     event: &str,
 ) -> Result<Verdict, String> {
     session.lapse_if_idle()?;
-    let verdict = session.runtime(protected).decide(action);
+    let mut verdict = session.runtime(protected).decide(action);
+    // Only what the agent may do without a human costs risk budget
+    let reserve = crate::budget::manage::authorize(session, action, &mut verdict)?;
     let exhausted = verdict.decision == Decision::Deny
         && verdict
             .reasons
             .iter()
             .any(|reason| reason.starts_with(BUDGET_EXHAUSTED));
     if exhausted && session.activity().safety != SafetyState::Quarantined {
-        session.record(json!({"event": "safety", "state": "quarantined", "reason": "autonomy budget exhausted"}))?;
+        apply(
+            session,
+            Trigger::Violation("budget_exhausted".into()),
+            Actor::Crane,
+            "autonomy budget exhausted",
+        )?;
     }
-    session.record(json!({
+    let mut entry = json!({
         "event": event,
         "tool": action.tool,
         "operation": action.operation.name(),
@@ -695,12 +783,25 @@ pub(crate) fn authorize(
             Decision::ApprovalRequired => "approval_required",
             Decision::Deny => "blocked",
         },
-    }))?;
+    });
+    if let Some(reserve) = reserve {
+        entry["budget_reserve"] = reserve;
+    }
+    session.record(entry)?;
+    if action.command.as_deref().is_some_and(changes_own_autonomy) {
+        // The command was denied above; trying it at all is a critical violation
+        apply(
+            session,
+            Trigger::Violation(SELF_ESCALATION.into()),
+            Actor::Crane,
+            "the agent tried to change its own autonomy or safety state",
+        )?;
+    }
     Ok(verdict)
 }
 
-/** Note what an executed tool call means for the session's safety: when the contract on disk no
- * longer matches the bound one, the session becomes degraded (autonomy capped at assisted)
+/** Note what an executed tool call means for the session's safety: the first time the contract on
+ * disk no longer matches the bound one, a contract_drift violation degrades the session
  * Input
     - session: &ContractSession - session
  * Output
@@ -708,10 +809,62 @@ pub(crate) fn authorize(
 */
 pub(crate) fn after_tool(session: &ContractSession) -> Result<(), String> {
     let drift = session.describe()["drift"].as_array().map_or(0, Vec::len);
-    if drift > 0 && session.activity().safety == SafetyState::Active {
-        session.record(json!({"event": "safety", "state": "degraded", "reason": "the contract changed on disk during the session"}))?;
+    let reported = session
+        .events()
+        .iter()
+        .any(|event| event["event"] == "autonomy" && event["kind"] == "contract_drift");
+    if drift > 0 && !reported {
+        apply(
+            session,
+            Trigger::Violation("contract_drift".into()),
+            Actor::Crane,
+            "the contract changed on disk during the session",
+        )?;
     }
     Ok(())
+}
+
+/** List the behaviour violations in a verification report (unmet targets and setup problems are
+ * not behaviour)
+ * Input
+    - report: &Report - verification report
+ * Output
+    - Vec<&str> violation kinds
+*/
+pub(crate) fn behaviour(report: &Report) -> Vec<&str> {
+    report
+        .violations
+        .iter()
+        .map(|violation| violation.violation_type.as_str())
+        .filter(|kind| !crate::autonomy::NOT_VIOLATIONS.contains(kind))
+        .collect()
+}
+
+/** Feed what effect verification found after a tool ran into the autonomy state machine: one
+ * violation trigger per tool call, of the first critical kind found, else of the first kind;
+ * unmet targets and setup problems are not behaviour and are left out
+ * Input
+    - session: &ContractSession - session
+    - report: &Report - fast effect verification of the tool call
+ * Output
+    - Result<bool, String> whether the tool call was compliant
+*/
+pub(crate) fn after_effect(session: &ContractSession, report: &Report) -> Result<bool, String> {
+    let policy = crate::autonomy::manage::policy_of(session);
+    let kinds = behaviour(report);
+    let kind = kinds
+        .iter()
+        .find(|kind| policy.critical.contains(**kind))
+        .or(kinds.first());
+    if let Some(kind) = kind {
+        apply(
+            session,
+            Trigger::Violation(kind.to_string()),
+            Actor::Crane,
+            &format!("{} violation(s) found after a tool call", kinds.len()),
+        )?;
+    }
+    Ok(kind.is_none())
 }
 
 /** Load a stored session for a management command
@@ -744,19 +897,28 @@ pub(crate) fn start(
         session.record(
             json!({"event": "session_start", "source": "manager", "model": null, "resumed": false}),
         )?;
+        // A human starting the session approves it, which may complete an inherited recovery
+        apply(
+            &session,
+            Trigger::Evidence(Condition::HumanApproval),
+            Actor::Human,
+            "started by a human",
+        )?;
     }
     let context = context(&session);
     Ok((session, context))
 }
 
-/** Resume a session as a human: reactivate a closed session, restore lapsed authority, and lift a
- * quarantine; cancelled, finalized, and expired sessions cannot be resumed
+/** Resume a session as a human: reactivate a closed session, restore lapsed authority, and record
+ * human approval as recovery evidence (which lifts a degraded or quarantined state only once a
+ * configured recovery set is complete); cancelled, finalized, and expired sessions cannot be
+ * resumed
  * Input
     - id: &str - Crane session id
  * Output
-    - Result<(), String>
+    - Result<State, String> the autonomy and safety state after the resume
 */
-pub(crate) fn resume(id: &str) -> Result<(), String> {
+pub(crate) fn resume(id: &str) -> Result<State, String> {
     require_human("resume sessions")?;
     let session = stored(id)?;
     if !session.resumable() {
@@ -770,12 +932,12 @@ pub(crate) fn resume(id: &str) -> Result<(), String> {
     }
     session.set_lifecycle(Lifecycle::Active)?;
     session.record(json!({"event": "session_resumed", "by": "human"}))?;
-    if session.activity().safety == SafetyState::Quarantined {
-        session.record(
-            json!({"event": "safety", "state": "active", "reason": "resumed by a human"}),
-        )?;
-    }
-    Ok(())
+    apply(
+        &session,
+        Trigger::Evidence(Condition::HumanApproval),
+        Actor::Human,
+        "resumed by a human",
+    )
 }
 
 /** Cancel a session: it can never act or be resumed again; the worktree is not touched
@@ -812,7 +974,36 @@ pub(crate) fn finalize(id: &str) -> Result<Value, String> {
         session.set_lifecycle(Lifecycle::Closed)?;
     }
     session.record(json!({"event": "session_finalizing"}))?;
-    let (_, attestation) = crate::effects::validate(&session)?;
+    let (_, mut attestation) = crate::effects::validate(&session)?;
+    // Contract tests are mandatory here: a failing one fails the session whatever the tests say
+    let tests = crate::contract_tests::for_session(&session)?;
+    let failed = tests
+        .iter()
+        .filter(|test| test.status == "failed")
+        .collect::<Vec<_>>();
+    let mut findings = attestation["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for test in &failed {
+        findings.push(json!({
+            "policy_id": test.policy_id,
+            "rule": test.rule,
+            "target": test.target,
+            "violation_type": "contract_test_failed",
+            "message": format!("contract test '{}' failed: {}", test.title, test.message),
+        }));
+    }
+    attestation["reconciliation"]["contract_tests_passed"] = json!(failed.is_empty());
+    if !failed.is_empty() {
+        attestation["findings"] = json!(findings);
+        attestation["final_status"] = json!("FAIL");
+    }
+    attestation["contract_tests"] = crate::contract_tests::summary(&tests);
+    if failed.is_empty() && !tests.is_empty() {
+        crate::budget::manage::regenerate(&session, "contract_tests_passed", "")?;
+    }
+    attestation["budget"] = crate::budget::manage::state(&session).to_json();
     session.write_attestation(&attestation)?;
     session.record(
         json!({"event": "session_finalized", "final_status": attestation["final_status"]}),
@@ -858,7 +1049,12 @@ pub(crate) fn sweep() -> Result<Vec<String>, String> {
 */
 pub(crate) fn quarantine(id: &str, reason: &str) -> Result<(), String> {
     let session = stored(id)?;
-    session.record(json!({"event": "safety", "state": "quarantined", "reason": reason}))
+    // Quarantining only restricts, so a request from any environment is carried out by Crane
+    let actor = match crate::autonomy::manage::actor() {
+        Actor::Agent => Actor::Crane,
+        actor => actor,
+    };
+    apply(&session, Trigger::Quarantine(reason.into()), actor, reason).map(|_| ())
 }
 
 /** Extend a session's autonomy budget as a human (journaled; the bound budget never changes)
@@ -878,5 +1074,13 @@ pub(crate) fn extend(id: &str, actions: u64, files: u64) -> Result<(), String> {
             session.lifecycle().name()
         ));
     }
-    session.record(json!({"event": "budget_extended", "mutating_actions": actions, "files": files}))
+    session
+        .record(json!({"event": "budget_extended", "mutating_actions": actions, "files": files}))?;
+    apply(
+        &session,
+        Trigger::Evidence(Condition::NewRiskBudget),
+        Actor::Human,
+        "a human granted a new autonomy budget",
+    )
+    .map(|_| ())
 }

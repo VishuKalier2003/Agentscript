@@ -539,6 +539,102 @@ crane agent session verify claude-s1 --level fast|tests|full
 crane agent session finalize claude-s1 && crane agent session cleanup claude-s1
 ```
 
+## Contract tests
+
+`crane test-contract` turns the active contracts into executable verification
+requirements and reports them apart from the repository's ordinary tests, so a
+customer can tell contract compliance from code correctness:
+
+```text
+CONTRACT TESTS (3 passed, 0 failed, 1 not applicable; decided by Crane, never by test files)
+✓ PaymentService.charge preserved [payments_core]
+✓ PaymentService.charge keeps its semantic identity [payments_core]
+- PaymentService.charge block scope preserved [payments_core]
+✓ PaymentService.retry changed [task_pay_7]
+✓ PaymentService.retry logical_bn satisfied [task_pay_7]
+✓ PaymentService.retry found within its folder scope [task_pay_7]
+
+ORDINARY TESTS
+  ✓ organizational python: 87 test files passed
+  ✓ agent-authored python: 1 test files passed
+```
+
+Contract tests are decided by Crane's own comparison of the code with the
+checkpoint. A passing test file never satisfies one, and changes to tests the
+agent wrote alone never satisfy a target. Organizational tests always run;
+tests the agent created are run and marked `agent-authored`. Contract tests are
+mandatory when a session is finalized.
+
+```bash
+crane test-contract [--json] [--plan] [--session SESSION_ID] [--no-ordinary]
+```
+
+## Autonomy and safety
+
+Every session has two separate states. **Autonomy** (`observe`, `assisted`,
+`delegated`, `autonomous`) is how much the agent may do on its own. **Safety**
+(`active`, `degraded`, `quarantined`) is whether it is behaving. Each has its
+own legal transitions:
+
+- Autonomy rises only when a human promotes it, one step at a time
+  (`observe → assisted → delegated → autonomous`), while safety is active.
+  A human can demote it at any time.
+- A violation moves safety from `active` to `degraded`. A critical violation
+  (an unauthorized effect, an exhausted budget, or an attempt at
+  self-escalation) moves any state to `quarantined`.
+- Recovery needs explicit evidence: a verified repair, a human approval, a
+  new session, or a new risk budget, in the combinations
+  `.crane/autonomy.json` configures. A quarantine never lifts without a
+  human.
+
+An agent can never change either state. Trying to, from its shell or through
+the CLI, quarantines its session. A quarantine also carries over to the same
+agent's next session on the task. The policy hierarchy outranks autonomy: a
+Restricted zone stays closed even to an autonomous agent unless
+`.crane/autonomy.json` grants that authority, and the contract still applies
+inside a grant.
+
+```bash
+crane autonomy status [SESSION_ID] [--json]
+crane autonomy history SESSION_ID [--json]
+crane autonomy promote|demote SESSION_ID --to MODE   # humans only
+crane autonomy approve SESSION_ID                     # human approval as recovery evidence
+```
+
+## Autonomy budget
+
+Each session also has a **risk budget**: the autonomous authority it may
+spend without a human. It is not tokens, compute, or money.
+
+- **Cost.** An action the agent takes on its own costs points from the
+  configurable risk-cost model in `.crane/budget.json`. The price depends on
+  the operation, resource criticality, environment (isolated, workspace, or
+  production), scope (task, repository, or shared library), reversibility,
+  contract sensitivity, and privilege escalation. Under the defaults, a
+  routine source write costs less than a shared-library write, which costs
+  less than a production write, which costs less than privilege escalation.
+  Actions a human approves cost nothing.
+- **Penalties.** Violations cost points, and critical ones set the budget to
+  zero.
+- **Regeneration.** The budget regenerates only through controlled events, and
+  never above `budget_max`:
+  - a completed contract;
+  - passing contract tests;
+  - task milestones, reviews, and merges;
+  - sustained compliant behaviour.
+- **Exhaustion.** When the budget runs out:
+  - actions need human approval;
+  - the session is degraded;
+  - promotion is blocked;
+  - a refill is requested.
+- **Refills.** A refill is temporary and never changes a policy:
+
+```bash
+crane autonomy budget SESSION_ID [--json]
+crane autonomy refill SESSION_ID --amount 20 --reason "reviewed plan" --approver lead --expires 4h
+crane autonomy credit SESSION_ID --event human_review --reference PR-42 --approver reviewer
+```
+
 ## Installation
 
 Prebuilt binaries for Linux, macOS (Intel and Apple Silicon), and Windows are
@@ -751,6 +847,19 @@ This MVP intentionally keeps the implementation narrow:
   cannot terminate the agent process.
 - Zones constrain writes whose files are known before they run; a shell command's effect on
   a zoned file is caught right after it runs (as an unauthorized effect), not prevented.
+- Contract tests check the code against the checkpoint and do not execute it;
+  behaviour is covered by the ordinary tests. Agent-authored tests are
+  recognised from session journals, so a test file an agent wrote outside any
+  Crane session counts as organizational.
+- Autonomy changes are human-only because agent environments are detected
+  (by their environment markers) and agent shell commands are inspected. A
+  process that hides those markers and runs outside the hooks is not
+  observed. The journal itself is protected only like the rest of `.crane`.
+- Pricing reads what an action declares: the files a write names, and the
+  text of a shell command, matched against configured path globs and command
+  fragments. A shell command that writes production files without saying so
+  is priced as an ordinary command. Its effect is still verified after it
+  runs.
 - Isolation uses Git worktrees, not containers: an agent process can still reach files outside
   its worktree, which effect verification of the worktree does not observe.
 - Sessions created by Crane 0.2.0 or earlier (session format 1) are rejected

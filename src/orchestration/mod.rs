@@ -1124,6 +1124,9 @@ pub(crate) fn advance(id: &str, to: TaskState, reason: Option<String>) -> Result
     let _lock = Lock::acquire()?;
     let mut record = TaskRecord::load(id)?.ok_or_else(|| format!("no task '{id}'"))?;
     let reason = reason.unwrap_or_else(|| format!("moved to {} by a human", to.name()));
+    if record.state().allows(to) {
+        credit_milestone(id, to)?;
+    }
     if to.terminal() {
         finish(&mut record, to, "crane task advance", &reason)?;
     } else {
@@ -1131,6 +1134,35 @@ pub(crate) fn advance(id: &str, to: TaskState, reason: Option<String>) -> Result
     }
     record.save()?;
     Ok(record.value)
+}
+
+/** Regenerate the budget of a task's open sessions for a milestone a human reported: a pull
+ * request ready or the task completed is a task milestone, a merge is a passed human review and a
+ * merge; each is credited once per task and state
+ * Input
+    - id: &str - task id
+    - to: TaskState - the state the task moves to
+ * Output
+    - Result<(), String>
+*/
+fn credit_milestone(id: &str, to: TaskState) -> Result<(), String> {
+    let sources: &[&str] = match to {
+        TaskState::PrReady | TaskState::Completed => &["task_milestone"],
+        TaskState::Merged => &["human_review", "merge"],
+        _ => return Ok(()),
+    };
+    for session_id in session_ids()? {
+        let Ok(Some(session)) = ContractSession::load(&session_id) else {
+            continue;
+        };
+        if session.identity().1 != Some(id) || !session.resumable() {
+            continue;
+        }
+        for source in sources {
+            crate::budget::manage::regenerate(&session, source, &format!("{id}:{}", to.name()))?;
+        }
+    }
+    Ok(())
 }
 
 /** Read the records for crane task status

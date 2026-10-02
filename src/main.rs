@@ -2,7 +2,10 @@
 mod adapter;
 mod agent_session;
 mod authority;
+mod autonomy;
+mod budget;
 mod commands;
+mod contract_tests;
 mod effects;
 mod inventory;
 mod ir;

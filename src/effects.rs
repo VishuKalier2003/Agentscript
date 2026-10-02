@@ -141,17 +141,23 @@ pub(crate) fn baseline(session: &ContractSession) -> Result<(), String> {
 }
 
 /** Return the policy-relevant level a session needs to change a path without asking: the lowest
- * of its mode, its zones, and (in delegated mode) its task scope
+ * of its current autonomy mode, its zones, and (in delegated mode) its task scope
  * Input
     - session: &ContractSession - session
+    - autonomy: Autonomy - the session's current autonomy mode
     - path: &str - repository-relative path
     - exists: bool - whether the file exists now
  * Output
     - (Autonomy, Vec<String>) the level and why it is restricted
 */
-fn required_level(session: &ContractSession, path: &str, exists: bool) -> (Autonomy, Vec<String>) {
+fn required_level(
+    session: &ContractSession,
+    autonomy: Autonomy,
+    path: &str,
+    exists: bool,
+) -> (Autonomy, Vec<String>) {
     let governance = session.governance();
-    let mut level = governance.autonomy;
+    let mut level = autonomy;
     let mut reasons = Vec::new();
     if let Some(constraint) = governance.constraint(path) {
         let cap = constraint.autonomy.min(constraint.state.autonomy_cap());
@@ -164,7 +170,7 @@ fn required_level(session: &ContractSession, path: &str, exists: bool) -> (Auton
         }
         level = level.min(cap);
     }
-    if governance.autonomy == Autonomy::Delegated && !governance.in_scope(path, exists) {
+    if autonomy == Autonomy::Delegated && !governance.in_scope(path, exists) {
         reasons.push("outside the task scope".into());
         level = level.min(Autonomy::Assisted);
     }
@@ -387,7 +393,8 @@ fn describe(
     difference: &Difference,
 ) -> (Value, Vec<Violation>) {
     let root = session.root_path();
-    let authorized = session.activity().files;
+    let activity = session.activity();
+    let authorized = activity.files;
     let governance = session.governance();
     let mut zones = BTreeSet::new();
     let mut violations = Vec::new();
@@ -396,7 +403,7 @@ fn describe(
             zones.extend(constraint.zones.iter().cloned());
         }
         let exists = root.join(&path).exists();
-        let (level, reasons) = required_level(session, &path, exists);
+        let (level, reasons) = required_level(session, activity.state.autonomy, &path, exists);
         if level <= Autonomy::Assisted
             && (level == Autonomy::Observe || !authorized.contains(&path))
         {
@@ -572,7 +579,7 @@ pub(crate) fn cumulative(
  * Output
     - Result<Value, String> the configuration, Null when there is none
 */
-fn testing_config() -> Result<Value, String> {
+pub(crate) fn testing_config() -> Result<Value, String> {
     match fs::read_to_string(root()?.join("testing.json")) {
         Ok(content) => {
             serde_json::from_str(&content).map_err(|error| format!(".crane/testing.json: {error}"))
@@ -590,7 +597,7 @@ fn testing_config() -> Result<Value, String> {
  * Output
     - Value {status: passed|failed|timed_out|error, exit, output}
 */
-fn run(root: &Path, command: &[String], timeout: u64) -> Value {
+pub(crate) fn run(root: &Path, command: &[String], timeout: u64) -> Value {
     let Some((program, arguments)) = command.split_first() else {
         return json!({"status": "error", "output": "empty test command"});
     };
@@ -756,10 +763,16 @@ pub(crate) fn affected_tests(
     - Result<(Report, Value), String> report and attestation
 */
 pub(crate) fn validate(session: &ContractSession) -> Result<(Report, Value), String> {
-    match workspace_of(session) {
-        Some(path) => within(&path, || validate_here(session)),
-        None => validate_here(session),
+    let (report, attestation) = match workspace_of(session) {
+        Some(path) => within(&path, || validate_here(session))?,
+        None => validate_here(session)?,
+    };
+    // A clean full validation is the verified repair a degraded or quarantined session recovers by
+    crate::autonomy::manage::note_validation(session, &report)?;
+    if attestation["final_status"] == "PASS" {
+        crate::budget::manage::regenerate(session, "contract_completed", "")?;
     }
+    Ok((report, attestation))
 }
 
 /** Return a session's isolated worktree when it belongs to this repository's .crane; any other

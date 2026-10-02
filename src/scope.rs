@@ -277,6 +277,29 @@ pub(crate) fn locate_target(
     context.state(commit)?.locate(kind, target)
 }
 
+/** Measure one item on both sides (checkpoint and worktree), requiring it to resolve exactly once
+ * on each, for semantic identity checks
+ * Input
+    - context: &mut ScopeContext - shared state for this run
+    - commit: &str - checkpoint commit
+    - kind: ItemKind - item kind
+    - target: &str - qualified target
+ * Output
+    - Result<(Features, Features), String> checkpoint and worktree measurements
+    - Error if the item is missing or ambiguous on either side
+*/
+pub(crate) fn item_features(
+    context: &mut ScopeContext,
+    commit: &str,
+    kind: ItemKind,
+    target: &str,
+) -> Result<(Features, Features), String> {
+    let (before, after) = context.state(commit)?.block_units(kind, target)?;
+    let first =
+        |units: BTreeMap<String, Features>| units.into_values().next().ok_or("item not measured");
+    Ok((first(before)?, first(after)?))
+}
+
 /** Where a clause's item lives in the checkpoint, used to derive runtime authority once per
  * session instead of on every tool call
  * Fields

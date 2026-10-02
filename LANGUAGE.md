@@ -829,6 +829,272 @@ Verification runs at three levels:
    session started (a reverted change leaves nothing), plus the affected tests
    of everything changed. All of it goes into the attestation.
 
+## Contract tests
+
+`crane test-contract` generates contract tests from the active contracts (with
+`--session ID`, from the contract bound to that session, run inside its
+worktree) and runs them, then runs the ordinary tests. The two are reported in
+separate sections (`contract_tests` and `ordinary_tests` in `--json`).
+
+Each clause becomes three contract tests:
+
+| Rule | Check | Passes when |
+| --- | --- | --- |
+| preserve | `checkpoint` | the item equals its checkpoint version (comments ignored) |
+| preserve | `identity` | the item resolves once on both sides with the same structure, business logic, and complexity, so a whitespace-only reformat fails `checkpoint` but passes `identity` |
+| preserve | `scope` | nothing changed within its scope (`not_applicable` for `block`) |
+| target | `changed` | the item changed within its scope, and not only through agent-authored test files |
+| target | `change_type` | the change is of the declared `change_type` (`not_applicable` without one) |
+| target | `scope` | the item resolves exactly once at the checkpoint and in the worktree |
+
+Test statuses are `passed`, `failed`, `not_applicable`, or `scheduled` (with
+`--plan`, which generates the tests without running anything). A malformed
+policy becomes one failing test. Every contract test is decided by Crane's
+verification of the code; no test file, and no test result, can satisfy one.
+
+**Ordinary tests** run with `.crane/testing.json`:
+
+- **Organizational tests** are the test files present at the contracts'
+  checkpoints, plus any added outside agent sessions. They always run. Set
+  `"suite": {"python": ["python", "-m", "pytest"]}` to run a language's whole
+  suite in one command; otherwise `commands[language]` runs with `{files}`
+  expanded to the test files.
+- **Agent-authored tests** are test files that agents added, wrote, or renamed
+  in any contract session of the repository (from the journals' effects and
+  authorized writes, never reads). They run separately with
+  `commands[language]` and are marked `agent_authored`.
+- An organizational test that an agent changed stays organizational, and
+  produces the non-blocking finding `organizational_test_modified_by_agent`.
+  One deleted since the checkpoint produces `organizational_test_deleted`,
+  which fails the ordinary tests.
+
+The command exits non-zero when any contract test or ordinary test fails.
+
+**At finalization**, `crane agent session finalize` always runs the session's
+contract tests. The attestation gains `contract_tests` (counts and every test)
+and `reconciliation.contract_tests_passed`. Each failed contract test adds a
+`contract_test_failed` finding and makes `final_status` `FAIL`.
+
+## Autonomy state machine
+
+Each session carries two dimensions that never mix: **autonomy** and
+**safety**. Promotions and demotions change only autonomy. Violations,
+quarantines, and recovery evidence change only safety. What the session may do
+is the lower of its autonomy and its safety cap: `degraded` caps it at
+`assisted`, and `quarantined` caps it at `observe`.
+
+**Legal transitions** (`crane autonomy status` prints them for the policy in
+force):
+
+| Dimension | From → to | Trigger | By | Requires |
+| --- | --- | --- | --- | --- |
+| autonomy | observe → assisted → delegated → autonomous | promote | human | safety active, one step at a time, at most `max_autonomy` |
+| autonomy | any → any lower | demote | human | nothing |
+| safety | active → degraded | violation | Crane or human | a non-critical violation |
+| safety | degraded → quarantined | violation | Crane or human | `violations_to_quarantine` violations in one incident |
+| safety | any → quarantined | critical violation, quarantine | Crane or human | a kind listed in `critical_violations` |
+| safety | degraded → active | evidence | per condition | any one set in `recovery.degraded.any_of` |
+| safety | quarantined → active (or degraded) | evidence | per condition | any one set in `recovery.quarantined.any_of` |
+
+**Triggers.** Crane records these triggers itself:
+
+- the first critical (else first) violation that fast effect verification
+  finds after a tool call;
+- `budget_exhausted`;
+- `contract_drift`, once per session;
+- `self_escalation`, when an agent runs `crane autonomy
+  promote|demote|approve` or `crane agent session resume|extend`.
+
+Unmet targets (`target_unchanged`, `change_type_mismatch`) are work still to
+do, and setup errors are not behaviour, so neither moves safety.
+
+**Recovery evidence** comes only from its own source. Evidence counts only if
+it was recorded after the latest violation, and it is discarded once safety is
+active again.
+
+| Condition | Recorded when | By |
+| --- | --- | --- |
+| `verified_repair` | a full validation (`agent session verify --level full`, stop, finalize) finds no behaviour violation | Crane |
+| `human_approval` | `crane agent session resume`, `crane autonomy approve`, or a human `agent session start` | human |
+| `new_risk_budget` | `crane agent session extend` | human |
+| `new_session` | a new session inherits the quarantine of the same agent's latest session on the same task | Crane |
+
+**Who can trigger what.** An agent can trigger nothing. Every attempt is
+journaled as `autonomy_rejected` and becomes a critical `self_escalation`
+violation.
+
+**Configuration.** Configuration lives in `.crane/autonomy.json`, and every
+setting is optional. The policy is bound to each session when it starts (it is
+covered by the binding digest), so replaying a journal always gives the same
+states. An invalid policy fails closed: no session starts under it.
+
+```json
+{
+  "max_autonomy": "autonomous",
+  "single_step_promotion": true,
+  "violations_to_quarantine": 3,
+  "critical_violations": ["unauthorized_effect", "budget_exhausted", "self_escalation"],
+  "recovery": {
+    "degraded": {"to": "active", "any_of": [["verified_repair"], ["human_approval"]]},
+    "quarantined": {"to": "active", "any_of": [
+      ["human_approval", "verified_repair"],
+      ["human_approval", "new_risk_budget"],
+      ["human_approval", "new_session"]
+    ]}
+  },
+  "grants": [
+    {"zone": "authentication", "autonomy": "delegated", "task": "SEC-9",
+     "approved_by": "security-lead", "reason": "token rotation"}
+  ]
+}
+```
+
+The policy is validated when it is loaded:
+
+- Every recovery set must be non-empty.
+- Every quarantine set must include `human_approval` or `new_risk_budget`.
+- `violations_to_quarantine` is 0 (never) or at least 2.
+- `self_escalation` is always critical.
+- A session's requested autonomy is capped at `max_autonomy`.
+
+**Precedence.** An earlier check is never relaxed by a later one:
+
+1. Crane metadata.
+2. The contract.
+3. Zones, meaning criticality and zone safety.
+4. Session safety.
+5. Session autonomy.
+6. Task scope and budget.
+
+A Restricted zone caps every mode at `observe`. Only an organizational grant
+in `.crane/autonomy.json` opens it, and the grant can be limited to a task.
+When it does, the zone allows the grant's level, still capped by the zone's
+safety state. A preserved item inside the zone stays protected.
+
+**Journal.** Every accepted trigger that changes the state is an `autonomy`
+event with:
+
+- the trigger and actor;
+- the `changes` (dimension, from, to);
+- the resulting state and the policy version.
+
+`crane autonomy history` lists these events with the initial state and the
+rejected attempts. `crane autonomy status` shows:
+
+- both dimensions and the effective level;
+- the incident's violations and evidence;
+- what recovery is still missing;
+- the next legal promotion;
+- the grants in force;
+- the precedence.
+
+## Autonomy budget
+
+The autonomy budget measures risk-bearing autonomous authority. It is not
+tokens, CPU, memory, or billing. Each session's budget is replayed from its
+own journal under the risk-cost model bound to it when it starts, so budgets
+are deterministic and never shared between sessions.
+
+| Quantity | Meaning |
+| --- | --- |
+| `budget_max` | ceiling for the session's current autonomy (`max.<mode>`); a human promotion grants the difference, a demotion lowers it |
+| `budget_current` | points left, including unexpired refills |
+| `budget_reserved` | points held for actions authorized but not yet run |
+| `budget_consumed` | points spent by executed actions |
+| `budget_events` | every reservation, consumption, release, penalty, regeneration, refill, and refill request (`crane autonomy budget ID --json`) |
+
+**Cost model** (`.crane/budget.json`, every setting optional). Multipliers
+are percentages (100 = 1.0).
+
+```json
+{
+  "max": {"observe": 0, "assisted": 50, "delegated": 100, "autonomous": 200},
+  "operation": {"read": 0, "write": 2, "delete": 4, "execute": 3, "other": 3},
+  "criticality": {"routine": 100, "sensitive": 150, "critical": 300, "restricted": 600},
+  "environment": {"isolated": 50, "workspace": 100, "production": 500},
+  "scope": {"task": 100, "repository": 125, "shared": 250},
+  "reversibility": {"reversible": 100, "irreversible": 300},
+  "sensitivity": {"none": 100, "contract": 150},
+  "privilege_escalation": 60,
+  "patterns": {
+    "production_paths": ["**/prod/**", "**/production/**", "deploy/**", "**/*.prod.*"],
+    "production_commands": ["kubectl ", "terraform apply", "helm upgrade", "--env=prod", "--context prod"],
+    "shared_paths": ["lib/**", "libs/**", "shared/**", "common/**", "packages/**"],
+    "irreversible_commands": ["rm -rf", "git push", "git reset --hard", "git clean", "drop table", "truncate table"],
+    "privileged_paths": [".github/workflows/**", "CODEOWNERS", ".github/CODEOWNERS", "**/sudoers*"],
+    "privileged_commands": ["sudo ", "chmod +s", "chown root", "setcap ", "gh secret", "git config --global"]
+  },
+  "regeneration": {"contract_completed": 20, "contract_tests_passed": 10, "task_milestone": 10, "human_review": 15, "merge": 20},
+  "compliance": {"every": 10, "amount": 2, "cap": 20},
+  "penalties": {"violation": 10, "critical": "zero"},
+  "max_refill_expiry_seconds": 604800
+}
+```
+
+**Pricing.** The price is the operation's base cost times the multipliers for
+criticality, environment, scope, reversibility, and sensitivity, rounded up.
+Privilege escalation adds a flat amount, and reads are free. For an action
+that writes several files, the worst file sets each factor:
+- **Criticality** is the zone's.
+- **Scope** is `task` only when every file is in the task scope.
+- **Sensitivity** is `contract` when a contract clause covers the change.
+- **Environment** is `isolated` in a session worktree, unless a production
+  pattern matches.
+
+**Life cycle:**
+- **Reservation.** An action the runtime allows outright reserves its price on
+  the `pre_tool_use` event (`budget_reserve`, with its factors).
+- **Consumption.** When the action runs, the `post_tool_use` event consumes the
+  reservation (`budget_consume`).
+- **Release.** Reservations of actions that never ran are released at the next
+  session start, prompt, or stop (`budget_released`).
+- **No charge for approvals.** An action that needs human approval costs
+  nothing; the human carries that risk.
+
+**Penalties** ride on the violation's `autonomy` event (`budget_penalty`). A
+violation costs `penalties.violation`. A critical violation sets the budget to
+zero, refills and reservations included, unless `penalties.critical` is a
+number. Running out of budget is not penalized again.
+
+**Regeneration** happens only through controlled events. Each event is
+credited once per session (or once per reference) and never above
+`budget_max`:
+
+| Event | Source |
+| --- | --- |
+| `contract_completed` | a full validation that passes (stop, `verify --level full`) |
+| `contract_tests_passed` | passing contract tests at finalization or `crane test-contract --session` |
+| `task_milestone` | `crane task advance` to `PR_READY` or `COMPLETED`, or `crane autonomy credit` |
+| `human_review`, `merge` | `crane task advance` to `MERGED`, or `crane autonomy credit` |
+| `sustained_compliance` | every `compliance.every` compliant actions in a row, at most `compliance.cap` per session |
+
+**Exhaustion.** When an action costs more than is available:
+- the action needs human approval;
+- the session records a `risk_budget_exhausted` violation once (safety
+  `degraded`, that is, supervised);
+- a `refill_requested` event asks for a human refill;
+- autonomy cannot be promoted.
+
+**Refill:**
+
+```bash
+crane autonomy refill SESSION_ID --amount N --reason TEXT --approver NAME --expires DURATION
+```
+
+The duration is in seconds, or a number with `s`, `m`, `h`, or `d`, up to
+`max_refill_expiry_seconds`. A refill behaves as follows:
+- The points never raise the budget above `budget_max`.
+- They are spent before the base budget, earliest expiry first.
+- Whatever is left of them expires at the expiry.
+- The refill counts as `new_risk_budget` recovery evidence. With the default
+  policy, that alone recovers a degraded session.
+- A refill writes only to the session journal. Policies, zones, the models,
+  and the session binding are untouched.
+
+**Human-only commands.** `crane autonomy refill` and `crane autonomy credit`
+are refused in an agent environment and are denied to agent shells. Either
+attempt quarantines the session.
+
 ## Failure semantics
 
 Crane never returns PASS when it cannot establish compliance:

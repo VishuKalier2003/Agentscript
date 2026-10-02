@@ -1294,7 +1294,10 @@ fn runtime_and_verification_share_one_binding() {
     assert_eq!(attestation["reconciliation"]["same_repository"], true);
     assert_eq!(attestation["reconciliation"]["fully_reconciled"], true);
     let journal = fixture.journal("claude-e1");
-    assert_eq!(journal.len(), 4);
+    assert_eq!(journal.len(), 5);
+    // The completed contract regenerates the risk budget the change consumed
+    assert_eq!(journal[3]["event"], "budget");
+    assert_eq!(journal[3]["source"], "contract_completed");
     for event in journal {
         assert_eq!(event["binding"], digest);
         assert_eq!(event["contract_version"], version);

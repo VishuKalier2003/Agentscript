@@ -799,8 +799,13 @@ fn agents_cannot_manage_sessions() {
         );
         assert_eq!(denied.status.code(), Some(2), "{command}");
     }
-    let read = repository.hook("claude", "pre-tool-use", "g1", json!({"tool_name": "Bash", "tool_input": {"command": "crane agent session show claude-g1"}}), &[]);
-    assert!(read.status.success());
+    // Trying to resume or extend its own session is self-escalation: the session is quarantined
+    assert_eq!(
+        repository.show("claude-g1")["activity"]["safety_state"],
+        "quarantined"
+    );
+    let read = repository.hook("codex", "pre-tool-use", "g2", json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "crane agent session show claude-g1"}}), &[]);
+    assert!(read.status.success(), "{}", text(&read.stderr));
 }
 
 /** A session started by the manager (for an orchestrator) gets the same binding and context, and

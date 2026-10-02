@@ -356,6 +356,7 @@ pub(crate) struct Runtime<'a> {
     pub(crate) usage: Usage,
     pub(crate) safety: SafetyState,
     pub(crate) safety_reason: Option<String>,
+    pub(crate) autonomy: Autonomy,
 }
 
 impl Runtime<'_> {
@@ -466,7 +467,7 @@ impl Runtime<'_> {
     */
     fn govern(&self, paths: &[(String, bool)]) -> Option<(Decision, Vec<String>)> {
         let governance = self.governance?;
-        if governance.autonomy == Autonomy::Observe {
+        if self.autonomy == Autonomy::Observe {
             // Checked before the budget: an observing session has no budget to exhaust
             return Some((
                 Decision::Deny,
@@ -506,7 +507,7 @@ impl Runtime<'_> {
                 )],
             ));
         }
-        let mut level = governance.autonomy;
+        let mut level = self.autonomy;
         let mut reasons = Vec::new();
         if level == Autonomy::Assisted {
             reasons.push(
@@ -538,7 +539,7 @@ impl Runtime<'_> {
                 }
                 level = level.min(cap);
             }
-            if governance.autonomy == Autonomy::Delegated && !governance.in_scope(path, *exists) {
+            if self.autonomy == Autonomy::Delegated && !governance.in_scope(path, *exists) {
                 reasons.push(format!(
                     "{path}: outside the task scope ({}), so it needs human approval",
                     if governance.scope_modules.is_empty() {
@@ -743,7 +744,7 @@ impl Runtime<'_> {
      * Output
         - Option<String>, None if the path is outside the repository
     */
-    fn relative(&self, raw: &str) -> Option<String> {
+    pub(crate) fn relative(&self, raw: &str) -> Option<String> {
         let path = Path::new(raw);
         let absolute = if path.is_absolute() {
             path.to_path_buf()
@@ -1145,13 +1146,45 @@ pub(crate) fn references_protected_path(value: &str, extra: &[&str]) -> bool {
     })
 }
 
+/** Detect shell commands by which an agent would change its own autonomy, safety, or budget:
+ * crane autonomy promote/demote/approve/refill/credit, and crane agent session resume/extend
+ * (which supply recovery evidence); these are denied like any mutating crane command and also quarantine the session
+ * Input
+    - command: &str - shell command text
+ * Output
+    - bool
+*/
+pub(crate) fn changes_own_autonomy(command: &str) -> bool {
+    let tokens = command
+        .split(|character: char| character.is_whitespace() || "&|;()`\"'".contains(character))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens.iter().enumerate().any(|(index, token)| {
+        let program = token.replace('\\', "/").to_ascii_lowercase();
+        if !matches!(program.rsplit('/').next(), Some("crane" | "crane.exe")) {
+            return false;
+        }
+        let at = |offset: usize| tokens.get(index + offset).copied().unwrap_or_default();
+        matches!(
+            (at(1), at(2), at(3)),
+            (
+                "autonomy",
+                "promote" | "demote" | "approve" | "refill" | "credit",
+                _
+            ) | ("agent", "session", "resume" | "extend")
+        )
+    })
+}
+
 /** Detect shell commands that change Crane metadata or authority through the CLI, by splitting
  * the command on whitespace and shell separators, finding tokens whose program name is crane or
  * crane.exe, and checking whether the next tokens are checkpoint, protect, target, init, agent
  * init/install/hook (a forged hook call could open or close a contract session), agent session
  * start/resume/cancel/finalize/sweep/quarantine/extend (session authority is a human's), or policy
  * approve/reject/edit/regenerate (an agent must never review or activate a policy proposal), or
- * task ingest/sync/advance/serve (an agent must never drive its own task lifecycle)
+ * task ingest/sync/advance/serve (an agent must never drive its own task lifecycle), or autonomy
+ * promote/demote/approve/refill/credit (an agent must never change its own autonomy, safety, or
+ * budget)
  * Input
     - command: &str - shell command text
  * Output
@@ -1196,6 +1229,10 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
             Some("task") => matches!(
                 tokens.get(index + 2).copied(),
                 Some("ingest" | "sync" | "advance" | "serve")
+            ),
+            Some("autonomy") => matches!(
+                tokens.get(index + 2).copied(),
+                Some("promote" | "demote" | "approve" | "refill" | "credit")
             ),
             _ => false,
         }
