@@ -1136,6 +1136,61 @@ pub(crate) fn advance(id: &str, to: TaskState, reason: Option<String>) -> Result
     Ok(record.value)
 }
 
+/** Move a task along as its delivery progresses, without a separate human command: an opened pull
+ * request moves PR_READY to REVIEW; a verified merge moves the task to MERGED and then COMPLETED
+ * (stopping its sessions and retiring its contract); untracked tasks are left alone
+ * Input
+    - id: &str - task id
+    - merged: Option<&str> - the verified merge commit, None when a pull request was opened
+ * Output
+    - Result<Option<Value>, String> the task's tracker identity {source, external_id} when it was
+      completed (for the tracker completion message), None otherwise
+*/
+pub(crate) fn delivery_progress(id: &str, merged: Option<&str>) -> Result<Option<Value>, String> {
+    let _lock = Lock::acquire()?;
+    let Some(mut record) = TaskRecord::load(id)? else {
+        return Ok(None);
+    };
+    let cause = "crane deliver";
+    match merged {
+        None => {
+            if record.state() == TaskState::PrReady {
+                credit_milestone(id, TaskState::Review)?;
+                record.transition(TaskState::Review, cause, "a pull request was opened")?;
+                record.save()?;
+            }
+            Ok(None)
+        }
+        Some(sha) => {
+            for step in [TaskState::Review, TaskState::Merged] {
+                if record.state().allows(step) && record.state() != step {
+                    credit_milestone(id, step)?;
+                    record.transition(step, cause, &format!("merged as {sha}"))?;
+                }
+            }
+            if record.state() != TaskState::Merged {
+                record.save()?;
+                return Err(format!(
+                    "task {id} is {} and cannot be completed by a merge",
+                    record.state().name()
+                ));
+            }
+            credit_milestone(id, TaskState::Completed)?;
+            record.value["merge_sha"] = json!(sha);
+            finish(
+                &mut record,
+                TaskState::Completed,
+                cause,
+                &format!("merged as {sha} and verified"),
+            )?;
+            record.save()?;
+            Ok(Some(
+                json!({"source": record.value["source"], "external_id": record.value["external_id"]}),
+            ))
+        }
+    }
+}
+
 /** Regenerate the budget of a task's open sessions for a milestone a human reported: a pull
  * request ready or the task completed is a task milestone, a merge is a passed human review and a
  * merge; each is credited once per task and state

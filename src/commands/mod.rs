@@ -4,13 +4,16 @@ use std::path::Path;
 mod agent;
 mod autonomy;
 mod check;
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod context;
+mod dashboard;
+mod deliver;
 mod discover;
 mod init;
 mod parse;
 mod policy;
 mod protect;
+mod session;
 mod status;
 mod target;
 mod task;
@@ -61,6 +64,11 @@ pub(crate) fn run() -> Result<(), String> {
         "test-contract" => test_contract::run(&rest), // contract compliance, apart from ordinary tests
         "zones" => zones::run(&rest), // resolved repository zones, an input to authorization
         "autonomy" => autonomy::run(&rest), // autonomy and safety state machine of sessions
+        "session" => session::run(&rest), // evidence: inspect and export a session
+        "deliver" => deliver::run(&rest), // branch, checks, pull request, approvals, merge
+        "connect" => dashboard::connect_command(&rest), // connect the repository once
+        "dashboard" => dashboard::run(&rest), // the semantic control plane and its API
+        "packs" => dashboard::packs_command(&rest), // Payments and Testing policy packs
         "agent" => agent::run(&rest), // agent adapters, hooks, and contract sessions
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
     }
@@ -152,6 +160,17 @@ Commands:
   autonomy budget SESSION_ID [--json]
   autonomy refill SESSION_ID --amount N --reason TEXT --approver NAME --expires DURATION
   autonomy credit SESSION_ID --event task_milestone|human_review|merge --reference REF --approver NAME
+  session inspect SESSION_ID [--json] | session inspect --export FILE
+  session export SESSION_ID --json [--otlp]
+  deliver run|status SESSION_ID [--json]
+  deliver approve|reject|request-changes SESSION_ID --approver NAME [--reason TEXT]
+  deliver exception SESSION_ID --check NAME --approver NAME --reason TEXT [--expires DURATION]
+  deliver merge SESSION_ID [--by NAME]
+  deliver slack-action --body FILE --timestamp T --signature S
+  connect [--refresh] [--json]
+  dashboard [serve] [--addr HOST:PORT] [--once]
+  dashboard api GET|POST PATH [--body JSON]
+  packs [list] | packs show payments|testing [--json] | packs propose payments [--name NAME]
   zones [ZONE_ID] [--json]
   task plan TASK_ID|TASK_FILE [--json] [--checkpoint NAME] [--propose]
   task ingest --source jira|asana [--delivery ID] [EVENT_FILE...] [--json]
@@ -195,6 +214,27 @@ points from the risk-cost model in .crane/budget.json (operation, criticality, e
 reversibility, policy sensitivity, privilege escalation); violations cost points and critical ones
 zero it; controlled events regenerate it up to its maximum. When it runs out, actions need human
 approval and a refill is requested; refill adds temporary points with an approver and an expiry.
+session inspect shows a session's evidence: the hash-chained journal projected into one record
+per meaningful event (organization, team, agent, task, contract, checkpoint, autonomy, safety,
+budget before and after, tool, operation, resources, decision, violations, repair, tests, human
+intervention; never raw tool arguments) and the deterministic attestation derived from it.
+session export --json prints all of it; --otlp prints it as OpenTelemetry OTLP/JSON spans;
+inspect --export FILE re-derives everything from an export alone and checks it.
+deliver run takes a reconciled session (finalizing it if needed) to a pull request: it commits
+the changes on a branch, runs the final contract tests, the repository tests, and the checks in
+.crane/delivery.json there, opens or updates the pull request with the contract and attestation,
+and notifies Slack. Merging follows the merge policy (approvals per session autonomy and zone
+criticality; autonomous routine changes may merge automatically); approvals come from the CLI or
+signed Slack actions and never change a policy; exceptions are scoped to one check, commit, and
+session, and expire. After a verified merge, Crane records the merge commit as a trusted
+checkpoint, completes the task, queues the Jira or Asana completion, and re-finalizes the
+attestation.
+connect records the repository once (identity, remote, default branch, languages); dashboard
+serves the semantic control plane (Repository, Zones, Contracts, Agent Sessions, Policy
+Simulator, Attestations) on a local address, and dashboard api answers the same API from the
+command line. Policies made in the dashboard's visual or Advanced (AgentScript) editor become
+pending proposals; the simulator replays session history in shadow mode. packs show runs the
+Payments or Testing pack, which only recommends; packs propose payments makes a pending proposal.
 discover inventories the repository (languages, services, modules, symbols, calls, tests,
 owners, contracts, checkpoints) and suggests critical code to protect; it is advisory and
 enforces nothing. --json prints the full inventory; --full ignores the incremental cache.

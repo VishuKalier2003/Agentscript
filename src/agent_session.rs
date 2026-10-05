@@ -62,6 +62,8 @@ pub(crate) struct FileConstraint {
       sessions created before the autonomy state machine, which use the default policy)
     - budget_model: Option<BudgetModel> - the risk-cost model bound at creation (None for sessions
       created before the autonomy budget, which use the default model)
+    - organization: Option<Value> - {organization, team} the session belongs to (None for sessions
+      created before evidence records)
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Governance {
@@ -77,6 +79,7 @@ pub(crate) struct Governance {
     pub(crate) scope_modules: Vec<String>,
     pub(crate) autonomy_policy: Option<AutonomyPolicy>,
     pub(crate) budget_model: Option<BudgetModel>,
+    pub(crate) organization: Option<Value>,
 }
 
 impl Governance {
@@ -116,6 +119,7 @@ impl Governance {
             scope_modules: Vec::new(),
             autonomy_policy: None,
             budget_model: None,
+            organization: None,
         }
     }
 
@@ -209,6 +213,9 @@ impl Governance {
         if let Some(model) = &self.budget_model {
             value["budget_model"] = model.to_json();
         }
+        if let Some(organization) = &self.organization {
+            value["organization"] = organization.clone();
+        }
         value
     }
 
@@ -275,6 +282,7 @@ impl Governance {
                 Some(model) => Some(BudgetModel::from_json(model)?),
                 None => None,
             },
+            organization: value.get("organization").cloned(),
         })
     }
 }
@@ -364,6 +372,7 @@ impl SessionOptions {
             idle_timeout: self.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT),
             autonomy_policy: Some(policy.clone()),
             budget_model: Some(crate::budget::manage::load_model()?),
+            organization: Some(crate::evidence::load_organization()?),
             ..Governance::plain()
         };
         let zoned = fs::read_dir(root()?.join("zones"))
@@ -787,6 +796,7 @@ pub(crate) fn authorize(
     if let Some(reserve) = reserve {
         entry["budget_reserve"] = reserve;
     }
+    entry["summary"] = summary(action);
     session.record(entry)?;
     if action.command.as_deref().is_some_and(changes_own_autonomy) {
         // The command was denied above; trying it at all is a critical violation
@@ -865,6 +875,28 @@ pub(crate) fn after_effect(session: &ContractSession, report: &Report) -> Result
         )?;
     }
     Ok(kind.is_none())
+}
+
+/** Summarize an action for the journal without its raw arguments: the programs a shell command
+ * runs and its argument count, or how many files a write touches and how
+ * Input
+    - action: &AgentAction - action
+ * Output
+    - Value
+*/
+pub(crate) fn summary(action: &AgentAction) -> Value {
+    match &action.command {
+        Some(command) => crate::evidence::summarize_command(command),
+        None => json!({
+            "files": action.files.len(),
+            "changes": action.files.iter().map(|change| match change.proposed {
+                crate::authority::Proposed::Content(_) => "write",
+                crate::authority::Proposed::Edits(_) => "edit",
+                crate::authority::Proposed::Delete => "delete",
+                crate::authority::Proposed::Unknown => "unknown",
+            }).collect::<Vec<_>>(),
+        }),
+    }
 }
 
 /** Load a stored session for a management command
@@ -1005,10 +1037,52 @@ pub(crate) fn finalize(id: &str) -> Result<Value, String> {
     }
     attestation["budget"] = crate::budget::manage::state(&session).to_json();
     session.write_attestation(&attestation)?;
-    session.record(
-        json!({"event": "session_finalized", "final_status": attestation["final_status"]}),
-    )?;
+    let findings = attestation["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            attestation["preserve_results"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            attestation["target_results"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .filter(|result| result["status"] != "pass")
+        .filter_map(|result| result["violation_type"].as_str().map(String::from))
+        .collect::<Vec<_>>();
+    session.record(json!({
+        "event": "session_finalized",
+        "final_status": attestation["final_status"],
+        "findings": findings,
+        "contract_tests": {
+            "passed": attestation["contract_tests"]["passed"],
+            "failed": attestation["contract_tests"]["failed"],
+            "not_applicable": attestation["contract_tests"]["not_applicable"],
+            "failed_tests": failed.iter().map(|test| test.title.clone()).collect::<Vec<_>>(),
+        },
+        "ordinary_tests": attestation["tests"].as_array().into_iter().flatten().map(|test| json!({
+            "language": test["language"],
+            "status": test["status"],
+            "files": test["files"].as_array().map_or(0, Vec::len),
+        })).collect::<Vec<_>>(),
+    }))?;
     session.set_lifecycle(Lifecycle::Finalized)?;
+    // The final attestation is derived from the evidence alone, so it is deterministic
+    let last = crate::evidence::attest(&session.document(), &session.events())?;
+    if let Some(directory) = session.directory() {
+        fs::write(
+            directory.join("final_attestation.json"),
+            serde_json::to_string_pretty(&last).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    attestation["final_attestation"] = last;
     Ok(attestation)
 }
 

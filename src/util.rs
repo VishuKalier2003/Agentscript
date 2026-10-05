@@ -210,6 +210,20 @@ const SHA256_ROUND: [u32; 64] = [
     - String such as "sha256:e3b0c442..."
 */
 pub(crate) fn sha256(bytes: &[u8]) -> String {
+    let hex = sha256_bytes(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+/** Compute a raw SHA-256 digest (see sha256)
+ * Input
+    - bytes: &[u8] - data to digest
+ * Output
+    - [u8; 32]
+*/
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -263,9 +277,39 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
             *value = value.wrapping_add(added);
         }
     }
-    let hex = state
+    let mut digest = [0u8; 32];
+    for (chunk, word) in digest.chunks_mut(4).zip(state) {
+        chunk.copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+/** Compute an HMAC-SHA256 (RFC 2104), used to verify signed webhook requests
+ * Input
+    - key: &[u8] - secret key
+    - message: &[u8] - signed message
+ * Output
+    - String lowercase hex digest
+*/
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&sha256_bytes(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let inner = block
         .iter()
-        .map(|word| format!("{word:08x}"))
-        .collect::<String>();
-    format!("sha256:{hex}")
+        .map(|byte| byte ^ 0x36)
+        .chain(message.iter().copied())
+        .collect::<Vec<_>>();
+    let outer = block
+        .iter()
+        .map(|byte| byte ^ 0x5c)
+        .chain(sha256_bytes(&inner))
+        .collect::<Vec<_>>();
+    sha256_bytes(&outer)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

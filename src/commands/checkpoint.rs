@@ -15,17 +15,50 @@ use crate::util::{io_error, now_unix, option, validate_identifier};
 */
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     // Record an explicit Git commit as the trusted baseline for future checks
-    ensure_repo()?;
-    let root = root()?;
     let name = option(args, "--name").unwrap_or_else(|| "baseline".into());
-    validate_identifier(&name)?;
+    let checkpoint = create(&name)?;
+    println!(
+        "Created checkpoint '{}' at {}",
+        checkpoint.name, checkpoint.commit
+    );
+    println!("Branch metadata: {}", checkpoint.branch);
+    Ok(())
+}
+
+/** Record the current Git HEAD as a trusted checkpoint, by validating the name, reading HEAD and
+ * the current branch from Git, and writing the checkpoint JSON to .crane/checkpoints/NAME.json
+ * Input
+    - name: &str - checkpoint name
+ * Output
+    - Result<Checkpoint, String>
+    - Error if not initialized, the name is invalid, HEAD is unavailable, or the file cannot be written
+*/
+pub(crate) fn create(name: &str) -> Result<Checkpoint, String> {
+    ensure_repo()?;
     let commit = git(&["rev-parse", "HEAD"])?;
     let branch = git(&["branch", "--show-current"]).unwrap_or_else(|_| "DETACHED".into());
     if commit.is_empty() {
         return Err("Git HEAD is unavailable; commit the repository first".into());
     }
+    create_at(name, &commit, &branch)
+}
+
+/** Record a given commit as a trusted checkpoint (a verified merge commit, for example)
+ * Input
+    - name: &str - checkpoint name
+    - commit: &str - full commit SHA
+    - branch: &str - branch metadata
+ * Output
+    - Result<Checkpoint, String>
+    - Error if the name is invalid, the commit does not exist, or the file cannot be written
+*/
+pub(crate) fn create_at(name: &str, commit: &str, branch: &str) -> Result<Checkpoint, String> {
+    let root = root()?;
+    validate_identifier(name)?;
+    let commit = git(&["rev-parse", "--verify", &format!("{commit}^{{commit}}")])?;
+    let branch = branch.to_string();
     let checkpoint = Checkpoint {
-        name: name.clone(),
+        name: name.to_string(),
         commit,
         branch,
         created_at_unix: now_unix(),
@@ -35,10 +68,5 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         checkpoint_json(&checkpoint),
     )
     .map_err(io_error)?;
-    println!(
-        "Created checkpoint '{}' at {}",
-        checkpoint.name, checkpoint.commit
-    );
-    println!("Branch metadata: {}", checkpoint.branch);
-    Ok(())
+    Ok(checkpoint)
 }

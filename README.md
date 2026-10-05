@@ -635,6 +635,130 @@ crane autonomy refill SESSION_ID --amount 20 --reason "reviewed plan" --approver
 crane autonomy credit SESSION_ID --event human_review --reference PR-42 --approver reviewer
 ```
 
+## Evidence and attestation
+
+Every session keeps an append-only, hash-chained journal. Crane projects it
+into one **evidence record** per meaningful event. Each record carries:
+
+- the organization, team, agent, session, and task;
+- the contract version and checkpoint;
+- the autonomy mode and safety state;
+- the budget before and after;
+- the tool, operation, and resources;
+- the policy decision;
+- violations, repairs, test results, and human interventions.
+
+Raw tool arguments are never stored. Actions are kept as a digest plus a
+normalized summary, such as the programs a shell command runs and its argument
+count.
+
+When a session is finalized, Crane derives a **deterministic attestation**
+from that evidence and writes it to `final_attestation.json`. It records:
+
+- the task, contract, checkpoints, agent, and policy versions;
+- an action summary;
+- denied actions, approvals, violations, and repairs;
+- human interventions;
+- contract and ordinary tests;
+- the final state and final decision;
+- a digest over all of the above.
+
+```bash
+crane session inspect SESSION_ID            # timeline and attestation
+crane session export SESSION_ID --json      # binding, journal, evidence, attestation
+crane session export SESSION_ID --otlp      # OpenTelemetry OTLP/JSON spans
+crane session inspect --export FILE         # re-derive and check an export on its own
+```
+
+The organization and team come from `.crane/organization.json`
+(`{"organization": "acme", "team": "payments"}`). Without that file, the
+organization is the owner of the `origin` remote.
+
+## Delivery: pull requests, CI checks, Slack, and merge
+
+`crane deliver run SESSION_ID` takes a reconciled session (finalizing it if
+needed) through to a pull request:
+
+1. It commits the session's changes on a delivery branch.
+2. On that branch it runs the final contract tests, the repository tests, and
+   the lint and security checks configured in `.crane/delivery.json`.
+3. It opens or updates the pull request with the contract summary and the
+   attestation.
+4. It notifies the configured Slack channels and people.
+
+**Merge policy.** Merging follows the policy for the session's final
+autonomy and the zone criticality of the changed files:
+- Under the defaults, an autonomous session that changed only routine code
+  merges automatically once every check passes.
+- Critical and restricted changes need two approvals.
+- Everything else needs one approval.
+
+**Slack.** The message's buttons are View PR, View contract, Approve, Reject,
+and Request changes, plus Approve exception where the configuration allows
+one. Clicks are verified with Slack's signing secret and count only for mapped
+approvers and the current commit.
+
+**Exceptions.** An exception covers one allowed failing check of one commit
+and session, expires, and is recorded in both journals. Contract tests can
+never be excepted. Approvals and exceptions never change a policy.
+
+**After the merge.** Once the merge is verified, Crane:
+- records the merge commit;
+- makes it the trusted checkpoint `trusted_<session>`;
+- completes the task;
+- only then queues the Jira or Asana completion;
+- re-finalizes the attestation.
+
+```bash
+crane deliver run SESSION_ID
+crane deliver status SESSION_ID
+crane deliver approve|reject|request-changes SESSION_ID --approver NAME [--reason TEXT]
+crane deliver exception SESSION_ID --check lint --approver NAME --reason TEXT --expires 4h
+crane deliver merge SESSION_ID
+crane task serve   # also accepts Slack button clicks on POST /slack/actions
+```
+
+## Semantic control plane
+
+Connect the repository once, then open the control plane:
+
+```bash
+crane connect          # records identity, remote, default branch, languages
+crane dashboard        # prints http://127.0.0.1:8790/?token=...
+```
+
+The control plane is not a generic admin console; every screen comes from the
+repository's own metadata and Crane's records:
+
+| Screen | What it shows |
+| --- | --- |
+| **Repository** | semantic inventory, critical regions, policy coverage, unresolved policy targets |
+| **Zones** | selectors, criticality, autonomy defaults, safety state, resolved resources |
+| **Contracts** | a visual policy editor with a live AgentScript preview, an Advanced AgentScript editor, version and approval history, and the policy packs |
+| **Agent Sessions** | agent behavior, autonomy, budget, actions, violations, tests, and final outcome |
+| **Policy Simulator** | shadow-mode evaluation of a draft or proposal against recorded session history, with false-positive analysis |
+| **Attestations** | each attestation with its full evidence trail |
+
+**Contracts.** A policy made in the dashboard is only a pending proposal.
+Activating it is the same human approval as `crane policy approve`.
+
+**API.** Everything the page shows comes from one API, which the command line
+can call directly: `crane dashboard api GET /api/zones`.
+
+**Policy packs.** There are two packs, and they only recommend:
+- **Payments** finds payment processing, refunds, transaction logic, and
+  payment state transitions, and suggests preserve rules and critical zones.
+  `crane packs propose payments` turns its suggestions into a pending
+  proposal.
+- **Testing** finds test directories, test frameworks, test ownership gaps,
+  and the `.crane/testing.json` commands that contract tests need.
+
+```bash
+crane packs show payments
+crane packs show testing
+crane packs propose payments
+```
+
 ## Installation
 
 Prebuilt binaries for Linux, macOS (Intel and Apple Silicon), and Windows are
@@ -860,6 +984,32 @@ This MVP intentionally keeps the implementation narrow:
   fragments. A shell command that writes production files without saying so
   is priced as an ordinary command. Its effect is still verified after it
   runs.
+- The journal's hash chain detects edits, insertions, removals, and reordering
+  of journal events. Anyone who can rewrite the whole journal can recompute
+  the chain, and attestations are not signed. Anchor exported attestation
+  digests elsewhere (CI artifacts, a ticket, a transparency log) when that
+  matters. OpenTelemetry output is produced as OTLP/JSON for a collector's
+  file receiver; Crane does not send it over the network.
+- **Outbound messages are queued, not sent.** Slack messages and Jira or
+  Asana completion calls are written to `.crane/runtime/delivery/outbox` for a
+  forwarder to send; Crane makes no outbound network calls. Slack clicks
+  reach Crane through `crane task serve` (or `crane deliver slack-action`).
+- **The local provider uses this repository.** It merges with `git merge
+  --no-ff` and needs the base branch checked out with no uncommitted tracked
+  changes. A session that is not isolated has its changes moved onto the
+  delivery branch, so the working tree returns to the base branch until the
+  merge.
+- **The `github` provider is untested.** It uses the GitHub CLI (`gh`) and
+  has not been run against GitHub here.
+- **The dashboard is local.** It serves one user on one address, behind a
+  token printed at start. It has no SSO, accounts, or multi-tenancy.
+- **Simulation has limits.** It replays what journals recorded: changed
+  symbols and files, never raw arguments. Flow scope is approximated by its
+  target, and false-positive classification is a heuristic based on how each
+  session ended.
+- **Packs are heuristics.** The Payments pack matches payment vocabulary in
+  names and their surroundings. The Testing pack reads test files to recognize
+  frameworks. Both only recommend.
 - Isolation uses Git worktrees, not containers: an agent process can still reach files outside
   its worktree, which effect verification of the worktree does not observe.
 - Sessions created by Crane 0.2.0 or earlier (session format 1) are rejected

@@ -405,6 +405,18 @@ impl ContractSession {
         &self.root
     }
 
+    /** Return the session's bound document (session.json): the binding and its digest
+     * Input
+        - None (uses self)
+     * Output
+        - Value
+    */
+    pub(crate) fn document(&self) -> Value {
+        let mut document = self.binding_json();
+        document["binding_digest"] = json!(self.binding);
+        document
+    }
+
     /** Return the session's runtime directory, None for a transient session
      * Input
         - None (uses self)
@@ -842,8 +854,9 @@ impl ContractSession {
     }
 
     /** Append an event to the session's journal, by stamping it with a sequence number, the time,
-     * and the session binding (session, agent, contract version, checkpoints, binding digest) and
-     * writing it as one JSON line; transient sessions keep no journal
+     * the session binding (session, agent, contract version, checkpoints, binding digest), and a
+     * hash chain link (the digest of the previous link and this event), and writing it as one JSON
+     * line; the chain makes the journal verifiably append-only; transient sessions keep no journal
      * Input
         - event: Value - JSON object with the event's own fields
      * Output
@@ -855,10 +868,14 @@ impl ContractSession {
             return Ok(());
         }
         let path = directory(&self.id)?.join("journal.jsonl");
-        let sequence = fs::read_to_string(&path)
-            .map(|content| content.lines().count())
-            .unwrap_or(0)
-            + 1;
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let sequence = content.lines().count() + 1;
+        let previous = content
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .and_then(|last| last["chain"].as_str().map(String::from))
+            .unwrap_or_else(|| crate::evidence::GENESIS.to_string());
         event["seq"] = json!(sequence);
         event["at"] = json!(now_unix());
         event["session_id"] = json!(self.id);
@@ -866,6 +883,7 @@ impl ContractSession {
         event["contract_version"] = json!(self.contracts.version);
         event["checkpoints"] = json!(self.checkpoints());
         event["binding"] = json!(self.binding);
+        event["chain"] = json!(crate::evidence::link(&previous, &event));
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1207,7 +1225,7 @@ fn task_id(value: &str) -> Result<String, String> {
     - Result<(PathBuf, String), String> repository root and identity
     - Error if the current directory is not inside a Git repository
 */
-fn repository_identity() -> Result<(PathBuf, String), String> {
+pub(crate) fn repository_identity() -> Result<(PathBuf, String), String> {
     let root = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?);
     let identity = match git(&["rev-list", "--max-parents=0", "HEAD"]) {
         Ok(commits) if !commits.trim().is_empty() => {

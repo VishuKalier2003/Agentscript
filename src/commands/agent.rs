@@ -184,6 +184,7 @@ fn handle(
             let consumption = crate::budget::manage::consumption(session, &action);
             let mut entry = json!({
                 "event": "post_tool_use",
+                "summary": agent_session::summary(&action),
                 "tool": action.tool,
                 "operation": action.operation.name(),
                 "resources": action.files.iter().map(|change| format!("file:{}", change.path)).collect::<Vec<_>>(),
@@ -431,6 +432,7 @@ fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
             let id = id()?;
             let attestation = agent_session::finalize(&id)?;
             println!("Finalized contract session {id}: {}", attestation["final_status"].as_str().unwrap_or("unknown"));
+            println!("Final attestation: {}", attestation["final_attestation"]["attestation_digest"].as_str().unwrap_or("unavailable"));
             let tests = &attestation["contract_tests"];
             if !tests.is_null() {
                 println!("Contract tests (mandatory): {} passed, {} failed, {} not applicable", tests["passed"], tests["failed"], tests["not_applicable"]);

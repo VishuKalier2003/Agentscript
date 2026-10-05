@@ -1095,6 +1095,314 @@ The duration is in seconds, or a number with `s`, `m`, `h`, or `d`, up to
 are refused in an agent environment and are denied to agent shells. Either
 attempt quarantines the session.
 
+## Evidence and attestation
+
+**Journal.** `.crane/runtime/sessions/ID/journal.jsonl` is the authoritative,
+append-only record. Each event is stamped with:
+
+- its sequence number and time;
+- the session, agent, contract version, checkpoints, and binding digest;
+- a `chain` link: `sha256(previous link + "\n" + the event's canonical JSON)`,
+  starting from `genesis`.
+
+Verification checks that sequence numbers have no gaps, that time never runs
+backwards, and that every link chains. The result is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `verified` | the whole journal chains |
+| `legacy` | the journal was written before chaining |
+| `partial` | chaining started partway through |
+| `broken` | any edit, insertion, removal, or reordering |
+
+`crane session inspect` refuses a broken journal.
+
+**No raw arguments.** Tool calls are journaled as `arguments_digest` (SHA-256
+of the tool input) and a `summary`:
+
+- shell commands: the programs run and the argument count;
+- writes: the number of files and the kind of each change.
+
+Command text, file contents, and argument values are never stored.
+
+**Evidence records.** One record per journal event (`evidence_format` 1). Each
+record is replayed from the session's bound document and journal alone:
+
+| Field | Content |
+| --- | --- |
+| `organization`, `team` | from `.crane/organization.json` (or the `origin` remote's owner), bound at session start |
+| `agent`, `session`, `task` | session identity |
+| `contract`, `checkpoints` | contract version and `name@sha` checkpoints |
+| `autonomy`, `safety` | state after the event |
+| `budget` | `before` and `after`: current, available, reserved, max |
+| `tool`, `operation`, `resources`, `action_digest`, `action_summary` | the action, without raw arguments |
+| `decision`, `reasons` | the policy decision |
+| `violations` | violation kinds found |
+| `repair` | `compliance_restored` (a passing check after a failing one) or `verified_repair` |
+| `tests` | ordinary tests at stop; contract and ordinary tests at finalization |
+| `human` | a start, prompt, approved tool call, resume, promotion, demotion, approval, refill, credit, limit extension, cancellation, or rejected agent attempt |
+| `category`, `event`, `seq`, `at`, `chain` | classification and position |
+
+**Attestation.** The attestation is a pure function of the bound document and
+the journal. Object keys are sorted, so the same evidence always yields the
+same bytes and the same `attestation_digest`.
+
+At finalization, the `session_finalized` event records the final status, the
+findings, the contract test counts and failed tests, and the ordinary test
+results. The attestation is then written to `final_attestation.json`, and its
+digest is printed. It contains:
+
+- `task`, `organization`, `team`, `agent` (with the models reported);
+- `contract`, `checkpoints`, `policy_versions` (contract, autonomy policy,
+  budget model, zone set, binding digest);
+- `action_summary` (authorizations by decision, operation, and tool; executed
+  actions; files changed; budget consumed);
+- `denied_actions`;
+- `approvals` (each `approved_and_executed` or `not_executed`);
+- `violations`, `repairs`, `human_interventions`;
+- `contract_tests`, `ordinary_tests`;
+- `final_state` (lifecycle, autonomy, safety, budget);
+- `final_decision` (`PASS`, `FAIL`, `CANCELLED`, or `INCOMPLETE`, with
+  reasons);
+- `evidence` (event count and chain verification);
+- `attestation_digest`.
+
+**Commands:**
+
+| Command | Output |
+| --- | --- |
+| `crane session inspect ID [--json]` | identity, chain status, a timeline of evidence records, and the attestation |
+| `crane session export ID --json` | `{export_format, session (the bound document), lifecycle, journal, chain, evidence, attestation}` |
+| `crane session inspect --export FILE [--json]` | re-derives the evidence and attestation from the export's bound document and journal alone, and checks them against what it carries; non-zero exit when the chain is broken or anything differs |
+| `crane session export ID --otlp` | OpenTelemetry OTLP/JSON (see below) |
+
+The `--export` check proves that an export is sufficient to reconstruct the
+session even after its directory is gone.
+
+**OpenTelemetry.** The OTLP/JSON output has these properties:
+- There is one trace per session, with a root `crane.session` span.
+- There is one span per evidence record, named
+  `crane.<category>.<event>`, with `crane.*` attributes.
+- Denials and violations get error status.
+- It is derived from the evidence records, which stay authoritative, and is
+  meant for an OpenTelemetry collector's file receiver.
+
+## Delivery
+
+**Pipeline** (`crane deliver run SESSION_ID`, human or trusted process only):
+
+1. **Reconciliation.** The session is finalized if it is not already, which
+   runs the mandatory contract tests. Delivery requires the evidence
+   attestation's final decision to be `PASS`; otherwise nothing is delivered.
+2. **Branch.** An isolated session commits in its worktree on its own branch.
+   Otherwise the changes move from the base branch onto
+   `<branch_prefix><session>`, and only the files the session changed are
+   committed. The base branch is the configured `base_branch`, or else the
+   checked-out branch.
+3. **Checks on the branch:**
+   - the final contract tests (`contract_tests`, never exceptable);
+   - the repository tests (`repository_tests`, from `.crane/testing.json`);
+   - every configured check.
+
+   Output is kept only as a digest.
+4. **Pull request.** The pull request is opened or updated:
+   - the `local` provider writes `pull_request.md` and numbers pull requests
+     locally;
+   - the `github` provider pushes the branch and uses `gh`.
+
+   The body has the contract clauses, the contract tests, the checks, the
+   attestation digest and counts, and the merge rule.
+5. **Slack.** A Block Kit message goes to each `slack.notify` target via the
+   outbox.
+6. **Merge.** If the merge policy allows autonomous merge, the change merges
+   right away.
+
+The task moves from `PR_READY` to `REVIEW` when the pull request opens.
+
+**Merge policy** (`merge_policy` in `.crane/delivery.json`). The first rule
+that covers the change applies, otherwise the default. A rule covers a change
+by:
+- `autonomy`: the session's final autonomy modes;
+- `min_criticality` / `max_criticality`: the highest zone criticality of the
+  changed files; unzoned files count as routine.
+
+A rule sets `approvals` (distinct people), `approvers` (empty means any mapped
+person), and `auto_merge`. A rule that could merge critical or restricted
+changes without approval is rejected when the configuration loads.
+
+| Default rule | Covers | Needs |
+| --- | --- | --- |
+| `autonomous-routine` | autonomous sessions, routine changes | 0 approvals, merges automatically |
+| `critical` | critical and restricted changes | 2 approvals, merged by a human |
+| `default` | everything else | 1 approval, merged by a human |
+
+**Eligibility.** A delivery may merge only when all of these hold:
+- the attestation is `PASS` and the session ended `active`;
+- the contract tests passed;
+- every other check passed or has a valid exception;
+- the branch has not moved since the checks ran;
+- no rejection or change request exists for the current commit;
+- the approvals of the current commit are in.
+
+`crane deliver status` lists what is missing.
+
+**Slack** (`slack` settings):
+- `notify`: channels and people to notify.
+- `users`: maps Slack user ids to approver names.
+- `signing_secret_env`: names the environment variable holding the signing
+  secret.
+- `pr_url_template` and `contract_url_template`: link templates.
+
+Clicks arrive at `POST /slack/actions` (`crane task serve`) or through
+`crane deliver slack-action --body FILE --timestamp T --signature S`. Each
+request must carry a valid `X-Slack-Signature`, an HMAC-SHA256 of
+`v0:timestamp:body`, and be at most five minutes old. Each button carries the
+delivery and commit it is about, so clicks on an older commit are refused, and
+clicks by unmapped users are recorded and not counted.
+
+| Button | What happens |
+| --- | --- |
+| View PR, View contract | links; the click is recorded |
+| Approve, Reject, Request changes | the same rules as the CLI |
+| Approve exception | shown only for failing checks listed in `exceptions.allowed_checks` |
+
+**Exceptions** (`crane deliver exception`, or Slack). An exception is:
+- **scoped** to one failing check listed in `exceptions.allowed_checks`;
+- **resource-bound** to the current commit;
+- **session-bound** to the delivery's session;
+- **temporary**, lasting at most `exceptions.max_duration_seconds` (Slack uses
+  `default_duration_seconds`);
+- **approved** by an approver of the covering rule;
+- **auditable**, recorded in the delivery journal (with its scope) and the
+  session journal.
+
+Exceptions, approvals, and rejections never touch policies, zones, or the
+configuration.
+
+**After a verified merge.** With the local provider, the merge is
+`git merge --no-ff` of the branch into the base branch; with `github`, it is
+`gh pr merge`. Crane then:
+- checks that the merge commit contains the checked commit;
+- records the merge commit;
+- writes the trusted checkpoint `trusted_<session>` at the merge commit (the
+  new trusted repository state);
+- moves the task through `REVIEW` and `MERGED` to `COMPLETED`;
+- only then queues the tracker completion in the outbox: for Jira, a comment
+  and a transition (`trackers.jira.done_transition`); for Asana, a story and
+  `completed: true`;
+- records `delivery_merged` in the session journal and re-finalizes
+  `final_attestation.json`, whose `delivery` section names the merge, the
+  approvals, and the exceptions.
+
+**Delivery journal.** `.crane/runtime/delivery/SESSION/journal.jsonl` is
+append-only and hash-chained like session journals. It records:
+- `submitted`, `pull_request`, `notified`;
+- `approval`, `rejection`, `changes_requested`, `exception`;
+- `unauthorized_action`, `viewed`;
+- `merged`, `task_completed`, `attestation_finalized`, `blocked`.
+
+The delivery state is replayed from it.
+
+**Agents.** Every `crane deliver` command except `status` is denied to agent
+shells and refused in agent environments. An attempt to run, approve, except,
+or merge quarantines the session.
+
+## Control plane and policy packs
+
+**Connection.** `crane connect` (or `POST /api/connection`) writes
+`.crane/connection.json` once. It records:
+- the repository identity (a digest of the root commits);
+- the root, the `origin` remote, and the default branch;
+- the HEAD, languages, files, and symbols;
+- who connected and when.
+
+Connecting again returns the same connection; `--refresh` updates the metadata
+but keeps who connected and when. A connection made for another repository is
+refused, and agents cannot connect. Until the repository is connected, every
+screen answers `409`.
+
+**API.** `crane dashboard` serves the page on `127.0.0.1:8790` (`--addr` to
+change it) and `/api/*`. API calls need the `X-Crane-Token` printed at start
+(or set `CRANE_DASHBOARD_TOKEN`); the page itself carries no data.
+`crane dashboard api METHOD PATH [--body JSON]` runs the same route from the
+command line, which is how the dashboard and the CLI stay identical.
+
+| Endpoint | Screen |
+| --- | --- |
+| `GET /api/repository` | Repository: inventory summary and targets, critical candidates and critical/restricted zones, `policy_coverage` (as `crane discover --json` reports it), unresolved targets |
+| `GET /api/zones` | Zones: exactly `crane zones --json` |
+| `GET /api/contracts`, `GET /api/contracts/NAME` | Contracts: active policies (AgentScript and editor draft); proposals; per contract the `versions` (generated, regenerated, edited revisions with digests), `approvals` (approved, rejected, superseded, retired), and the Git history of the active file |
+| `POST /api/contracts/preview` | the AgentScript a draft generates, or every problem in it |
+| `POST /api/contracts/parse` | the draft for AgentScript (Advanced to visual) |
+| `POST /api/contracts` | `{draft}` or `{agentscript}`: a new pending proposal (`origin.editor` is `visual` or `advanced`) |
+| `POST /api/contracts/NAME/edit`, `/approve`, `/reject` | the proposal workflow; approval needs the approver and the digest confirmation |
+| `GET /api/sessions`, `GET /api/sessions/ID` | Agent Sessions: autonomy, safety, budget, actions, denials, violations, tests, outcome; the detail adds autonomy, budget, and evidence records |
+| `POST /api/simulate` | Policy Simulator: `{draft}`, `{agentscript}`, or `{proposal}` |
+| `GET /api/attestations`, `GET /api/attestations/ID` | Attestations: the stored final attestation, whether it matches the evidence, the chain, the evidence records, and the delivery journal |
+| `GET /api/packs`, `GET /api/packs/NAME`, `POST /api/packs/payments/propose` | policy packs |
+
+`POST` calls are refused in an agent environment and denied to agent shells.
+
+**Visual editor.** A draft is
+`{"name", "checkpoint", "rules": [{"rule", "kind", "target", "scope", "change_type"}]}`.
+It generates canonical AgentScript, one line per rule with block scope left
+implicit, which is validated by the same parser that compiles active policies.
+The Advanced editor edits AgentScript directly and converts back.
+
+**Simulator (shadow mode).** The simulator replays every session journal's
+mutating actions: the symbols and files from authorizations, and the effects
+of executions.
+
+For a preserve rule, each action that touches what the rule covers is judged:
+
+| Scope | What counts as touching |
+| --- | --- |
+| block, flow | the target symbol (flow is approximated by the target) |
+| file | the target or its file |
+| folder | the target or its folder |
+| all | anything |
+
+| Shadow decision | When |
+| --- | --- |
+| `would_deny` | an authorization the rule would have denied |
+| `would_flag` | an execution with no authorization, such as a shell command |
+| `already_denied` | the action was already denied; nothing changes |
+
+For a target rule, the simulator lists the sessions that never changed the
+target.
+
+Each rule reports how it resolves in today's repository. Each newly blocked
+action is classified:
+
+| Classification | When |
+| --- | --- |
+| `likely_true_positive` | the action caused a violation, or its session failed, was quarantined, or was rejected or sent back in review |
+| `likely_false_positive` | its session passed or merged |
+| `undetermined` | its session is still open |
+
+The analysis gives the counts and the false-positive rate. Nothing is
+enforced.
+
+**Policy packs.** Only two exist, and neither activates anything:
+
+- **`payments@1`** recommends `preserve` rules for non-test functions in
+  payment code, in four categories:
+  - `payment_processing`
+  - `refunds`
+  - `transaction_logic`
+  - `payment_state_transitions`
+
+  Whole types are recommended only for payment state. Symbols already covered
+  by a contract are marked `covered`. It also suggests a critical zone for
+  each payment module, and `proposed_policy` holds the uncovered rules.
+  `crane packs propose payments` makes them a pending proposal (origin
+  `{"kind": "pack"}`) to review and approve like any other.
+- **`testing@1`** reports test directories (with languages, frameworks, and
+  owners), test ownership gaps (with a CODEOWNERS suggestion), and contract-test
+  configuration per framework: `configured` or `new`, with the
+  `.crane/testing.json` entry. `suggested_testing_json` holds all of it;
+  nothing is written.
+
 ## Failure semantics
 
 Crane never returns PASS when it cannot establish compliance:

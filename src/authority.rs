@@ -1172,6 +1172,11 @@ pub(crate) fn changes_own_autonomy(command: &str) -> bool {
                 "promote" | "demote" | "approve" | "refill" | "credit",
                 _
             ) | ("agent", "session", "resume" | "extend")
+                | (
+                    "deliver",
+                    "run" | "approve" | "exception" | "merge" | "slack-action",
+                    _
+                )
         )
     })
 }
@@ -1234,6 +1239,16 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
                 tokens.get(index + 2).copied(),
                 Some("promote" | "demote" | "approve" | "refill" | "credit")
             ),
+            // Delivering, approving, excepting, and merging are a human's; status only reads
+            Some("deliver") => !matches!(tokens.get(index + 2).copied(), Some("status")),
+            // Connecting, serving the control plane, and changing contracts through its API
+            Some("connect") => true,
+            Some("dashboard") => match tokens.get(index + 2).copied() {
+                Some("api") => tokens
+                    .get(index + 3)
+                    .is_some_and(|method| method.eq_ignore_ascii_case("post")),
+                _ => true,
+            },
             _ => false,
         }
     })

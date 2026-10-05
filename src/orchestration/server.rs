@@ -14,7 +14,8 @@ const MAX_BODY: usize = 1_000_000;
 
 /** Serve webhook deliveries over HTTP, one request at a time: POST /webhooks/jira and
  * /webhooks/asana with the shared token in X-Crane-Token (from CRANE_WEBHOOK_TOKEN); Asana's
- * handshake (X-Hook-Secret) is echoed; every delivery goes through the same ingestion as replay
+ * handshake (X-Hook-Secret) is echoed; every delivery goes through the same ingestion as replay;
+ * POST /slack/actions takes Slack button clicks, verified by Slack's request signature
  * Input
     - address: &str - address to bind, 127.0.0.1:8787 by default
     - once: bool - stop after one request (for tests and manual checks)
@@ -137,11 +138,19 @@ fn respond(stream: &mut TcpStream, token: &str) -> Result<(u16, Value, String), 
     let source = match (method.as_str(), path.as_str()) {
         ("POST", "/webhooks/jira") => "jira",
         ("POST", "/webhooks/asana") => "asana",
-        _ => return Err((404, "use POST /webhooks/jira or /webhooks/asana".into())),
+        ("POST", "/slack/actions") => "slack",
+        _ => {
+            return Err((
+                404,
+                "use POST /webhooks/jira, /webhooks/asana, or /slack/actions".into(),
+            ))
+        }
     };
-    if !headers
-        .get("x-crane-token")
-        .is_some_and(|given| same_secret(given, token))
+    // Slack signs its requests itself; they are verified with the Slack signing secret instead
+    if source != "slack"
+        && !headers
+            .get("x-crane-token")
+            .is_some_and(|given| same_secret(given, token))
     {
         return Err((401, "missing or wrong X-Crane-Token".into()));
     }
@@ -161,6 +170,29 @@ fn respond(stream: &mut TcpStream, token: &str) -> Result<(u16, Value, String), 
     reader
         .read_exact(&mut body)
         .map_err(|error| (400, error.to_string()))?;
+    if source == "slack" {
+        let header = |name: &str| headers.get(name).cloned().unwrap_or_default();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        return match crate::delivery::slack_action(
+            &text,
+            &header("x-slack-request-timestamp"),
+            &header("x-slack-signature"),
+        ) {
+            Ok(status) => Ok((
+                200,
+                json!({"delivery": status["delivery_id"], "eligibility": status["eligibility"]}),
+                String::new(),
+            )),
+            Err(error)
+                if error.contains("signature")
+                    || error.contains("older than")
+                    || error.contains("not set") =>
+            {
+                Err((401, error))
+            }
+            Err(error) => Err((422, error)),
+        };
+    }
     if let Some(secret) = headers.get("x-hook-secret").filter(|_| source == "asana") {
         // Asana's handshake: echo the secret to confirm the webhook
         return Ok((
