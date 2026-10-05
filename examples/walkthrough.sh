@@ -150,21 +150,31 @@ fi
 if want 8; then
 step "8. Evidence: inspect, export, reconstruct, detect tampering"
 crane session inspect claude-s4 | head -20
-crane session export claude-s4 --json > "$PLAY/export.json"
-crane session inspect --export "$PLAY/export.json" | tail -2
-sed 's/"decision": "allow"/"decision": "deny"/' "$PLAY/export.json" > "$PLAY/forged.json"
-crane session inspect --export "$PLAY/forged.json" > "$PLAY/forged.txt"; echo "  -> exit $?"; sed -n 5p "$PLAY/forged.txt"
+crane session export claude-s4 --json > "$ROOT/.crane/runtime/export.json"
+crane session inspect --export "$ROOT/.crane/runtime/export.json" | tail -2
+sed 's/"decision": "allow"/"decision": "deny"/' "$ROOT/.crane/runtime/export.json" > "$ROOT/.crane/runtime/forged.json"
+crane session inspect --export "$ROOT/.crane/runtime/forged.json" > "$ROOT/.crane/runtime/forged.txt"; echo "  -> exit $?"; sed -n 5p "$ROOT/.crane/runtime/forged.txt"
 crane session export claude-s4 --otlp | head -c 200; echo
 fi
 
 if want 9; then
 step "9. Delivery: branch, checks, pull request, approvals, merge"
-git add .crane/zones .crane/policies .crane/testing.json && git commit -qm "crane configuration"
+printf '{"slack": {"notify": ["#payments-delivery"]}}' > .crane/delivery.json
+git add .crane/zones .crane/policies .crane/testing.json .crane/delivery.json && git commit -qm "crane configuration"
+echo "--- 9a: autonomous session, routine change: merges by itself once every check passes"
 crane deliver run claude-s4
-crane deliver approve claude-s4 --approver lead --reason "looks good" | tail -2
-crane deliver merge claude-s4 | head -4
-git log --oneline -3
 cat .crane/checkpoints/trusted_claude_s4.json
+echo "--- 9b: delegated session: waits for one human approval"
+crane agent session start --profile claude --session s5 --autonomy delegated > /dev/null
+hook pre-tool-use s5 "$(write_payload docs/notes.md 'reviewed notes')" > /dev/null
+echo "reviewed notes" > docs/notes.md
+hook post-tool-use s5 "$(write_payload docs/notes.md 'reviewed notes')" > /dev/null
+crane agent session finalize claude-s5 > /dev/null
+crane deliver run claude-s5 | tail -4
+crane deliver merge claude-s5; echo "  -> exit $? (no approval yet)"
+crane deliver approve claude-s5 --approver lead --reason "looks good" | tail -3
+crane deliver merge claude-s5 --by release-manager | sed -n 7p
+git log --oneline -5
 ls .crane/runtime/delivery/outbox
 fi
 
