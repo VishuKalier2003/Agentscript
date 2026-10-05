@@ -16,9 +16,12 @@ CRANE="${CRANE:-$HERE/target/debug/crane}"
 ONLY="${1:-all}"
 PLAY="$(mktemp -d)"
 unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CRANE_AGENT
+# Git Bash on Windows rewrites arguments such as /api/zones into C:/Program Files/Git/api/zones
+export MSYS_NO_PATHCONV=1
 cd "$PLAY"
 ROOT="$(pwd -W 2>/dev/null || pwd)"   # a native path on Windows, so hook payloads resolve
-PY="$(command -v python3 || command -v python)"
+# A bare program name: Crane runs it with the native process API, which cannot run /c/... paths
+PY=python; python3 -c "print(1)" >/dev/null 2>&1 && PY=python3
 
 crane() { "$CRANE" "$@"; }
 step() { echo; echo "=== $* ==="; }
@@ -49,6 +52,7 @@ printf '%s' "$ORIGINAL" > $SERVICE
 printf 'import sys, os\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))\nfrom pay.service import PaymentService\n\ndef test_charge():\n    assert PaymentService().charge(100) == 110\n\nif __name__ == "__main__":\n    test_charge()\n' > tests/test_service.py
 echo "notes" > docs/notes.md
 git init -q -b main && git config user.email lead@example.com && git config user.name Lead && git config core.autocrlf false
+git remote add origin https://github.com/acme/shop.git
 git add . && git commit -qm baseline
 crane init && crane checkpoint --name baseline && crane connect
 printf '{"commands": {"python": ["%s", "-c", "import runpy, sys\\nfor path in sys.argv[1:]:\\n    runpy.run_path(path, run_name=\\"__main__\\")\\n", "{files}"]}}' "$PY" > .crane/testing.json
@@ -107,7 +111,9 @@ if want 5; then
 step "5. Autonomy: human promotion, agent self-escalation, recovery"
 crane agent session start --profile claude --session s2 --autonomy assisted > /dev/null
 crane autonomy promote claude-s2 --to delegated --reason "good record"
-crane autonomy promote claude-s2 --to autonomous; echo "  -> exit $? (only one step at a time... from delegated it is allowed)"
+crane autonomy promote claude-s2 --to autonomous --reason "second step"
+crane agent session start --profile claude --session s2b --autonomy observe > /dev/null
+crane autonomy promote claude-s2b --to delegated; echo "  -> exit $? (skipping a step is refused)"
 CLAUDECODE=1 crane autonomy promote claude-s2 --to autonomous; echo "  -> exit $? (agent tried it)"
 crane autonomy status claude-s2 | sed -n 1,10p
 crane agent session resume claude-s2
@@ -147,7 +153,7 @@ crane session inspect claude-s4 | head -20
 crane session export claude-s4 --json > "$PLAY/export.json"
 crane session inspect --export "$PLAY/export.json" | tail -2
 sed 's/"decision": "allow"/"decision": "deny"/' "$PLAY/export.json" > "$PLAY/forged.json"
-crane session inspect --export "$PLAY/forged.json" | sed -n 5p; echo "  -> exit $?"
+crane session inspect --export "$PLAY/forged.json" > "$PLAY/forged.txt"; echo "  -> exit $?"; sed -n 5p "$PLAY/forged.txt"
 crane session export claude-s4 --otlp | head -c 200; echo
 fi
 
