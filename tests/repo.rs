@@ -60,13 +60,19 @@ impl Fixture {
         let fixture = Self::empty();
         fixture.write("pay/service.py", SERVICE);
         fixture.write("README.md", "# Shop\n");
+        // Each fixture is its own repository: identical content committed in the same second
+        // would give the same root commit, which is how Crane identifies a repository
+        let message = format!(
+            "baseline {}",
+            fixture.root.file_name().unwrap().to_string_lossy()
+        );
         for args in [
             vec!["init", "-q", "-b", "main"],
             vec!["config", "user.email", "lead@example.com"],
             vec!["config", "user.name", "Crane Repo Test"],
             vec!["config", "core.autocrlf", "false"],
             vec!["add", "."],
-            vec!["commit", "-qm", "baseline"],
+            vec!["commit", "-qm", message.as_str()],
         ] {
             fixture.git(&args);
         }

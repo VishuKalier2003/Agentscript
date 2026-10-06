@@ -74,7 +74,13 @@ impl Fixture {
         fixture.git(&["config", "user.email", "crane@example.com"]);
         fixture.git(&["config", "user.name", "Crane Runtime Test"]);
         fixture.git(&["add", "."]);
-        fixture.git(&["commit", "-qm", "baseline"]);
+        // Each fixture is its own repository: identical content committed in the same second
+        // would give the same root commit, which is how Crane identifies a repository
+        let message = format!(
+            "baseline {}",
+            fixture.root.file_name().unwrap().to_string_lossy()
+        );
+        fixture.git(&["commit", "-qm", &message]);
         assert!(fixture.crane(&["init"], "").status.success());
         assert!(fixture
             .crane(&["checkpoint", "--name", "baseline"], "")
