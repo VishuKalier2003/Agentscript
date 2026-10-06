@@ -525,3 +525,25 @@ fn test_paths_owners_and_words() {
         ["payment", "service", "charge", "customer", "now", "settle", "ledger"]
     );
 }
+
+/** Caches that running code generates are never files anyone changed: an agent's session must not
+ * be blamed for the bytecode its own tests (or Crane's) leave behind */
+#[test]
+fn generated_caches_are_not_repository_files() {
+    use super::index::excluded;
+    for path in [
+        "services/payments/pay/__pycache__/service.cpython-312.pyc",
+        "pay/service.pyc",
+        ".pytest_cache/v/cache/lastfailed",
+        "web/node_modules/left-pad/index.js",
+    ] {
+        assert!(excluded(path), "{path}");
+    }
+    for path in [
+        "services/payments/pay/service.py",
+        "docs/pycache.md",
+        "src/cache.rs",
+    ] {
+        assert!(!excluded(path), "{path}");
+    }
+}

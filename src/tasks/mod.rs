@@ -15,8 +15,9 @@ use serde_json::{json, Value};
 use crate::inventory::graph::Graph;
 use crate::inventory::Inventory;
 use crate::ir::checkpoint_commit;
+use crate::model::ItemKind;
 use crate::policy::parse;
-use crate::repository::{git, load_checkpoint, root};
+use crate::repository::{load_checkpoint, root};
 use crate::resolver::matches_target;
 use crate::session::{read_attestation, session_ids, ContractSession};
 use crate::util::{io_error, sha256};
@@ -77,6 +78,10 @@ const BROAD: &[&str] = &[
     "as needed",
     "whatever is necessary",
 ];
+
+/** Fewer source files than this never make a scope repository-wide (small repositories are all
+ * in scope of nearly any task) */
+const BROAD_SCOPE_MIN_FILES: usize = 10;
 
 /** Words that start a new clause, so a negation only applies to its own clause */
 const CLAUSE_WORDS: &[&str] = &[
@@ -218,7 +223,7 @@ impl TaskInput {
  * Output
     - bool
 */
-fn valid_task_id(id: &str) -> bool {
+pub(crate) fn valid_task_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
@@ -448,9 +453,11 @@ fn repository_names(inventory: &Inventory) -> BTreeSet<String> {
     if let Some(name) = inventory.root.file_name().and_then(|name| name.to_str()) {
         names.insert(name.to_ascii_lowercase());
     }
-    if let Ok(url) = git(&["config", "--get", "remote.origin.url"]) {
-        if let Some(name) = url.trim_end_matches('/').rsplit(['/', ':']).next() {
-            names.insert(name.trim_end_matches(".git").to_ascii_lowercase());
+    // The connected repository (or the origin remote) also answers to its name and owner/name
+    if let (owner, Some(name)) = crate::repo::owner_and_name() {
+        names.insert(name.to_ascii_lowercase());
+        if let Some(owner) = owner {
+            names.insert(format!("{owner}/{name}").to_ascii_lowercase());
         }
     }
     names
@@ -561,8 +568,12 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
     let inventory = &zones.inventory;
     let graph = &inventory.graph;
     let mut clarifications: Vec<Value> = Vec::new();
+    // Missing acceptance criteria are advisory (a regression test is expected instead); every
+    // other clarification blocks the contract
     let mut clarify = |field: &str, message: String| {
-        clarifications.push(json!({"field": field, "message": message}))
+        clarifications.push(
+            json!({"field": field, "message": message, "blocking": field != "acceptance_criteria"}),
+        )
     };
 
     // Specification
@@ -587,7 +598,7 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
     if task.acceptance_criteria.is_empty() {
         clarify(
             "acceptance_criteria",
-            "acceptance_criteria is empty: list the observable conditions that make the task done"
+            "acceptance_criteria is empty: list the observable conditions that make the task done (until then the contract expects a regression test)"
                 .into(),
         );
     }
@@ -627,6 +638,7 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
     // References
     let mut must_change: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut must_not: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut named_types: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     let mut scope_modules: BTreeSet<usize> = BTreeSet::new();
     let mut scope_files: BTreeSet<usize> = BTreeSet::new();
     let mut resolved = Vec::new();
@@ -693,6 +705,12 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
                 } else {
                     // A type named in prose sets scope, it does not have to change
                     scope_modules.insert(graph.entities[entity].module);
+                    if matches!(
+                        symbol.kind.item_kind(),
+                        Some(ItemKind::Class | ItemKind::Interface)
+                    ) {
+                        named_types.entry(entity).or_default().push(reason);
+                    }
                 }
             }
             many => clarify(
@@ -701,6 +719,32 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
                     "symbol {quoted} is ambiguous: it matches {}; use a qualified name or an id",
                     many.iter()
                         .map(|entity| graph.entities[*entity].id.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+        }
+    }
+    // A task naming exactly one type and no method is bounded to that type: the type must change,
+    // the rest of its module may; several types and no method leave the target open
+    if must_change.is_empty() {
+        match named_types.iter().collect::<Vec<_>>().as_slice() {
+            [(entity, reasons)] => {
+                let reasons = reasons
+                    .iter()
+                    .map(|reason| {
+                        format!("{reason}; no method was named, so the change is bounded to this type")
+                    })
+                    .collect();
+                must_change.insert(**entity, reasons);
+            }
+            [] => {}
+            many => clarify(
+                "references.symbols",
+                format!(
+                    "the task names several types ({}) but no method: name the method that must change",
+                    many.iter()
+                        .map(|(entity, _)| graph.entities[**entity].id.clone())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
@@ -832,6 +876,26 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
         expected_tests
             .push(json!({"test_file": inventory.snapshot.files[*file].path, "run": true}));
     }
+    if task.acceptance_criteria.is_empty() && !must_change.is_empty() {
+        expected_tests.push(json!({
+            "add_regression_test": must_change.keys().map(|entity| graph.entities[*entity].id.clone()).collect::<Vec<_>>(),
+            "reason": "the task gives no acceptance criteria, so a regression test must show the reported behavior is fixed",
+        }));
+    }
+    // A scope covering most of the repository is repository-wide authority, whatever named it
+    let sources = graph
+        .files
+        .iter()
+        .filter(|file| !file.test && file.module != usize::MAX)
+        .count();
+    let scoped = graph
+        .files
+        .iter()
+        .filter(|file| !file.test && scope_modules.contains(&file.module))
+        .count();
+    if sources >= BROAD_SCOPE_MIN_FILES && scoped * 2 > sources {
+        clarify("references.modules", format!("the task scope would cover {scoped} of the repository's {sources} source files, which is repository-wide authority: name the symbols or the modules in scope"));
+    }
     let task_entities = must_change
         .keys()
         .chain(must_not.keys())
@@ -865,7 +929,7 @@ pub(crate) fn plan(task: &TaskInput, task_digest: &str, checkpoint: &str) -> Res
     // Status and AgentScript
     let status = if !task.repositories.is_empty() && !related {
         "task_unrelated"
-    } else if !clarifications.is_empty() {
+    } else if clarifications.iter().any(|item| item["blocking"] == true) {
         "task_needs_clarification"
     } else if !conflicts.is_empty() {
         "task_conflicts_with_policy"
@@ -1017,6 +1081,24 @@ pub(crate) fn proposal_content(
 ) -> Result<(Value, String, Value, Value), String> {
     let (task, digest) = load(task_id)?;
     let plan = plan(&task, &digest, checkpoint)?;
+    proposal_from_plan(&plan, name)
+}
+
+/** Build what a task-contract proposal holds from a plan already made
+ * Input
+    - plan: &Value - plan from plan()
+    - name: &str - proposal and policy name
+ * Output
+    - Result<(Value, String, Value, Value), String> candidates, policy text, zone suggestions
+      (none), and source state
+    - Error if the task is not planned or yields no AgentScript
+*/
+pub(crate) fn proposal_from_plan(
+    plan: &Value,
+    name: &str,
+) -> Result<(Value, String, Value, Value), String> {
+    let task_id = plan["task_id"].as_str().unwrap_or_default();
+    let digest = plan["task_digest"].as_str().unwrap_or_default();
     if plan["status"] != "planned" {
         return Err(format!(
             "task {task_id} is {}; no contract can be proposed",
@@ -1069,7 +1151,12 @@ pub(crate) fn render(plan: &Value) -> String {
     );
     for item in plan["clarifications"].as_array().into_iter().flatten() {
         out.push_str(&format!(
-            "  needs clarification [{}]: {}\n",
+            "  {} [{}]: {}\n",
+            if item["blocking"] == false {
+                "advisory"
+            } else {
+                "needs clarification"
+            },
             text(&item["field"]),
             text(&item["message"])
         ));
@@ -1143,6 +1230,12 @@ pub(crate) fn render(plan: &Value) -> String {
             ));
         } else if let Some(file) = item["test_file"].as_str() {
             out.push_str(&format!("  run tests in {file}\n"));
+        } else if let Some(covers) = item["add_regression_test"].as_array() {
+            out.push_str(&format!(
+                "  add a regression test for {} ({})\n",
+                covers.iter().map(text).collect::<Vec<_>>().join(", "),
+                text(&item["reason"])
+            ));
         } else {
             out.push_str(&format!(
                 "  add a test for {} ({})\n",

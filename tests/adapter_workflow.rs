@@ -105,9 +105,14 @@ fn claude_hook_install_writes_project_local_settings() {
     assert!(settings.contains("pre-tool-use"));
     assert!(settings.contains("crane agent hook --event stop"));
 
+    // Installing again is idempotent: nothing changes
     let second_install = crane(&directory, &["agent", "install", "--profile", "claude"]);
-    assert!(!second_install.status.success());
-    assert!(String::from_utf8_lossy(&second_install.stderr).contains("already exists"));
+    assert!(second_install.status.success());
+    assert!(String::from_utf8_lossy(&second_install.stdout).contains("already installed"));
+    assert_eq!(
+        fs::read_to_string(directory.join(".claude").join("settings.local.json")).unwrap(),
+        settings
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

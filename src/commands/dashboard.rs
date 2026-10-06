@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::dashboard::{connect, route, server::serve};
+use crate::dashboard::{route, server::serve};
 use crate::repository::ensure_initialized;
 use crate::util::option;
 
@@ -50,39 +50,16 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/** Connect the repository once (crane connect [--refresh] [--json])
+/** Connect the repository once (crane connect, the same as crane repo connect)
  * Input
     - args: &[String] - options
  * Output
     - Result<(), String>
 */
 pub(crate) fn connect_command(args: &[String]) -> Result<(), String> {
-    ensure_initialized()?;
-    let value = connect(args.iter().any(|argument| argument == "--refresh"))?;
-    if args.iter().any(|argument| argument == "--json") {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
-        );
-    } else if value["already_connected"] == true {
-        println!(
-            "Already connected to {} (repository {}); use --refresh to update its metadata.",
-            value["remote"]
-                .as_str()
-                .unwrap_or(value["root"].as_str().unwrap_or_default()),
-            value["repository_id"].as_str().unwrap_or_default()
-        );
-    } else {
-        println!(
-            "Connected {} (repository {}, default branch {}, {} files, {} symbols). Run 'crane dashboard' to open the control plane.",
-            value["remote"].as_str().unwrap_or(value["root"].as_str().unwrap_or_default()),
-            value["repository_id"].as_str().unwrap_or_default(),
-            value["default_branch"].as_str().unwrap_or("unknown"),
-            value["files"],
-            value["symbols"]
-        );
-    }
-    Ok(())
+    let mut full = vec!["connect".to_string()];
+    full.extend_from_slice(args);
+    crate::commands::repo::run(&full)
 }
 
 /** Run a policy pack (crane packs [list] | show PACK | propose payments [--name N] [--checkpoint C])

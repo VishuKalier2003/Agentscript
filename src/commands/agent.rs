@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::adapter::{adapter, AgentAdapter, AgentKind, HookEvent, ProviderEvent};
+use crate::adapter::{adapter, AgentAdapter, AgentKind, HookConfig, HookEvent, ProviderEvent};
 use crate::agent_session::{self, SessionOptions};
 use crate::authority::{AgentAction, Operation, Runtime, Usage};
 use crate::effects;
@@ -36,24 +36,62 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         .map(String::as_str);
     let selected = AgentKind::parse(profile)?;
     let adapter = adapter(selected);
+    let json = args.iter().any(|argument| argument == "--json");
     match operation {
-        "install" => match selected {
-            AgentKind::Codex => install_codex_hooks().map(|_| ()),
-            _ => install_hooks(selected),
-        },
+        "install" => install(adapter.as_ref()).map(|_| ()),
+        "uninstall" => uninstall(adapter.as_ref()),
+        "hooks" => {
+            let report = validate(adapter.as_ref())?;
+            print_hooks(&report, json)?;
+            match report["valid"] == true {
+                true => Ok(()),
+                false => Err(format!(
+                    "the {} hooks are not valid; run 'crane agent install --profile {}'",
+                    selected.name(),
+                    selected.name()
+                )),
+            }
+        }
+        "status" => status(args, profile.map(|_| selected), json),
         "hook" => {
             let event = option(args, "--event").ok_or(
                 "agent hook requires --event session-start|user-prompt-submit|pre-tool-use|post-tool-use|permission-request|stop|session-end (or the host spelling, such as PreToolUse)",
             )?;
-            let options = SessionOptions::from_args(args)?;
-            hook(HookEvent::parse(&event)?, adapter.as_ref(), &options)
+            let event = HookEvent::parse(&event)?;
+            let explicit = option(args, "--crane-session").or_else(|| {
+                env::var("CRANE_SESSION")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+            let options = match SessionOptions::from_args(args) {
+                Ok(options) => options,
+                Err(error) => return adapter.respond_failure(event, &error, false),
+            };
+            // A crash must never pass for a decision: a panic becomes the provider's failure answer
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                hook(event, adapter.as_ref(), &options, explicit.as_deref())
+            }));
+            std::panic::set_hook(previous);
+            match outcome {
+                Ok(result) => result,
+                Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+                        .unwrap_or_else(|| "unknown error".into());
+                    adapter.respond_failure(event, &format!("Crane failed internally ({message})"), false)
+                }
+            }
         }
         "session" => session(&args[1..], selected),
         "init" => {
             if selected == AgentKind::Codex {
-                // Codex installation is additive and idempotent, so init can always (re)install it
+                // Installation is additive and idempotent, so init can always (re)install it
                 super::init::run()?;
-                install_codex_hooks()?;
+                install(adapter.as_ref())?;
             }
             adapter.initialize()?;
             println!(
@@ -65,20 +103,24 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         }
         "verify" | "check" => adapter.verify(),
         _ => Err(format!(
-            "unknown agent operation '{operation}'; use 'crane agent init', 'crane agent verify', or 'crane agent session'"
+            "unknown agent operation '{operation}'; use init, verify, install, uninstall, hooks, status, hook, or session"
         )),
     }
 }
 
-/** Run one lifecycle hook, by reading and translating the provider payload, binding it to its
- * contract session (created on first sight, transient when the provider sends no session id),
- * and then handling the event; for pre-tool-use every failure is turned into a denial so a crash
- * can never let a tool run unchecked
+/** Run one lifecycle hook: read and translate the provider payload (the adapter only translates),
+ * check that the payload is the event it was registered for, bind it to its Society session
+ * (agent_session::bind: an explicitly named session, the task's approved session, the provider's
+ * session, or a transient one), check that the agent works in that session's repository, record the
+ * provider's attachment, and hand the normalized event to the session manager and authority
+ * engine. Whenever no Society decision or verification can be obtained, the adapter answers with
+ * its failure response, which never allows a tool call or reports success
  * Input
     - event: HookEvent - lifecycle event
     - adapter: &dyn AgentAdapter - provider adapter
     - options: &SessionOptions - lifetime, idle timeout, task, autonomy mode, and budget, used
-      only when the session is created (a task given later must match the bound one)
+      only when the session is created
+    - explicit: Option<&str> - Society session named with CRANE_SESSION or --crane-session
  * Output
     - Result<(), String>
     - HOOK_BLOCK error when the action is denied or the agent must repair something now
@@ -87,29 +129,73 @@ fn hook(
     event: HookEvent,
     adapter: &dyn AgentAdapter,
     options: &SessionOptions,
+    explicit: Option<&str>,
 ) -> Result<(), String> {
-    let result = read_payload(event).and_then(|payload| {
-        let provider = adapter.translate(event, &payload);
-        if let Err(error) = ensure_initialized() {
-            return unbound(event, adapter, provider, &error, false);
-        }
-        let session = match &provider.session {
-            Some(id) => {
-                agent_session::establish(adapter.kind(), id, options).map(|(session, _)| session)
-            }
-            None => agent_session::transient(adapter.kind(), options),
-        };
-        match session {
-            Ok(session) => handle(event, adapter, provider, &session),
-            Err(error) => unbound(event, adapter, provider, &error, true),
-        }
-    });
-    match (event, result) {
-        (HookEvent::PreToolUse, Err(error)) if !error.starts_with("HOOK_BLOCK:") => Err(format!(
-            "HOOK_BLOCK:Crane could not authorize this tool call: {error}"
-        )),
-        (_, result) => result,
+    let payload = match read_payload(event) {
+        Ok(payload) => payload,
+        Err(error) => return adapter.respond_failure(event, &error, false),
+    };
+    let provider = adapter.translate(event, &payload);
+    let held = provider.stop_hook_active;
+    match bound_hook(event, adapter, provider, options, explicit) {
+        Ok(()) => Ok(()),
+        Err(error) if error.starts_with("HOOK_BLOCK:") => Err(error),
+        Err(error) => adapter.respond_failure(event, &error, held),
     }
+}
+
+/** Bind a translated event to its session and handle it (see hook)
+ * Input
+    - event: HookEvent - lifecycle event
+    - adapter: &dyn AgentAdapter - provider adapter
+    - provider: ProviderEvent - translated payload
+    - options: &SessionOptions - session options
+    - explicit: Option<&str> - explicitly named Society session
+ * Output
+    - Result<(), String>
+*/
+fn bound_hook(
+    event: HookEvent,
+    adapter: &dyn AgentAdapter,
+    provider: ProviderEvent,
+    options: &SessionOptions,
+    explicit: Option<&str>,
+) -> Result<(), String> {
+    if let Some(name) = provider.event_name.as_deref() {
+        if name != event.host_name() && name != event.name() {
+            return Err(format!(
+                "the payload is a {name} event, but this hook handles {}; check the hook configuration",
+                event.host_name()
+            ));
+        }
+    }
+    if let Err(error) = ensure_initialized() {
+        return unbound(event, adapter, provider, &error, false);
+    }
+    let binding = match agent_session::bind(
+        adapter.kind(),
+        explicit,
+        provider.session.as_deref(),
+        options,
+    ) {
+        Ok(binding) => binding,
+        Err(error) => return unbound(event, adapter, provider, &error, true),
+    };
+    if let Err(error) = agent_session::check_workspace(&binding.session, provider.cwd.as_deref()) {
+        return unbound(event, adapter, provider, &error, true);
+    }
+    let mut facts = provider.identity.clone();
+    facts["model"] = json!(provider.model);
+    facts["cwd"] = json!(provider.cwd);
+    facts["first_event"] = json!(event.host_name());
+    agent_session::attach(
+        &binding.session,
+        adapter.kind(),
+        provider.session.as_deref(),
+        binding.via,
+        facts,
+    )?;
+    handle(event, adapter, provider, &binding.session)
 }
 
 /** Handle an event under its contract session through the provider-neutral session manager:
@@ -143,6 +229,7 @@ fn handle(
                 provider.model.as_deref(),
                 provider.source.as_deref(),
             )?;
+            crate::session_orchestrator::connected(session, "session_start")?;
             print!("{context}");
             Ok(())
         }
@@ -158,49 +245,24 @@ fn handle(
         }
         HookEvent::PreToolUse => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            let verdict = agent_session::authorize(session, protected, &action, "pre_tool_use")?;
+            let (_, verdict) =
+                crate::session_orchestrator::decide(session, protected, &action, "pre_tool_use")?;
             adapter.respond_action(&verdict)
         }
         HookEvent::PermissionRequest => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            let verdict =
-                agent_session::authorize(session, protected, &action, "permission_request")?;
+            let (_, verdict) = crate::session_orchestrator::decide(
+                session,
+                protected,
+                &action,
+                "permission_request",
+            )?;
             adapter.respond_permission(&verdict)
         }
         HookEvent::PostToolUse => {
             let action = provider.action.unwrap_or_else(unknown_action);
-            // Reads change nothing; everything else is judged by what actually changed
-            let (report, effect) = if action.operation == Operation::Read {
-                (
-                    Report {
-                        passes: Vec::new(),
-                        violations: Vec::new(),
-                    },
-                    Value::Null,
-                )
-            } else {
-                effects::observe(session, &action, protected)?
-            };
-            let consumption = crate::budget::manage::consumption(session, &action);
-            let mut entry = json!({
-                "event": "post_tool_use",
-                "summary": agent_session::summary(&action),
-                "tool": action.tool,
-                "operation": action.operation.name(),
-                "resources": action.files.iter().map(|change| format!("file:{}", change.path)).collect::<Vec<_>>(),
-                "arguments_digest": action.digest,
-                "result": "executed",
-                "verified_clauses": effect["clauses_checked"].as_u64().unwrap_or(0),
-                "verification": outcome(&report),
-                "effect": effect,
-            });
-            if let Some(amount) = consumption {
-                entry["budget_consume"] = json!({"amount": amount, "compliant": agent_session::behaviour(&report).is_empty()});
-            }
-            session.record(entry)?;
-            agent_session::after_tool(session)?;
-            agent_session::after_effect(session, &report)?;
-            crate::budget::manage::reward_compliance(session)?;
+            // Observation, incremental verification, and the state updates belong to the orchestrator
+            let report = crate::session_orchestrator::observe(session, &action, protected)?;
             adapter.respond_verification(event, assess(&report, false), &report)
         }
         HookEvent::Stop => {
@@ -226,6 +288,7 @@ fn handle(
             session.record(json!({
                 "event": "session_end",
                 "final_status": attestation["final_status"],
+                "provider_session": provider.session,
             }))?;
             session.set_lifecycle(Lifecycle::Closed)
         }
@@ -286,8 +349,9 @@ fn unbound(
     }
 }
 
-/** Read the hook payload from stdin, treating empty input as Null; invalid JSON is an error for
- * pre-tool-use (which then denies) and Null for every other event
+/** Read the hook payload from stdin, treating empty input as Null; unreadable input or invalid
+ * JSON is an error for tool events (which the adapter then answers as a failure, never an allow)
+ * and Null for every other event
  * Input
     - event: HookEvent - lifecycle event
  * Output
@@ -297,9 +361,9 @@ fn unbound(
 fn read_payload(event: HookEvent) -> Result<Value, String> {
     let mut input = String::new();
     if let Err(error) = io::stdin().read_to_string(&mut input) {
-        return match event {
-            HookEvent::PreToolUse => Err(format!("HOOK_BLOCK:could not read hook input: {error}")),
-            _ => Ok(Value::Null),
+        return match event.has_action() {
+            true => Err(format!("could not read hook input: {error}")),
+            false => Ok(Value::Null),
         };
     }
     if input.trim().is_empty() {
@@ -307,9 +371,7 @@ fn read_payload(event: HookEvent) -> Result<Value, String> {
     }
     match serde_json::from_str(&input) {
         Ok(payload) => Ok(payload),
-        Err(error) if event == HookEvent::PreToolUse => {
-            Err(format!("HOOK_BLOCK:invalid hook input: {error}"))
-        }
+        Err(error) if event.has_action() => Err(format!("invalid hook input: {error}")),
         Err(_) => Ok(Value::Null),
     }
 }
@@ -508,170 +570,557 @@ fn session(args: &[String], profile: AgentKind) -> Result<(), String> {
     }
 }
 
-/** Codex events Crane registers, with whether their hook entry needs a tool matcher */
-const CODEX_EVENTS: [(HookEvent, bool); 7] = [
-    (HookEvent::SessionStart, false),
-    (HookEvent::UserPromptSubmit, false),
-    (HookEvent::PreToolUse, true),
-    (HookEvent::PermissionRequest, true),
-    (HookEvent::PostToolUse, true),
-    (HookEvent::Stop, false),
-    (HookEvent::SessionEnd, false),
-];
-
-/** Install Codex hooks for the repository additively and idempotently, by reading
- * <repo>/.codex/hooks.json (refusing to touch a file that is not a JSON object with an object
- * "hooks" field), skipping every event whose Crane command is already registered there or inline
- * in .codex/config.toml, appending one Crane-owned matcher group for each remaining event, and
- * writing the file through a temporary file; unrelated settings and hooks are never changed
+/** Read a provider's hook configuration file: its path, its JSON document ({} when missing), and
+ * whether it existed; a file that is not a JSON object is an error, so it is never overwritten
  * Input
-    - None
+    - config: &HookConfig - provider configuration
  * Output
-    - Result<Vec<String>, String> names of the events that were added (empty when already installed)
-    - Error if the repository root cannot be found or the configuration cannot be read or written
+    - Result<(PathBuf, Value, bool), String>
 */
-fn install_codex_hooks() -> Result<Vec<String>, String> {
+fn read_config(config: &HookConfig) -> Result<(PathBuf, Value, bool), String> {
     let root = PathBuf::from(crate::repository::git(&["rev-parse", "--show-toplevel"])?);
-    let directory = root.join(".codex");
-    let path = directory.join("hooks.json");
-    let mut document = match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str::<Value>(&content).map_err(|error| {
-            format!(
-                "{} is not valid JSON ({error}); fix it before installing Crane hooks",
-                path.display()
-            )
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => json!({}),
+    let path = root.join(config.file);
+    let (document, exists) = match fs::read_to_string(&path) {
+        Ok(content) => (
+            serde_json::from_str::<Value>(&content).map_err(|error| {
+                format!(
+                    "{} is not valid JSON ({error}); fix it before changing Crane hooks",
+                    path.display()
+                )
+            })?,
+            true,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (json!({}), false),
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
-    let inline = fs::read_to_string(directory.join("config.toml")).unwrap_or_default();
-    let hooks = document
-        .as_object_mut()
-        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| format!("\"hooks\" in {} must be an object", path.display()))?;
+    if !document.is_object() {
+        return Err(format!("{} must contain a JSON object", path.display()));
+    }
+    if !document.get("hooks").is_none_or(Value::is_object) {
+        return Err(format!("\"hooks\" in {} must be an object", path.display()));
+    }
+    Ok((path, document, exists))
+}
+
+/** Write a configuration file through a temporary file
+ * Input
+    - path: &Path - file
+    - document: &Value - JSON
+ * Output
+    - Result<(), String>
+*/
+fn write_config(path: &Path, document: &Value) -> Result<(), String> {
+    let directory = path.parent().ok_or("invalid configuration path")?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+    let temporary = path.with_extension(format!("crane-{}", std::process::id()));
+    let text = serde_json::to_string_pretty(document).map_err(|error| error.to_string())? + "\n";
+    fs::write(&temporary, text)
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("could not write {}: {error}", path.display())
+    })
+}
+
+/** Return the provider configuration that registers hooks inline (Codex's config.toml next to
+ * hooks.json), empty when there is none
+ * Input
+    - path: &Path - hook configuration file
+ * Output
+    - String
+*/
+fn inline_config(path: &Path) -> String {
+    path.parent()
+        .map(|folder| fs::read_to_string(folder.join("config.toml")).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/** Install a provider's hooks additively and idempotently: every event Crane needs gets one
+ * Crane-owned handler group (skipped when the command is already registered, in the file or inline
+ * in config.toml), Crane's permission rules are added when missing, unrelated settings and hooks are
+ * never changed, and an unchanged configuration is not rewritten
+ * Input
+    - adapter: &dyn AgentAdapter - provider adapter
+ * Output
+    - Result<Vec<String>, String> events added (empty when already installed)
+*/
+fn install(adapter: &dyn AgentAdapter) -> Result<Vec<String>, String> {
+    let config = adapter
+        .hook_config()
+        .ok_or("automatic hooks are supported for --profile claude and --profile codex")?;
+    let (path, mut document, _) = read_config(&config)?;
+    let inline = inline_config(&path);
     let mut added = Vec::new();
-    for (event, with_matcher) in CODEX_EVENTS {
-        let name = event.host_name();
-        let command = format!("crane agent hook --event {name} --profile codex");
-        if inline.contains(&command) {
-            continue; // already registered inline in .codex/config.toml
+    {
+        let hooks = document
+            .as_object_mut()
+            .ok_or("invalid configuration")?
+            .entry("hooks")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("invalid configuration")?;
+        for (event, with_matcher) in config.events {
+            let name = event.host_name();
+            let command = adapter.hook_command(*event);
+            if inline.contains(&command) {
+                continue;
+            }
+            let groups = hooks
+                .entry(name)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| format!("hooks.{name} in {} must be an array", path.display()))?;
+            if registrations(groups, &command) > 0 {
+                continue;
+            }
+            let mut handler =
+                json!({"type": "command", "command": command, "timeout": config.timeout});
+            if adapter.kind() == AgentKind::Codex {
+                handler["statusMessage"] = json!(format!("Crane: {}", event.name()));
+            }
+            let mut group = json!({ "hooks": [handler] });
+            if *with_matcher {
+                group["matcher"] = json!("*");
+            }
+            groups.push(group);
+            added.push(name.to_string());
         }
-        let groups = hooks
-            .entry(name)
+    }
+    let mut denied = Vec::new();
+    if !config.deny.is_empty() {
+        let rules = document
+            .as_object_mut()
+            .ok_or("invalid configuration")?
+            .entry("permissions")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| format!("\"permissions\" in {} must be an object", path.display()))?
+            .entry("deny")
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            .ok_or_else(|| format!("hooks.{name} in {} must be an array", path.display()))?;
-        let registered = groups.iter().any(|group| {
-            group["hooks"].as_array().is_some_and(|handlers| {
-                handlers
-                    .iter()
-                    .any(|handler| handler["command"] == command.as_str())
-            })
-        });
-        if registered {
-            continue;
+            .ok_or_else(|| format!("permissions.deny in {} must be an array", path.display()))?;
+        for rule in config.deny {
+            if !rules.iter().any(|existing| existing == rule) {
+                rules.push(json!(rule));
+                denied.push(*rule);
+            }
         }
-        let mut group = json!({ "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": 120,
-            "statusMessage": format!("Crane: {}", event.name()),
-        }] });
-        if with_matcher {
-            group["matcher"] = json!("*");
-        }
-        groups.push(group);
-        added.push(name.to_string());
     }
-    if added.is_empty() {
+    if added.is_empty() && denied.is_empty() {
         println!(
-            "Crane Codex hooks are already installed in {}",
+            "Crane {} hooks are already installed in {}",
+            display(adapter.kind()),
             path.display()
         );
         return Ok(added);
     }
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
-    let temporary = directory.join(format!("hooks.json.crane-{}", std::process::id()));
-    let text = serde_json::to_string_pretty(&document).map_err(|error| error.to_string())? + "\n";
-    fs::write(&temporary, text)
-        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
-    fs::rename(&temporary, &path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        format!("could not write {}: {error}", path.display())
-    })?;
+    write_config(&path, &document)?;
     println!(
-        "Installed Crane Codex hooks for {} in {}",
-        added.join(", "),
+        "Installed Crane {} hooks{} in {}",
+        display(adapter.kind()),
+        if added.is_empty() {
+            String::new()
+        } else {
+            format!(" for {}", added.join(", "))
+        },
         path.display()
     );
-    println!("Codex runs project hooks only after they are trusted: open Codex in this repository and review them with /hooks.");
-    println!("The hooks use the Crane executable available on PATH.");
+    if adapter.kind() == AgentKind::Codex {
+        println!("Codex runs project hooks only after they are trusted: open Codex in this repository and review them with /hooks.");
+    }
+    println!("The hooks use the Crane executable available on PATH; check them with 'crane agent hooks --profile {}'.", adapter.kind().name());
     Ok(added)
 }
 
-/** Install Claude Code hooks for the project, by first requiring the claude profile, then creating
- * .claude, refusing to overwrite an existing settings.local.json, and finally writing the Crane
- * hook and permission settings
+/** Return a provider's display name for messages
  * Input
-    - profile: AgentKind - selected agent profile
+    - kind: AgentKind - provider profile
  * Output
-    - Result<(), String>
-    - Error if the profile is not claude, the settings file already exists, or writing fails
+    - &'static str
 */
-fn install_hooks(profile: AgentKind) -> Result<(), String> {
-    // Register project-local hooks so Claude starts Crane as a separate process
-    if profile != AgentKind::Claude {
-        return Err(
-            "automatic hooks are supported for --profile claude and --profile codex".into(),
-        );
+fn display(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Claude => "Claude Code",
+        AgentKind::Codex => "Codex",
+        AgentKind::Generic => "generic",
     }
+}
 
-    let directory = Path::new(".claude");
-    fs::create_dir_all(directory)
-        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
-    let path = directory.join("settings.local.json");
-    if path.exists() {
-        return Err(format!(
-            "{} already exists; review it and merge the Crane hooks manually, or remove it before reinstalling",
-            path.display()
+/** Count the handlers in a hook event's groups that run a command
+ * Input
+    - groups: &[Value] - matcher groups of one event
+    - command: &str - command
+ * Output
+    - usize
+*/
+fn registrations(groups: &[Value], command: &str) -> usize {
+    groups
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().cloned().unwrap_or_default())
+        .filter(|handler| handler["command"] == command)
+        .count()
+}
+
+/** Find the Crane executable the hooks will run: crane (crane.exe) on PATH
+ * Input
+    - None
+ * Output
+    - Option<PathBuf>
+*/
+fn crane_on_path() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["crane.exe", "crane"]
+    } else {
+        &["crane"]
+    };
+    env::split_paths(&env::var_os("PATH")?)
+        .flat_map(|folder| names.iter().map(move |name| folder.join(name)))
+        .find(|path| path.is_file())
+}
+
+/** Validate a provider's hook configuration: the file parses; every event Crane needs runs Crane's
+ * command exactly once (in the file or inline), with a matcher that covers every tool on tool
+ * events; Crane's permission rules are present; the Crane executable is on PATH (a hook that
+ * cannot run is a non-blocking error to the provider, which would let tools run unchecked); and
+ * Crane is initialized
+ * Input
+    - adapter: &dyn AgentAdapter - provider adapter
+ * Output
+    - Result<Value, String> {profile, file, exists, events, permissions, executable, problems,
+      warnings, valid}
+*/
+pub(crate) fn validate(adapter: &dyn AgentAdapter) -> Result<Value, String> {
+    let config = adapter
+        .hook_config()
+        .ok_or("hook validation is supported for --profile claude and --profile codex")?;
+    let mut problems = Vec::new();
+    let mut warnings = Vec::new();
+    let (path, document, exists) = match read_config(&config) {
+        Ok(read) => read,
+        Err(error) => {
+            return Ok(
+                json!({"profile": adapter.kind().name(), "file": config.file, "exists": true, "valid": false, "problems": [error], "warnings": [], "events": []}),
+            )
+        }
+    };
+    let inline = inline_config(&path);
+    if !exists && inline.is_empty() {
+        problems.push(format!(
+            "{} does not exist; run 'crane agent install --profile {}'",
+            config.file,
+            adapter.kind().name()
         ));
     }
-    let hook = |event: &str| {
-        json!([{ "hooks": [{
-            "type": "command",
-            "command": format!("crane agent hook --event {event} --profile claude"),
-        }] }])
-    };
-    let with_matcher = |event: &str| {
-        let mut entry = hook(event);
-        entry[0]["matcher"] = json!("*");
-        entry
-    };
-    let settings = json!({
-        "permissions": {
-            "deny": [
-                "Edit(./.crane/**)",
-                "Edit(./.claude/settings.json)",
-                "Edit(./.claude/settings.local.json)"
-            ]
-        },
-        "hooks": {
-            "SessionStart": hook("session-start"),
-            "UserPromptSubmit": hook("user-prompt-submit"),
-            "PreToolUse": with_matcher("pre-tool-use"),
-            "PostToolUse": with_matcher("post-tool-use"),
-            "Stop": hook("stop"),
-            "SessionEnd": hook("session-end"),
+    let mut events = Vec::new();
+    for (event, with_matcher) in config.events {
+        let name = event.host_name();
+        let command = adapter.hook_command(*event);
+        let groups = document["hooks"][name]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let count = registrations(&groups, &command) + usize::from(inline.contains(&command));
+        let matchers = groups
+            .iter()
+            .filter(|group| registrations(std::slice::from_ref(*group), &command) > 0)
+            .map(|group| group["matcher"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>();
+        match count {
+            0 => problems.push(format!("{name} is not registered, so Crane never sees it")),
+            1 => {}
+            many => problems.push(format!(
+                "{name} runs Crane {many} times; remove the duplicates"
+            )),
         }
-    });
-    let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())? + "\n";
-    fs::write(&path, text)
-        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
-    println!("Installed Claude Code hooks in {}", path.display());
-    println!("The hooks use the Crane executable available on PATH.");
+        if *with_matcher {
+            for matcher in &matchers {
+                if !matches!(matcher.as_str(), "" | "*" | ".*") {
+                    problems.push(format!("{name} is registered with matcher '{matcher}', so other tools run without Crane's authorization"));
+                }
+            }
+        }
+        events.push(
+            json!({"event": name, "command": command, "registered": count, "matchers": matchers}),
+        );
+    }
+    let missing = config
+        .deny
+        .iter()
+        .filter(|rule| {
+            !document["permissions"]["deny"]
+                .as_array()
+                .is_some_and(|rules| rules.iter().any(|existing| existing == **rule))
+        })
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "permission rules missing: {}",
+            missing
+                .iter()
+                .map(|rule| rule.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let executable = crane_on_path();
+    if executable.is_none() {
+        problems.push("crane is not on PATH: the provider could not run the hooks, and a hook that cannot run does not stop a tool call".into());
+    }
+    if ensure_initialized().is_err() {
+        problems.push("Crane is not initialized in this repository; run 'crane init'".into());
+    }
+    if adapter.kind() == AgentKind::Codex {
+        warnings.push("Codex runs project hooks only after they are trusted; review them with /hooks in Codex".to_string());
+    }
+    Ok(json!({
+        "profile": adapter.kind().name(),
+        "file": config.file,
+        "exists": exists,
+        "events": events,
+        "permissions": {"required": config.deny, "missing": missing},
+        "executable": executable.map(|path| path.to_string_lossy().into_owned()),
+        "problems": problems,
+        "warnings": warnings,
+        "valid": problems.is_empty(),
+    }))
+}
+
+/** Print a hook validation report
+ * Input
+    - report: &Value - from validate
+    - json: bool - print JSON
+ * Output
+    - Result<(), String>
+*/
+fn print_hooks(report: &Value, json: bool) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    println!(
+        "{} hooks ({}): {}",
+        report["profile"].as_str().unwrap_or_default(),
+        report["file"].as_str().unwrap_or_default(),
+        if report["valid"] == true {
+            "valid"
+        } else {
+            "NOT VALID"
+        }
+    );
+    for problem in report["problems"].as_array().into_iter().flatten() {
+        println!("  problem: {}", problem.as_str().unwrap_or_default());
+    }
+    for warning in report["warnings"].as_array().into_iter().flatten() {
+        println!("  note: {}", warning.as_str().unwrap_or_default());
+    }
+    Ok(())
+}
+
+/** Remove a provider's Crane hooks (disconnect it), refused on behalf of an agent: only handlers
+ * running Crane's commands for
+ * that provider and Crane's permission rules are removed, groups and events left empty are
+ * dropped, every other setting stays, and a file that only held Crane's configuration is deleted;
+ * the provider's sessions stay as evidence (their authority ends with them)
+ * Input
+    - adapter: &dyn AgentAdapter - provider adapter
+ * Output
+    - Result<(), String>
+*/
+fn uninstall(adapter: &dyn AgentAdapter) -> Result<(), String> {
+    if let Some(marker) = crate::proposals::store::agent_environment() {
+        return Err(format!("crane agent uninstall refuses to run in an agent environment ({marker} is set); only a human disconnects Crane from an agent"));
+    }
+    let config = adapter
+        .hook_config()
+        .ok_or("hook removal is supported for --profile claude and --profile codex")?;
+    let (path, mut document, exists) = read_config(&config)?;
+    if !exists {
+        println!(
+            "Crane {} hooks are not installed ({} does not exist).",
+            display(adapter.kind()),
+            path.display()
+        );
+        return Ok(());
+    }
+    let commands = config
+        .events
+        .iter()
+        .map(|(event, _)| adapter.hook_command(*event))
+        .collect::<Vec<_>>();
+    let mut removed = 0;
+    if let Some(hooks) = document.get_mut("hooks").and_then(Value::as_object_mut) {
+        for groups in hooks.values_mut() {
+            if let Some(groups) = groups.as_array_mut() {
+                for group in groups.iter_mut() {
+                    if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                        let before = handlers.len();
+                        handlers.retain(|handler| {
+                            !handler["command"]
+                                .as_str()
+                                .is_some_and(|command| commands.iter().any(|ours| ours == command))
+                        });
+                        removed += before - handlers.len();
+                    }
+                }
+                groups.retain(|group| {
+                    group["hooks"]
+                        .as_array()
+                        .is_none_or(|handlers| !handlers.is_empty())
+                });
+            }
+        }
+        hooks.retain(|_, groups| groups.as_array().is_none_or(|groups| !groups.is_empty()));
+    }
+    let mut rules = 0;
+    if let Some(deny) = document
+        .pointer_mut("/permissions/deny")
+        .and_then(Value::as_array_mut)
+    {
+        let before = deny.len();
+        deny.retain(|rule| !config.deny.iter().any(|ours| rule == ours));
+        rules = before - deny.len();
+    }
+    for (parent, key) in [("/permissions", "deny"), ("", "permissions"), ("", "hooks")] {
+        let empty = document
+            .pointer(&format!("{parent}/{key}"))
+            .is_some_and(|value| {
+                value.as_array().is_some_and(Vec::is_empty)
+                    || value.as_object().is_some_and(serde_json::Map::is_empty)
+            });
+        if empty {
+            if let Some(object) = (if parent.is_empty() {
+                Some(&mut document)
+            } else {
+                document.pointer_mut(parent)
+            })
+            .and_then(Value::as_object_mut)
+            {
+                object.remove(key);
+            }
+        }
+    }
+    if removed == 0 && rules == 0 {
+        println!(
+            "Crane {} hooks are not installed in {}.",
+            display(adapter.kind()),
+            path.display()
+        );
+        return Ok(());
+    }
+    if document.as_object().is_some_and(serde_json::Map::is_empty) {
+        fs::remove_file(&path)
+            .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+        println!("Removed {} (it only held Crane's hooks).", path.display());
+    } else {
+        write_config(&path, &document)?;
+        println!("Removed {removed} Crane hooks and {rules} permission rules from {}; other settings are unchanged.", path.display());
+    }
+    let active = session_ids()?
+        .into_iter()
+        .filter_map(|id| ContractSession::load(&id).ok().flatten())
+        .filter(|session| session.identity().0 == adapter.kind() && session.resumable())
+        .map(|session| session.id().to_string())
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        println!("{} sessions can still be resumed: {}; end them with 'crane agent session cancel ID' or 'finalize ID'.", adapter.kind().name(), active.join(", "));
+    }
+    Ok(())
+}
+
+/** Report provider status: the hook validation of each provider, and the sessions selected by
+ * --session, --task, or (by default) every resumable session of the profile, with their provider
+ * attachments, task contract, checkpoints, autonomy, safety, budget, and last event
+ * Input
+    - args: &[String] - arguments after "agent"
+    - profile: Option<AgentKind> - --profile, when given
+    - json: bool - print JSON
+ * Output
+    - Result<(), String>
+*/
+fn status(args: &[String], profile: Option<AgentKind>, json: bool) -> Result<(), String> {
+    ensure_initialized()?;
+    let kinds = match profile {
+        Some(kind) => vec![kind],
+        None => vec![AgentKind::Claude, AgentKind::Codex],
+    };
+    let hooks = kinds
+        .iter()
+        .filter_map(|kind| validate(adapter(*kind).as_ref()).ok())
+        .collect::<Vec<_>>();
+    let wanted = option(args, "--session");
+    let task = option(args, "--task");
+    let mut sessions = Vec::new();
+    for id in session_ids()? {
+        let Ok(Some(session)) = ContractSession::load(&id) else {
+            continue;
+        };
+        let (kind, bound, _) = session.identity();
+        let selected = match (&wanted, &task) {
+            (Some(wanted), _) => *wanted == id,
+            (None, Some(task)) => bound == Some(task.as_str()),
+            (None, None) => kinds.contains(&kind) && session.resumable(),
+        };
+        if selected {
+            sessions.push(agent_session::status_report(&session));
+        }
+    }
+    if let (Some(wanted), true) = (&wanted, sessions.is_empty()) {
+        return Err(format!("no contract session '{wanted}'"));
+    }
+    let report = json!({"hooks": hooks, "sessions": sessions});
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    for hook in &hooks {
+        print_hooks(hook, false)?;
+    }
+    if sessions.is_empty() {
+        println!("No active sessions.");
+    }
+    let text = |value: &Value| value.as_str().map_or_else(|| "-".to_string(), String::from);
+    for session in &sessions {
+        println!(
+            "{} ({}, {}): task {}, contract {} {}, autonomy {}, safety {}, budget {}/{} actions, last {}",
+            text(&session["session_id"]),
+            text(&session["agent"]),
+            text(&session["lifecycle"]),
+            text(&session["task_id"]),
+            text(&session["task_contract"]["contract_id"]),
+            match session["task_contract"]["current"].as_bool() {
+                Some(true) => "current".to_string(),
+                Some(false) => format!("OBSOLETE: {}", text(&session["task_contract"]["obsolete"])),
+                None => text(&session["task_contract"]["status"]),
+            },
+            text(&session["autonomy"]),
+            text(&session["safety"]),
+            session["budget"]["actions"],
+            session["budget"]["max_actions"],
+            text(&session["last_event"]["event"])
+        );
+        for checkpoint in session["checkpoints"].as_array().into_iter().flatten() {
+            println!(
+                "  checkpoint {} {} (policy {})",
+                text(&checkpoint["checkpoint"]),
+                text(&checkpoint["sha"]),
+                text(&checkpoint["policy"])
+            );
+        }
+        for attachment in session["attachments"].as_array().into_iter().flatten() {
+            println!(
+                "  attached: {} session {} via {}",
+                text(&attachment["provider"]),
+                text(&attachment["provider_session"]),
+                text(&attachment["via"])
+            );
+        }
+    }
     Ok(())
 }

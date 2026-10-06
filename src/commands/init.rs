@@ -14,6 +14,19 @@ use crate::util::io_error;
     - Error if not inside a Git repository or the directories cannot be created
 */
 pub(crate) fn run() -> Result<(), String> {
+    println!("Initialized {}", initialize()?.display());
+    Ok(())
+}
+
+/** Create Crane's metadata directories (policies, checkpoints, zones, tasks) and a default
+ * config.toml where missing, without printing; safe to repeat
+ * Input
+    - None
+ * Output
+    - Result<PathBuf, String> the .crane directory
+    - Error if not inside a Git repository or the directories cannot be created
+*/
+pub(crate) fn initialize() -> Result<std::path::PathBuf, String> {
     // Create only Crane metadata directories and never alter application source
     let root = root_allow_missing()?;
     fs::create_dir_all(root.join("policies")).map_err(io_error)?;
@@ -24,6 +37,5 @@ pub(crate) fn run() -> Result<(), String> {
     if !config.exists() {
         fs::write(config, "# Crane MVP configuration\n").map_err(io_error)?;
     }
-    println!("Initialized {}", root.display());
-    Ok(())
+    Ok(root)
 }

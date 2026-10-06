@@ -604,6 +604,8 @@ pub(crate) fn run(root: &Path, command: &[String], timeout: u64) -> Value {
     let child = Command::new(program)
         .args(arguments)
         .current_dir(root)
+        // Crane's own test runs must not leave bytecode behind for effect verification to find
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -866,6 +868,21 @@ fn validate_here(session: &ContractSession) -> Result<(Report, Value), String> {
     }
     attestation["effects"] = effect;
     attestation["tests"] = json!(tests);
+    // Violations found here come after the reconciliation; the attestation must still name them
+    let added = report
+        .violations
+        .iter()
+        .filter(|violation| matches!(violation.violation_type.as_str(), "unauthorized_effect" | "tests_failed"))
+        .map(|violation| json!({"policy_id": violation.policy_id, "rule": violation.rule, "target": violation.target, "violation_type": violation.violation_type, "message": violation.message}))
+        .collect::<Vec<_>>();
+    if !added.is_empty() {
+        let mut findings = attestation["findings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        findings.extend(added);
+        attestation["findings"] = json!(findings);
+    }
     if !report.violations.is_empty() {
         attestation["final_status"] = json!("FAIL");
     }

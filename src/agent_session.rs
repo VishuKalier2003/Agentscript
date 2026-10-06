@@ -10,7 +10,9 @@ use std::fs;
 use serde_json::{json, Value};
 
 use crate::adapter::AgentKind;
-use crate::authority::{changes_own_autonomy, AgentAction, Decision, Verdict, BUDGET_EXHAUSTED};
+use crate::authority::{
+    changes_own_autonomy, AgentAction, Decision, Operation, Verdict, BUDGET_EXHAUSTED,
+};
 use crate::autonomy::manage::{apply, inherit, load_policy};
 use crate::autonomy::{Actor, AutonomyPolicy, Condition, State, Trigger, SELF_ESCALATION};
 use crate::budget::BudgetModel;
@@ -64,6 +66,8 @@ pub(crate) struct FileConstraint {
       created before the autonomy budget, which use the default model)
     - organization: Option<Value> - {organization, team} the session belongs to (None for sessions
       created before evidence records)
+    - task_contract: Option<Value> - the task contract the session is bound to ({contract_id,
+      version, digest, status}), None without a task or for sessions created before task contracts
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Governance {
@@ -80,6 +84,7 @@ pub(crate) struct Governance {
     pub(crate) autonomy_policy: Option<AutonomyPolicy>,
     pub(crate) budget_model: Option<BudgetModel>,
     pub(crate) organization: Option<Value>,
+    pub(crate) task_contract: Option<Value>,
 }
 
 impl Governance {
@@ -120,6 +125,7 @@ impl Governance {
             autonomy_policy: None,
             budget_model: None,
             organization: None,
+            task_contract: None,
         }
     }
 
@@ -216,6 +222,10 @@ impl Governance {
         if let Some(organization) = &self.organization {
             value["organization"] = organization.clone();
         }
+        // Written only when present, so bindings made before task contracts keep their digest
+        if let Some(contract) = &self.task_contract {
+            value["task_contract"] = contract.clone();
+        }
         value
     }
 
@@ -283,6 +293,7 @@ impl Governance {
                 None => None,
             },
             organization: value.get("organization").cloned(),
+            task_contract: value.get("task_contract").cloned(),
         })
     }
 }
@@ -446,32 +457,63 @@ impl SessionOptions {
             );
         }
         if let Some(task) = task {
-            let mut scope = BTreeSet::new();
-            if let Ok((input, digest)) = crate::tasks::load(task) {
-                governance.task_title = Some(input.title.clone());
-                if let Ok(plan) = crate::tasks::plan(&input, &digest, &self.checkpoint) {
-                    let modules = plan["contract"]["TASK_SCOPE"]["modules"]
-                        .as_array()
-                        .map(|modules| {
-                            modules
-                                .iter()
-                                .filter_map(|module| module.as_str().map(String::from))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let graph = &zones.inventory.graph;
-                    for (index, info) in graph.files.iter().enumerate() {
-                        if info.module != usize::MAX
-                            && modules.contains(&graph.modules[info.module].id)
-                        {
-                            scope.insert(snapshot.files[index].path.clone());
+            let modules_of = |contract: &Value| {
+                contract["TASK_SCOPE"]["modules"]
+                    .as_array()
+                    .map(|modules| {
+                        modules
+                            .iter()
+                            .filter_map(|module| module.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            // The task's compiled contract decides the scope, and only an approved contract whose
+            // bindings still hold gives the session more than assisted autonomy; a task without
+            // a compiled contract is planned here, and only a planned one keeps its autonomy
+            let mut modules = Vec::new();
+            let mut authorized = false;
+            match crate::task_contracts::for_session(task) {
+                Ok(Some(record)) => {
+                    governance.task_title = record["task"]["title"].as_str().map(String::from);
+                    modules = modules_of(&record["contract"]);
+                    authorized = record["status"] == "approved";
+                    governance.task_contract = Some(json!({
+                        "contract_id": record["contract_id"],
+                        "version": record["version"],
+                        "digest": record["digest"],
+                        "status": record["status"],
+                        "invalidation": record["invalidation"]["message"],
+                    }));
+                }
+                Ok(None) => {
+                    if let Ok((input, digest)) = crate::tasks::load(task) {
+                        governance.task_title = Some(input.title.clone());
+                        if let Ok(plan) = crate::tasks::plan(&input, &digest, &self.checkpoint) {
+                            modules = modules_of(&plan["contract"]);
+                            authorized = plan["status"] == "planned";
                         }
                     }
-                    governance.scope_modules = modules;
+                }
+                Err(error) => {
+                    governance.task_contract =
+                        Some(json!({"status": "unreadable", "error": error}));
                 }
             }
+            let mut scope = BTreeSet::new();
+            let graph = &zones.inventory.graph;
+            for (index, info) in graph.files.iter().enumerate() {
+                if info.module != usize::MAX && modules.contains(&graph.modules[info.module].id) {
+                    scope.insert(snapshot.files[index].path.clone());
+                }
+            }
+            governance.scope_modules = modules;
             // A task that cannot be planned has an empty scope: every write needs approval
             governance.scope = Some(scope);
+            if !authorized {
+                // A vague, unapproved, or invalidated task never yields autonomous authority
+                governance.autonomy = governance.autonomy.min(Autonomy::Assisted);
+            }
         }
         Ok(governance)
     }
@@ -695,6 +737,17 @@ pub(crate) fn context(session: &ContractSession) -> String {
                 .map_or(String::new(), |title| format!(" - {title}"))
         ));
     }
+    if let Some(contract) = &governance.task_contract {
+        out.push_str(&format!(
+            "task contract: {} ({}, {})
+",
+            contract["contract_id"].as_str().unwrap_or("none"),
+            contract["status"].as_str().unwrap_or("unknown"),
+            contract["digest"]
+                .as_str()
+                .map_or(String::new(), |digest| digest.chars().take(19).collect())
+        ));
+    }
     let mode = match activity.state.autonomy {
         Autonomy::Observe => "observe (read-only)",
         Autonomy::Assisted => "assisted (every change needs human approval)",
@@ -764,6 +817,21 @@ pub(crate) fn authorize(
 ) -> Result<Verdict, String> {
     session.lapse_if_idle()?;
     let mut verdict = session.runtime(protected).decide(action);
+    // A session bound to an approved task contract loses its authority once that contract is
+    // superseded, retired, or invalidated: no change may run against an obsolete contract
+    if action.operation != Operation::Read && verdict.decision != Decision::Deny {
+        let bound = &session.governance().task_contract;
+        if let (Some(bound), (_, Some(task), _)) = (bound, session.identity()) {
+            if bound["status"] == "approved" {
+                if let Some(reason) =
+                    crate::task_contracts::obsolete(task, bound["version"].as_u64().unwrap_or(0))
+                {
+                    verdict.decision = Decision::Deny;
+                    verdict.reasons.push(reason);
+                }
+            }
+        }
+    }
     // Only what the agent may do without a human costs risk budget
     let reserve = crate::budget::manage::authorize(session, action, &mut verdict)?;
     let exhausted = verdict.decision == Decision::Deny
@@ -1157,4 +1225,244 @@ pub(crate) fn extend(id: &str, actions: u64, files: u64) -> Result<(), String> {
         "a human granted a new autonomy budget",
     )
     .map(|_| ())
+}
+
+/** How a provider's hook was bound to its Society session
+ * Fields
+    - session: ContractSession - the session
+    - via: &'static str - "CRANE_SESSION" (named explicitly), "task" (the task's approved session),
+      "provider session" (keyed by the provider's own session id), or "transient"
+*/
+pub(crate) struct Binding {
+    pub(crate) session: ContractSession,
+    pub(crate) via: &'static str,
+}
+
+/** Bind a provider event to its Society session, always the same way for the same inputs:
+ * 1. a session named explicitly (CRANE_SESSION) must exist, belong to this agent and the bound
+ *    task, and not have ended; 2. otherwise, with a task, the agent's resumable session of the
+ *    task's current approved contract (the launched one; the provider's own id wins when it names
+ *    one of them, then the newest contract version); 3. otherwise the session keyed by the
+ *    provider's session id, created on first sight; 4. otherwise a transient session
+ * Input
+    - agent: AgentKind - provider profile
+    - explicit: Option<&str> - Society session id named by the human who started the agent
+    - provider_session: Option<&str> - the provider's own session id
+    - options: &SessionOptions - task and creation options
+ * Output
+    - Result<Binding, String>
+    - Error when the named session cannot be used, or a session cannot be established
+*/
+pub(crate) fn bind(
+    agent: AgentKind,
+    explicit: Option<&str>,
+    provider_session: Option<&str>,
+    options: &SessionOptions,
+) -> Result<Binding, String> {
+    if let Some(id) = explicit {
+        let session = ContractSession::load(id)?.ok_or_else(|| {
+            format!("Society session {id} (CRANE_SESSION) does not exist; launch it with 'crane task launch'")
+        })?;
+        let (kind, task, _) = session.identity();
+        if kind != agent {
+            return Err(format!(
+                "Society session {id} belongs to {}, not {}",
+                kind.name(),
+                agent.name()
+            ));
+        }
+        if let Some(wanted) = options.task.as_deref() {
+            if task != Some(wanted) {
+                return Err(format!(
+                    "Society session {id} is bound to task {}, not {wanted}",
+                    task.unwrap_or("none")
+                ));
+            }
+        }
+        if !session.resumable() {
+            return Err(format!(
+                "Society session {id} is {}; it can never act again",
+                session.lifecycle().name()
+            ));
+        }
+        return Ok(Binding {
+            session,
+            via: "CRANE_SESSION",
+        });
+    }
+    if let (Some(task), true) = (options.task.as_deref(), agent != AgentKind::Generic) {
+        let mut launched = Vec::new();
+        for id in session_ids()? {
+            let Ok(Some(session)) = ContractSession::load(&id) else {
+                continue;
+            };
+            let (kind, bound, created) = session.identity();
+            let contract = session.governance().task_contract.clone();
+            let current = contract.as_ref().is_some_and(|contract| {
+                contract["status"] == "approved"
+                    && crate::task_contracts::obsolete(
+                        task,
+                        contract["version"].as_u64().unwrap_or(0),
+                    )
+                    .is_none()
+            });
+            if kind == agent && bound == Some(task) && session.resumable() && current {
+                let version =
+                    contract.map_or(0, |contract| contract["version"].as_u64().unwrap_or(0));
+                let named = provider_session
+                    .is_some_and(|provider| id == format!("{}-{provider}", agent.name()));
+                launched.push((named, version, created, session));
+            }
+        }
+        launched.sort_by_key(|(named, version, created, _)| (*named, *version, *created));
+        if let Some((_, _, _, session)) = launched.pop() {
+            return Ok(Binding {
+                session,
+                via: "task",
+            });
+        }
+    }
+    Ok(match provider_session {
+        Some(id) => Binding {
+            session: establish(agent, id, options)?.0,
+            via: "provider session",
+        },
+        None => Binding {
+            session: transient(agent, options)?,
+            via: "transient",
+        },
+    })
+}
+
+/** Check that the agent works where its session is bound: a reported working directory must lie
+ * inside the session's repository (or isolated worktree), so actions are resolved against the
+ * code the contract and checkpoint describe
+ * Input
+    - session: &ContractSession - bound session
+    - cwd: Option<&str> - the agent's working directory, if reported
+ * Output
+    - Result<(), String>
+*/
+pub(crate) fn check_workspace(session: &ContractSession, cwd: Option<&str>) -> Result<(), String> {
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return Ok(());
+    };
+    let canonical =
+        |path: &std::path::Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let root = canonical(session.root_path());
+    let working = canonical(std::path::Path::new(cwd));
+    if working.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the agent works in {cwd}, outside the repository of session {} ({}); start it in that directory",
+            session.id(),
+            session.root_path().display()
+        ))
+    }
+}
+
+/** Record which provider session drives a Society session, once per provider session id: the
+ * provider, its session id, how it was bound, and the identity facts it reported (a session keyed
+ * by the provider's own session id already holds it in its binding, so nothing is added)
+ * Input
+    - session: &ContractSession - bound session
+    - agent: AgentKind - provider profile
+    - provider_session: Option<&str> - the provider's session id
+    - via: &str - how it was bound
+    - facts: Value - model, cwd, and identity facts
+ * Output
+    - Result<bool, String> whether this attachment is new
+*/
+pub(crate) fn attach(
+    session: &ContractSession,
+    agent: AgentKind,
+    provider_session: Option<&str>,
+    via: &str,
+    facts: Value,
+) -> Result<bool, String> {
+    let Some(provider_session) = provider_session else {
+        return Ok(false);
+    };
+    // The session keyed by this provider session already records it in its binding
+    if session.describe()["provider_session"] == provider_session {
+        return Ok(false);
+    }
+    let known = session.events().iter().any(|event| {
+        event["event"] == "provider_attached" && event["provider_session"] == provider_session
+    });
+    if known {
+        return Ok(false);
+    }
+    let mut event = json!({
+        "event": "provider_attached",
+        "provider": agent.name(),
+        "provider_session": provider_session,
+        "via": via,
+    });
+    if let Some(object) = facts.as_object() {
+        for (key, value) in object {
+            event[key] = value.clone();
+        }
+    }
+    session.record(event)?;
+    Ok(true)
+}
+
+/** Report a session for operators: identity, provider attachments, task contract (and whether it
+ * is still current), checkpoints, repository, lifecycle, autonomy and safety, budget use, and the
+ * last journaled event
+ * Input
+    - session: &ContractSession - session
+ * Output
+    - Value
+*/
+pub(crate) fn status_report(session: &ContractSession) -> Value {
+    let described = session.describe();
+    let activity = session.activity();
+    let events = session.events();
+    let attachments = events
+        .iter()
+        .filter(|event| event["event"] == "provider_attached")
+        .map(|event| json!({"provider": event["provider"], "provider_session": event["provider_session"], "via": event["via"], "model": event["model"], "at": event["at"]}))
+        .collect::<Vec<_>>();
+    let mut contract = described["governance"]["task_contract"].clone();
+    if let (Some(task), true) = (
+        described["task_id"].as_str(),
+        contract["status"] == "approved",
+    ) {
+        let obsolete =
+            crate::task_contracts::obsolete(task, contract["version"].as_u64().unwrap_or(0));
+        contract["current"] = json!(obsolete.is_none());
+        contract["obsolete"] = json!(obsolete);
+    }
+    let checkpoints = described["contracts"]["contracts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| json!({"policy": item["policy_id"], "checkpoint": item["checkpoint"], "sha": item["checkpoint_sha"]}))
+        .collect::<Vec<_>>();
+    json!({
+        "session_id": described["session_id"],
+        "agent": described["agent"],
+        "provider_session": described["provider_session"],
+        "attachments": attachments,
+        "task_id": described["task_id"],
+        "task_contract": contract,
+        "checkpoints": checkpoints,
+        "repository_id": described["repository_id"],
+        "root": described["root"],
+        "binding_digest": described["binding_digest"],
+        "lifecycle": described["lifecycle"],
+        "expires_at": described["expires_at"],
+        "autonomy": activity.state.autonomy.name(),
+        "safety": activity.state.safety.name(),
+        "safety_reason": activity.safety_reason,
+        "budget": {"actions": activity.actions, "max_actions": activity.max_actions, "files": activity.files.len(), "max_files": activity.max_files},
+        "started_at": activity.started_at,
+        "model": activity.model,
+        "lapsed": activity.lapsed,
+        "last_event": events.last().map(|event| json!({"event": event["event"], "at": event["at"], "decision": event["decision"]})),
+        "events": events.len(),
+    })
 }

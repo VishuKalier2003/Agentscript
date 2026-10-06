@@ -700,8 +700,14 @@ fn critical_change_requires_configured_approval() {
     );
     let task: Value =
         serde_json::from_str(&repository.read(".crane/runtime/tasks/PAY-1/state.json")).unwrap();
-    assert_eq!(task["state"], "COMPLETED");
+    // Merged, not completed: the task completes once Jira confirms its completion event
+    assert_eq!(task["state"], "MERGED");
     assert_eq!(task["merge_sha"], sha);
+    assert_eq!(merged["task_completion"]["status"], "pending");
+    assert!(merged["task_completion"]["completion_event"]
+        .as_str()
+        .unwrap()
+        .starts_with("completion-"));
     let jira = repository.outbox("jira");
     assert_eq!(jira.len(), 2);
     assert_eq!(

@@ -9,10 +9,12 @@ mod context;
 mod dashboard;
 mod deliver;
 mod discover;
-mod init;
+mod flow;
+pub(crate) mod init;
 mod parse;
 mod policy;
 mod protect;
+mod repo;
 mod session;
 mod status;
 mod target;
@@ -66,12 +68,24 @@ pub(crate) fn run() -> Result<(), String> {
         "autonomy" => autonomy::run(&rest), // autonomy and safety state machine of sessions
         "session" => session::run(&rest), // evidence: inspect and export a session
         "deliver" => deliver::run(&rest), // branch, checks, pull request, approvals, merge
-        "connect" => dashboard::connect_command(&rest), // connect the repository once
+        "connect" => dashboard::connect_command(&rest), // crane repo connect
+        "repo" => repo::run(&rest), // the repository connection: connect, status, inspect, disconnect
+        "flow" => flow::run(&rest), // the golden path: one lifecycle from connection to completion
         "dashboard" => dashboard::run(&rest), // the semantic control plane and its API
         "packs" => dashboard::packs_command(&rest), // Payments and Testing policy packs
         "agent" => agent::run(&rest), // agent adapters, hooks, and contract sessions
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
     }
+}
+
+/** Validate the installed hooks of an agent provider (used by the golden path)
+ * Input
+    - kind: crate::adapter::AgentKind - claude or codex
+ * Output
+    - Result<serde_json::Value, String> the validation report
+*/
+pub(crate) fn validate_hooks(kind: crate::adapter::AgentKind) -> Result<serde_json::Value, String> {
+    agent::validate(crate::adapter::adapter(kind).as_ref())
 }
 
 /** Initialize Crane on behalf of an agent adapter, by delegating to the init command
@@ -132,6 +146,9 @@ Commands:
   agent init [--profile generic|claude|codex]
   agent verify [--profile generic|claude|codex]
   agent install --profile claude|codex
+  agent uninstall --profile claude|codex
+  agent hooks --profile claude|codex [--json]
+  agent status [--profile claude|codex] [--session ID | --task ID] [--json]
   agent hook --event EVENT [--profile generic|claude|codex] [--ttl SECONDS] [--task ID]
              [--autonomy observe|assisted|delegated|autonomous] [--idle-timeout SECONDS]
              [--max-actions N] [--max-files N]
@@ -146,6 +163,7 @@ Commands:
   context
   status
   discover [--json] [--full] [--policies]
+  policy status [--json]
   policy propose [--name NAME] [--checkpoint NAME] [--min-confidence high|medium|low] [--json]
   policy proposals | show NAME [--json]
   policy edit NAME [--file PATH] [--by NAME]
@@ -162,17 +180,37 @@ Commands:
   autonomy credit SESSION_ID --event task_milestone|human_review|merge --reference REF --approver NAME
   session inspect SESSION_ID [--json] | session inspect --export FILE
   session export SESSION_ID --json [--otlp]
+  deliver merged SESSION_ID --sha MERGE_SHA [--by NAME]
   deliver run|status SESSION_ID [--json]
   deliver approve|reject|request-changes SESSION_ID --approver NAME [--reason TEXT]
   deliver exception SESSION_ID --check NAME --approver NAME --reason TEXT [--expires DURATION]
   deliver merge SESSION_ID [--by NAME]
   deliver slack-action --body FILE --timestamp T --signature S
-  connect [--refresh] [--json]
+  repo connect [--provider github|git|local] [--checkpoint NAME] [--default-branch NAME] [--refresh] [--json]
+  repo status|inspect [--json]
+  repo disconnect [--reason TEXT] [--forget]
+  connect [--refresh] [--json]   (same as repo connect)
   dashboard [serve] [--addr HOST:PORT] [--once]
   dashboard api GET|POST PATH [--body JSON]
   packs [list] | packs show payments|testing [--json] | packs propose payments [--name NAME]
   zones [ZONE_ID] [--json]
+  zones recommend [--by NAME] [--json] | zones recommendations [--json]
+  zones review ID [--claim] [--by NAME] [--json]
+  zones approve ID --approver NAME --confirm DIGEST_PREFIX | zones reject ID --approver NAME [--reason TEXT]
+  zones audit [--json]
+  session run TASK_ID --agent claude|codex|generic [--actions FILE] [--approve] [--autonomy MODE] [--detach] [--json] [-- AGENT_COMMAND...]
+  session finish SESSION_ID [--json] | session lifecycle SESSION_ID [--json]
+  flow [status] [TASK_ID] [--json] | flow advance TASK_ID [--now] [--by NAME] [--json] | flow audit [TASK_ID|repository] [--json]
+  task completions [list | show EVENT_ID | send [--now] [--task ID] | reconcile [--send]] [--json]
+  task list [--json] | task show TASK_ID [--json]
+  task prepare TASK_ID [--checkpoint NAME] [--by NAME] [--json]
+  task approve TASK_ID --approver NAME --confirm DIGEST_PREFIX [--json]
+  task launch TASK_ID --agent claude|codex|generic [--autonomy MODE] [--isolate] [--by NAME] [--json]
   task plan TASK_ID|TASK_FILE [--json] [--checkpoint NAME] [--propose]
+  task contract compile TASK_ID|TASK_FILE [--checkpoint NAME] [--by NAME] [--json]
+  task contract show TASK_ID [--version N] [--json] | task contract list [--json]
+  task contract approve TASK_ID --approver NAME --confirm DIGEST_PREFIX
+  task contract reject TASK_ID --approver NAME [--reason TEXT] | task contract history TASK_ID [--json]
   task ingest --source jira|asana [--delivery ID] [EVENT_FILE...] [--json]
   task sync [TASK_ID] [--json]
   task status [TASK_ID] [--json]
@@ -192,6 +230,13 @@ stop, or session-end; host spellings such as PreToolUse are accepted too. The ho
 read from stdin: Claude Code hook JSON for --profile claude, Codex hook JSON for --profile codex,
 and Crane's neutral action JSON for --profile generic. --ttl only applies when the hook creates
 the session. --task (or CRANE_TASK_ID) binds a task id when the hook creates the session.
+A hook binds its provider event deterministically: to the Society session named by CRANE_SESSION
+(or --crane-session), else to the agent's launched session of the task's current approved contract,
+else to the session keyed by the provider's own session id, else to a transient one; the provider's
+session is recorded as attached, a payload for another event or an agent working outside the
+session's repository is refused, and whenever no Society decision can be obtained the provider gets
+its blocking or deny answer, never an allow. agent hooks validates the installed hooks, agent
+uninstall removes only Crane's, and agent status reports hooks and sessions.
 Sessions also bind an autonomy mode (default delegated), an autonomy budget, an idle timeout
 (default 1800 s), and a lifetime (default 8 hours), plus the zones and the task scope; every
 tool call is judged by the contract, then by zones, mode, scope, budget, and safety state.
@@ -229,6 +274,17 @@ signed Slack actions and never change a policy; exceptions are scoped to one che
 session, and expire. After a verified merge, Crane records the merge commit as a trusted
 checkpoint, completes the task, queues the Jira or Asana completion, and re-finalizes the
 attestation.
+zones recommend runs discovery and turns its signals (payment and security vocabulary, persistence,
+entry points, integrations, shared components, protected regions, the policy packs, and session
+history) into zone recommendations: proposals in .crane/zone-proposals that govern nothing until a
+human approves one (zones approve, quoting its digest), which writes .crane/zones/ZONE.zone;
+zones reject declines it; every decision is in the zone audit log; agents cannot decide either.
+repo connect connects the repository once: it initializes .crane, makes sure the trusted
+checkpoint exists (never moving it), runs discovery, and records identity, provider (github, git,
+or local, read from the origin remote without any network call), owner, name, default branch, and
+the policy and zone versions; connecting again changes nothing (--refresh updates it). repo status
+shows the connection, checkpoint staleness, and discovery freshness; repo inspect adds branches,
+worktrees, capabilities, and history; repo disconnect keeps everything for a later reconnect.
 connect records the repository once (identity, remote, default branch, languages); dashboard
 serves the semantic control plane (Repository, Zones, Contracts, Agent Sessions, Policy
 Simulator, Attestations) on a local address, and dashboard api answers the same API from the
@@ -245,10 +301,33 @@ discover --policies lists heuristic candidates for protection with reason, confi
 rule, and affected entities. policy propose writes them as candidate AgentScript under
 .crane/proposals without activating it; only a human or trusted process can approve (which
 writes .crane/policies/NAME.crane), reject, edit, or regenerate a proposal, never an agent.
+flow is the golden path: one stage for the whole lifecycle (CONNECT_REPOSITORY, DISCOVERING,
+REVIEW_REQUIRED, POLICY_APPROVAL, AGENT_READY, TASK_READY, RUNNING, VERIFYING, DELIVERY_READY, REVIEW,
+MERGING, COMPLETING_TASK, COMPLETED, or a failure branch) derived from the subsystems, every layer from
+the repository to the task completion with the identifiers that link them, audited transitions, and
+flow advance for the steps that need no human decision (deliver, merge once approved, complete Jira).
+session run launches an approved task and drives it through the governed lifecycle (TASK_READY,
+SESSION_CREATED, AGENT_CONNECTED, RUNNING, DEGRADED or QUARANTINED, STOPPING, RECONCILING, VERIFIED,
+DELIVERY_READY, or FAILED): actions come from an action script (executed by Crane where permitted),
+an agent command whose hooks attach with CRANE_SESSION, or a detached agent finished later with
+session finish; termination freezes execution, reconciles the repository, runs the contract tests
+and the repository tests of the testing policy, attests, and only a DELIVERY_READY session can be
+delivered.
+task list shows the tracker tasks (Jira, Asana snapshots in .crane/sources) mapped to the connected
+repository with their state: AVAILABLE, PLANNING, NEEDS_CLARIFICATION, CONTRACT_PENDING_APPROVAL,
+READY, RUNNING, COMPLETED, BLOCKED, or FAILED; task prepare fetches, validates, and compiles the
+task's contract; task approve approves it; task launch starts the session with the chosen agent,
+bound to the task, contract digest, repository, checkpoint, agent, autonomy, budget, zones, and
+policy version (READY TO RUN); launching again reuses it, and an obsolete contract never launches.
 task plan reads .crane/tasks/TASK_ID.json and derives MUST_CHANGE, MUST_NOT_CHANGE, MAY_CHANGE,
 REQUIRES_APPROVAL, TASK_SCOPE, and EXPECTED_TESTS from code references (backticks, Type.method,
 references), or reports task_needs_clarification with what is missing; --propose stores the
-contract as a pending proposal. task ingest replays Jira or Asana webhook deliveries (or stdin)
+contract as a pending proposal. task contract compile turns a task into a versioned contract bound
+to the repository, task, checkpoint SHA, persistent policy version, zone set, autonomy policy,
+budget model, and organization (.crane/task-contracts/TASK/vN.json); a vague task compiles to
+clarification_required and grants nothing; only a human approves it (quoting its digest), and a
+contract whose bindings changed is invalidated. policy status shows which policies are active in
+the organization, repository, and task layers. task ingest replays Jira or Asana webhook deliveries (or stdin)
 through the lifecycle RECEIVED, ANALYZING, CONTRACT_PROPOSED, APPROVED, EXECUTING, VALIDATING,
 PR_READY, REVIEW, MERGED, COMPLETED (or BLOCKED, FAILED, CANCELLED, DEGRADED); task serve accepts
 the same deliveries over HTTP with CRANE_WEBHOOK_TOKEN. Repository mapping and agent assignees

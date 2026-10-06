@@ -51,6 +51,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let inventory = discover(&Options {
         full: args.iter().any(|argument| argument == "--full"),
     })?;
+    // A connected repository remembers its latest discovery
+    crate::repo::note_discovery(&inventory)?;
     if json {
         println!(
             "{}",

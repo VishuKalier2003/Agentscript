@@ -19,7 +19,7 @@ use crate::agent_session::Governance;
 use crate::autonomy::{step, Actor, State, Trigger};
 use crate::budget::manage::operations;
 use crate::budget::BudgetState;
-use crate::repository::{git, root};
+use crate::repository::root;
 use crate::util::{io_error, sha256};
 use crate::zones::model::SafetyState;
 
@@ -108,8 +108,9 @@ pub(crate) fn verify_chain(events: &[Value]) -> Value {
     json!({"status": status, "length": events.len(), "head": (chained > 0).then_some(previous), "problem": Value::Null})
 }
 
-/** Load the organization and team from .crane/organization.json; without it, the organization is
- * the owner in the origin remote's URL and the team is unspecified
+/** Load the organization and team from .crane/organization.json (its policies list, the
+ * organization's own policies, is read by the policy activation state); without it, the
+ * organization is the owner in the origin remote's URL and the team is unspecified
  * Input
     - None
  * Output
@@ -126,9 +127,9 @@ pub(crate) fn load_organization() -> Result<Value, String> {
                 .ok_or_else(|| format!(".crane/{ORGANIZATION_FILE} must be a JSON object"))?;
             if let Some(unknown) = map
                 .keys()
-                .find(|key| !["organization", "team"].contains(&key.as_str()))
+                .find(|key| !["organization", "team", "policies"].contains(&key.as_str()))
             {
-                return Err(format!(".crane/{ORGANIZATION_FILE} has unknown setting '{unknown}'; expected organization, team"));
+                return Err(format!(".crane/{ORGANIZATION_FILE} has unknown setting '{unknown}'; expected organization, team, policies"));
             }
             let text = |key: &str| {
                 map.get(key)
@@ -139,15 +140,8 @@ pub(crate) fn load_organization() -> Result<Value, String> {
             Ok(json!({"organization": text("organization"), "team": text("team")}))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            let owner = git(&["remote", "get-url", "origin"]).ok().and_then(|url| {
-                let path = url.trim().trim_end_matches(".git").replace(':', "/");
-                let parts = path
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>();
-                (parts.len() >= 2).then(|| parts[parts.len() - 2].to_string())
-            });
-            Ok(json!({"organization": owner, "team": Value::Null}))
+            // The connected repository's owner (or the origin remote's) names the organization
+            Ok(json!({"organization": crate::repo::owner_and_name().0, "team": Value::Null}))
         }
         Err(error) => Err(io_error(error)),
     }

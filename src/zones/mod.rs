@@ -3,7 +3,9 @@
 // authorization that can only restrict; they never grant anything and never relax a contract.
 
 pub(crate) mod model;
+pub(crate) mod recommend;
 pub(crate) mod resolve;
+pub(crate) mod review;
 
 #[cfg(test)]
 mod tests;

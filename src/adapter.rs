@@ -168,6 +168,10 @@ impl HookEvent {
     - model: Option<String> - model the agent host reported, if any
     - source: Option<String> - why the session started (startup, resume, clear, compact), if
       reported
+    - event_name: Option<String> - the event the payload says it is (hook_event_name), if any
+    - cwd: Option<String> - the directory the agent works in, if reported
+    - identity: Value - other provider facts worth recording (transcript_path, permission_mode,
+      turn_id, tool_use_id), never used for decisions
 */
 pub(crate) struct ProviderEvent {
     pub(crate) session: Option<String>,
@@ -175,6 +179,60 @@ pub(crate) struct ProviderEvent {
     pub(crate) stop_hook_active: bool,
     pub(crate) model: Option<String>,
     pub(crate) source: Option<String>,
+    pub(crate) event_name: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) identity: Value,
+}
+
+/** Build a provider event from the fields Claude Code and Codex hook payloads share (session_id,
+ * stop_hook_active, model, source, hook_event_name, cwd, and identity facts) and a translated action
+ * Input
+    - payload: &Value - hook JSON
+    - action: Option<AgentAction> - the translated tool call, if the event has one
+ * Output
+    - ProviderEvent
+*/
+fn provider_event(payload: &Value, action: Option<AgentAction>) -> ProviderEvent {
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).map(String::from);
+    let mut identity = json!({});
+    for key in [
+        "transcript_path",
+        "permission_mode",
+        "turn_id",
+        "tool_use_id",
+    ] {
+        if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+            identity[key] = value.clone();
+        }
+    }
+    ProviderEvent {
+        session: text("session_id"),
+        action,
+        stop_hook_active: payload
+            .get("stop_hook_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        model: text("model"),
+        source: text("source"),
+        event_name: text("hook_event_name"),
+        cwd: text("cwd"),
+        identity,
+    }
+}
+
+/** Where a provider keeps its hook configuration and which events Crane registers there
+ * Fields
+    - file: &'static str - repository-relative configuration file
+    - events: &'static [(HookEvent, bool)] - registered events, and whether each needs a tool
+      matcher
+    - deny: &'static [&'static str] - provider permission rules Crane adds (Claude Code's deny list)
+    - timeout: u64 - seconds the provider waits for a hook before treating it as failed
+*/
+pub(crate) struct HookConfig {
+    pub(crate) file: &'static str,
+    pub(crate) events: &'static [(HookEvent, bool)],
+    pub(crate) deny: &'static [&'static str],
+    pub(crate) timeout: u64,
 }
 
 /** Common interface for agent integrations: an adapter only translates its provider's hook
@@ -270,6 +328,67 @@ pub(crate) trait AgentAdapter {
             Assessment::Block => Err("HOOK_BLOCK:one or more Crane policies failed".into()),
             _ => Ok(()),
         }
+    }
+
+    /** Answer an event whose Society decision or verification could not be obtained: never as an
+     * allow or a clean result; tool calls are blocked, an executed tool call and a stop are
+     * reported as unverified (a stop is held once, then let through so the agent cannot loop),
+     * and other events report the problem
+     * Input
+        - event: HookEvent - lifecycle event
+        - error: &str - why no decision could be obtained
+        - stop_hook_active: bool - the agent is already continuing after a held stop
+     * Output
+        - Result<(), String>
+        - HOOK_BLOCK error when the provider must block
+    */
+    fn respond_failure(
+        &self,
+        event: HookEvent,
+        error: &str,
+        stop_hook_active: bool,
+    ) -> Result<(), String> {
+        let error = error.strip_prefix("HOOK_BLOCK:").unwrap_or(error);
+        match event {
+            HookEvent::PreToolUse | HookEvent::PermissionRequest => Err(format!(
+                "HOOK_BLOCK:Crane could not authorize this tool call: {error}"
+            )),
+            HookEvent::PostToolUse => Err(format!(
+                "HOOK_BLOCK:Crane could not verify this tool call, so it is not known to be compliant: {error}"
+            )),
+            HookEvent::Stop if !stop_hook_active => Err(format!(
+                "HOOK_BLOCK:Crane could not reconcile the session, so the work is not verified: {error}"
+            )),
+            HookEvent::SessionStart => Err(format!("Crane could not start the session: {error}")),
+            _ => {
+                eprintln!("Crane: {error}");
+                Ok(())
+            }
+        }
+    }
+
+    /** Describe the provider's hook configuration, None for providers Crane cannot install into
+     * Input
+        - None (uses self)
+     * Output
+        - Option<HookConfig>
+    */
+    fn hook_config(&self) -> Option<HookConfig> {
+        None
+    }
+
+    /** Return the command a provider's configuration runs for an event
+     * Input
+        - event: HookEvent - lifecycle event
+     * Output
+        - String
+    */
+    fn hook_command(&self, event: HookEvent) -> String {
+        format!(
+            "crane agent hook --event {} --profile {}",
+            event.name(),
+            self.kind().name()
+        )
     }
 
     /** Initialize an agent integration, by first creating the .crane repository structure and then
@@ -386,25 +505,36 @@ impl AgentAdapter for ClaudeAdapter {
         - ProviderEvent
     */
     fn translate(&self, event: HookEvent, payload: &Value) -> ProviderEvent {
-        ProviderEvent {
-            session: payload
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(String::from),
-            action: event.has_action().then(|| claude_action(payload)),
-            stop_hook_active: payload
-                .get("stop_hook_active")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            model: payload
-                .get("model")
-                .and_then(Value::as_str)
-                .map(String::from),
-            source: payload
-                .get("source")
-                .and_then(Value::as_str)
-                .map(String::from),
-        }
+        provider_event(payload, event.has_action().then(|| claude_action(payload)))
+    }
+
+    /** Describe Claude Code's project-local hook configuration: .claude/settings.local.json with
+     * the lifecycle events, a tool matcher on tool events, the deny rules protecting Crane's
+     * files, and a timeout longer than any authorization takes (a timed-out hook is treated by
+     * Claude Code as a non-blocking error)
+     * Input
+        - None (uses self)
+     * Output
+        - Option<HookConfig>
+    */
+    fn hook_config(&self) -> Option<HookConfig> {
+        Some(HookConfig {
+            file: ".claude/settings.local.json",
+            events: &[
+                (HookEvent::SessionStart, false),
+                (HookEvent::UserPromptSubmit, false),
+                (HookEvent::PreToolUse, true),
+                (HookEvent::PostToolUse, true),
+                (HookEvent::Stop, false),
+                (HookEvent::SessionEnd, false),
+            ],
+            deny: &[
+                "Edit(./.crane/**)",
+                "Edit(./.claude/settings.json)",
+                "Edit(./.claude/settings.local.json)",
+            ],
+            timeout: 120,
+        })
     }
 
     /** Answer PreToolUse the Claude Code way: exit code 2 with the reason on stderr to deny,
@@ -502,25 +632,91 @@ impl AgentAdapter for CodexAdapter {
         - ProviderEvent
     */
     fn translate(&self, event: HookEvent, payload: &Value) -> ProviderEvent {
-        ProviderEvent {
-            session: payload
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(String::from),
-            action: event.has_action().then(|| codex_action(payload)),
-            stop_hook_active: payload
-                .get("stop_hook_active")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            model: payload
-                .get("model")
-                .and_then(Value::as_str)
-                .map(String::from),
-            source: payload
-                .get("source")
-                .and_then(Value::as_str)
-                .map(String::from),
-        }
+        provider_event(payload, event.has_action().then(|| codex_action(payload)))
+    }
+
+    /** Describe Codex's project hook configuration: .codex/hooks.json with the lifecycle events
+     * (PermissionRequest included), a tool matcher on tool events, and a timeout
+     * Input
+        - None (uses self)
+     * Output
+        - Option<HookConfig>
+    */
+    fn hook_config(&self) -> Option<HookConfig> {
+        Some(HookConfig {
+            file: ".codex/hooks.json",
+            events: &[
+                (HookEvent::SessionStart, false),
+                (HookEvent::UserPromptSubmit, false),
+                (HookEvent::PreToolUse, true),
+                (HookEvent::PermissionRequest, true),
+                (HookEvent::PostToolUse, true),
+                (HookEvent::Stop, false),
+                (HookEvent::SessionEnd, false),
+            ],
+            deny: &[],
+            timeout: 120,
+        })
+    }
+
+    /** Return the command Codex runs for an event (Codex spells events as PreToolUse)
+     * Input
+        - event: HookEvent - lifecycle event
+     * Output
+        - String
+    */
+    fn hook_command(&self, event: HookEvent) -> String {
+        format!(
+            "crane agent hook --event {} --profile codex",
+            event.host_name()
+        )
+    }
+
+    /** Answer an event without a Society decision the Codex way: PreToolUse blocks with exit code
+     * 2, PermissionRequest answers with a deny decision (Codex never approves on its own after a
+     * failed hook, and Crane must not let it), PostToolUse and a first Stop return decision
+     * "block" with the reason, anything else a systemMessage
+     * Input
+        - event: HookEvent - lifecycle event
+        - error: &str - why no decision could be obtained
+        - stop_hook_active: bool - the agent is already continuing after a held stop
+     * Output
+        - Result<(), String>
+    */
+    fn respond_failure(
+        &self,
+        event: HookEvent,
+        error: &str,
+        stop_hook_active: bool,
+    ) -> Result<(), String> {
+        let error = error.strip_prefix("HOOK_BLOCK:").unwrap_or(error);
+        let output = match event {
+            HookEvent::PreToolUse => {
+                return Err(format!(
+                    "HOOK_BLOCK:Crane could not authorize this tool call: {error}"
+                ))
+            }
+            HookEvent::PermissionRequest => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "deny", "message": format!("Crane could not authorize this tool call: {error}")},
+                },
+            }),
+            HookEvent::PostToolUse => json!({
+                "decision": "block",
+                "reason": format!("Crane could not verify this tool call, so it is not known to be compliant: {error}"),
+            }),
+            HookEvent::SessionStart => {
+                return Err(format!("Crane could not start the session: {error}"))
+            }
+            HookEvent::Stop if !stop_hook_active => json!({
+                "decision": "block",
+                "reason": format!("Crane could not reconcile the session, so the work is not verified: {error}"),
+            }),
+            _ => json!({"systemMessage": format!("Crane: {error}")}),
+        };
+        println!("{output}");
+        Ok(())
     }
 
     /** Answer PreToolUse the Codex way: allow by printing nothing; deny with exit code 2 and the
@@ -754,28 +950,14 @@ fn neutral_event(event: HookEvent, payload: &Value) -> ProviderEvent {
             digest: sha256(payload.to_string().as_bytes()),
         }
     });
-    ProviderEvent {
-        session: text(payload, "session_id"),
-        action,
-        stop_hook_active: payload
-            .get("stop_hook_active")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        model: payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(String::from),
-        source: payload
-            .get("source")
-            .and_then(Value::as_str)
-            .map(String::from),
-    }
+    provider_event(payload, action)
 }
 
-/** Map a Codex tool call to a neutral action: apply_patch to write with the files its patch
- * changes (a patch that cannot be parsed becomes a write with no known files, which the decision
- * engine denies); Bash to execute; update_plan to read; and any other tool (MCP servers, other
- * local functions) to other
+/** Map a Codex tool call to a neutral action: apply_patch (and apply_patch run through the shell)
+ * to write with the files its patch changes (a patch that cannot be parsed becomes a write with no
+ * known files, which the decision engine denies); Bash and Codex's shell tools to execute, with an
+ * argument vector joined or its shell script taken; update_plan and Codex's read-only tools to
+ * read; and any other tool (MCP servers, other local functions) to other
  * Input
     - payload: &Value - Codex PreToolUse, PostToolUse, or PermissionRequest JSON
  * Output
@@ -788,8 +970,27 @@ fn codex_action(payload: &Value) -> AgentAction {
         .unwrap_or_default()
         .to_string();
     let input = payload.get("tool_input").unwrap_or(&Value::Null);
-    let command = input.get("command").and_then(Value::as_str);
-    let cwd = payload.get("cwd").and_then(Value::as_str);
+    // Codex sends a shell command as a string or as an argument vector (["bash", "-lc", SCRIPT])
+    let joined = match input.get("command") {
+        Some(Value::Array(parts)) => {
+            let parts = parts.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+            match parts.as_slice() {
+                [shell, flag, script] if shell.ends_with("sh") && flag.starts_with('-') => {
+                    Some(script.to_string())
+                }
+                _ => Some(parts.join(" ")),
+            }
+        }
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => ["patch", "input", "cmd"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str).map(String::from)),
+    };
+    let command = joined.as_deref();
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| input.get("workdir").and_then(Value::as_str));
     let mut action = AgentAction {
         tool: tool.clone(),
         operation: Operation::Other,
@@ -798,6 +999,14 @@ fn codex_action(payload: &Value) -> AgentAction {
         arguments: Vec::new(),
         digest: sha256(input.to_string().as_bytes()),
     };
+    // A patch applied through the shell (apply_patch <<'EOF' ... EOF) is the same write
+    let shell_patch = command
+        .filter(|command| command.trim_start().starts_with("apply_patch"))
+        .and_then(|command| {
+            let start = command.find("*** Begin Patch")?;
+            let end = command.find("*** End Patch")? + "*** End Patch".len();
+            Some(command[start..end].to_string())
+        });
     match tool.as_str() {
         "apply_patch" => {
             action.operation = Operation::Write;
@@ -805,11 +1014,21 @@ fn codex_action(payload: &Value) -> AgentAction {
                 .and_then(|patch| parse_patch(patch, cwd))
                 .unwrap_or_default();
         }
-        "Bash" => {
+        "Bash" | "shell" | "local_shell" | "exec_command" | "container.exec" | "unified_exec"
+            if shell_patch.is_some() =>
+        {
+            action.operation = Operation::Write;
+            action.files = shell_patch
+                .and_then(|patch| parse_patch(&patch, cwd))
+                .unwrap_or_default();
+        }
+        "Bash" | "shell" | "local_shell" | "exec_command" | "container.exec" | "unified_exec" => {
             action.operation = Operation::Execute;
             action.command = command.map(String::from);
         }
-        "update_plan" => action.operation = Operation::Read,
+        "update_plan" | "read_file" | "list_dir" | "grep_files" | "view_image" | "web_search" => {
+            action.operation = Operation::Read
+        }
         _ => action.arguments = strings(input),
     }
     action

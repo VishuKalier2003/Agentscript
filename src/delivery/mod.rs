@@ -27,6 +27,7 @@ use crate::autonomy::manage::apply;
 use crate::autonomy::{Actor, Trigger, SELF_ESCALATION};
 use crate::evidence::{attest, link, GENESIS};
 use crate::proposals::store::agent_environment;
+use crate::repo::providers::{named, PullRequest};
 use crate::repository::root;
 use crate::session::{ContractSession, Lifecycle};
 use crate::util::{io_error, now_unix, sha256};
@@ -128,7 +129,7 @@ fn record(id: &str, mut event: Value) -> Result<Value, String> {
     - Value
 */
 pub(crate) fn state(events: &[Value]) -> Value {
-    let mut state = json!({"rounds": 0, "approvals": [], "blocks": [], "exceptions": [], "unauthorized": [], "merged": null, "task_completion": null, "pull_request": null});
+    let mut state = json!({"rounds": 0, "approvals": [], "blocks": [], "exceptions": [], "unauthorized": [], "merge_failures": [], "merged": null, "task_completion": null, "pull_request": null});
     for event in events {
         let entry = |event: &Value| {
             let mut entry = event.clone();
@@ -157,6 +158,12 @@ pub(crate) fn state(events: &[Value]) -> Value {
                     "contract_version",
                     "contract_tests",
                     "checks",
+                    "tree",
+                    "binding",
+                    "binding_digest",
+                    "verification",
+                    "task_contract",
+                    "checkpoint",
                 ] {
                     state[key] = event[key].clone();
                 }
@@ -180,7 +187,12 @@ pub(crate) fn state(events: &[Value]) -> Value {
                 .unwrap()
                 .push(entry(event)),
             Some("merged") => state["merged"] = entry(event),
-            Some("task_completed") => state["task_completion"] = entry(event),
+            Some("merge_failed") => state["merge_failures"]
+                .as_array_mut()
+                .unwrap()
+                .push(entry(event)),
+            Some("task_completion_queued") => state["task_completion"] = entry(event),
+            Some("task_completed") => state["task_confirmed"] = entry(event),
             Some("attestation_finalized") => state["attestation_digest"] = event["digest"].clone(),
             _ => {}
         }
@@ -191,14 +203,32 @@ pub(crate) fn state(events: &[Value]) -> Value {
     state
 }
 
-/** Gather the facts merge eligibility needs from a delivery's state
+/** Check whether a recorded decision is about the delivery's current round: the same binding
+ * (commit, checks, contract, attestation), or for decisions recorded before bindings, the same
+ * commit
+ * Input
+    - decision: &Value - approval, rejection, or change request
+    - state: &Value - delivery state
+ * Output
+    - bool
+*/
+fn current_round(decision: &Value, state: &Value) -> bool {
+    match decision["binding"].as_str() {
+        Some(binding) => state["binding_digest"] == binding,
+        None => decision["head"] == state["head"],
+    }
+}
+
+/** Gather the facts merge eligibility needs from a delivery's state: approvals and blocks count
+ * only for the current round (binding-bound), and approvals only within the configured lifetime
  * Input
     - state: &Value - delivery state
     - now: u64 - Unix seconds
+    - approval_ttl: Option<u64> - seconds an approval counts
  * Output
     - Result<Facts, String>
 */
-fn facts(state: &Value, now: u64) -> Result<Facts, String> {
+fn facts(state: &Value, now: u64, approval_ttl: Option<u64>) -> Result<Facts, String> {
     let branch_head = state["branch"].as_str().and_then(|branch| {
         git_in(
             &root_directory().ok()?,
@@ -207,6 +237,10 @@ fn facts(state: &Value, now: u64) -> Result<Facts, String> {
         .ok()
     });
     let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let head = text(&state["head"]);
+    let fresh = |approval: &Value| {
+        approval_ttl.is_none_or(|ttl| approval["at"].as_u64().unwrap_or(0) + ttl > now)
+    };
     Ok(Facts {
         session: text(&state["session"]),
         decision: text(&state["decision"]),
@@ -220,25 +254,21 @@ fn facts(state: &Value, now: u64) -> Result<Facts, String> {
             .flatten()
             .map(|check| (text(&check["name"]), text(&check["status"])))
             .collect(),
-        head: text(&state["head"]),
+        head: head.clone(),
         branch_head,
         approvals: state["approvals"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|approval| (text(&approval["by"]), text(&approval["head"])))
+            .filter(|approval| current_round(approval, state) && fresh(approval))
+            .map(|approval| (text(&approval["by"]), head.clone()))
             .collect(),
         blocks: state["blocks"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|block| {
-                (
-                    text(&block["kind"]),
-                    text(&block["by"]),
-                    text(&block["head"]),
-                )
-            })
+            .filter(|block| current_round(block, state))
+            .map(|block| (text(&block["kind"]), text(&block["by"]), head.clone()))
             .collect(),
         exceptions: state["exceptions"]
             .as_array()
@@ -314,7 +344,7 @@ fn session(id: &str) -> Result<ContractSession, String> {
  * Output
     - Result<String, String> the outbox file name
 */
-fn outbox(channel: &str, delivery: &str, request: Value) -> Result<String, String> {
+pub(crate) fn outbox(channel: &str, delivery: &str, request: Value) -> Result<String, String> {
     let directory = root()?.join("runtime").join("delivery").join("outbox");
     fs::create_dir_all(&directory).map_err(io_error)?;
     let number = fs::read_dir(&directory).map_err(io_error)?.count() + 1;
@@ -416,11 +446,13 @@ fn tell(config: &DeliveryConfig, id: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/** Render the pull request body: the task, the contract and its tests, the checks, the
- * attestation, and the merge policy that applies
+/** Render the pull request body: the delivery binding (repository, task, contract digest,
+ * checkpoint, checked commit and tree, checks, attestation), the affected zones, the contract and
+ * its tests, the validation results, the attestation, the autonomy mode, the exceptions, and the
+ * merge policy that applies
  * Input
     - session: &ContractSession - session
-    - round: &Value - the submitted round
+    - round: &Value - the delivery state with the submitted round
     - attestation: &Value - the session attestation
     - eligibility: &Value - merge evaluation
  * Output
@@ -432,10 +464,33 @@ fn body(
     attestation: &Value,
     eligibility: &Value,
 ) -> String {
+    let binding = &round["binding"];
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .map_or_else(|| "none".to_string(), String::from)
+    };
     let mut out = format!(
-        "Delivered by Crane from contract session `{}`{}.\n\n## Contract\n\nContract version `{}`\n\n",
+        "Delivered by Crane from contract session `{}`{}.\n\n## Delivery binding\n\nThis pull request is bound to exactly the repository state Crane checked:\n\n| | |\n|---|---|\n| repository | {} (`{}`) |\n| task | {} |\n| task contract | {} `{}` |\n| checkpoint | {} `{}` |\n| checked commit | `{}` (tree `{}`) |\n| checks digest | `{}` |\n| attestation | `{}` |\n| verified by | {} |\n| **binding digest** | `{}` |\n\nApprovals count only for this binding; any new commit or check result needs new approvals.\n\n## Contract\n\nContract version `{}`\n\n",
         session.id(),
         round["task"].as_str().map_or(String::new(), |task| format!(" for task {task}")),
+        match (binding["repository"]["owner"].as_str(), binding["repository"]["name"].as_str()) {
+            (Some(owner), Some(name)) => format!("{owner}/{name}"),
+            (_, Some(name)) => name.to_string(),
+            _ => "this repository".to_string(),
+        },
+        text(&binding["repository"]["identity"]),
+        text(&round["task"]),
+        text(&binding["contract_id"]),
+        text(&binding["contract_digest"]),
+        text(&binding["checkpoint"]["name"]),
+        text(&binding["checkpoint"]["sha"]),
+        text(&round["head"]),
+        text(&round["tree"]),
+        text(&binding["checks_digest"]),
+        text(&round["attestation_digest"]),
+        text(&round["verification"]["by"]),
+        text(&round["binding_digest"]),
         session.contracts().version
     );
     for (_, contract, clause) in session.contracts().clauses() {
@@ -449,8 +504,16 @@ fn body(
             contract.checkpoint
         ));
     }
+    let zones = round["zones"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
     out.push_str(&format!(
-        "\n## Contract tests\n\n{} passed, {} failed, {} not applicable (decided by Crane, never by test files)\n\n## Checks\n\n",
+        "\n## Affected zones\n\n{} (change criticality {})\n\n## Validation\n\nContract tests: {} passed, {} failed, {} not applicable (decided by Crane, never by test files)\n\n",
+        if zones.is_empty() { "none".to_string() } else { zones.join(", ") },
+        round["criticality"].as_str().unwrap_or_default(),
         round["contract_tests"]["passed"], round["contract_tests"]["failed"], round["contract_tests"]["not_applicable"]
     ));
     for check in round["checks"].as_array().into_iter().flatten() {
@@ -462,19 +525,55 @@ fn body(
         ));
     }
     out.push_str(&format!(
-        "\n## Attestation\n\n- digest `{}`\n- final decision {}\n- {} actions authorized, {} denied, {} violations, {} repairs\n- change criticality {} by a {} session\n\n## Merge policy\n\nRule `{}`: {} approval(s){}{}.\n",
+        "\n## Attestation\n\n- digest `{}`\n- final decision {}\n- {} actions authorized, {} denied, {} violations, {} repairs\n- autonomy mode **{}**, safety {}\n\n## Exceptions\n\n",
         attestation["attestation_digest"].as_str().unwrap_or_default(),
         attestation["final_decision"]["decision"].as_str().unwrap_or_default(),
         attestation["action_summary"]["authorizations"],
         attestation["denied_actions"].as_array().map_or(0, Vec::len),
         attestation["violations"].as_array().map_or(0, Vec::len),
         attestation["repairs"].as_array().map_or(0, Vec::len),
-        round["criticality"].as_str().unwrap_or_default(),
         round["autonomy"].as_str().unwrap_or_default(),
+        round["safety"].as_str().unwrap_or_default(),
+    ));
+    let exceptions = round["exceptions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|exception| exception["head"] == round["head"])
+        .collect::<Vec<_>>();
+    if exceptions.is_empty() {
+        out.push_str("None.\n");
+    }
+    for exception in exceptions {
+        out.push_str(&format!(
+            "- `{}`: check {} excepted by {} until {} ({})\n",
+            text(&exception["id"]),
+            text(&exception["check"]),
+            text(&exception["by"]),
+            exception["expires_at"],
+            text(&exception["reason"])
+        ));
+    }
+    out.push_str(&format!(
+        "\n## Merge policy\n\nRule `{}`: {} approval(s){}{}.\n",
         eligibility["rule"]["name"].as_str().unwrap_or_default(),
         eligibility["approvals"]["required"],
-        eligibility["rule"]["approvers"].as_array().filter(|approvers| !approvers.is_empty()).map_or(String::new(), |approvers| format!(" from {}", approvers.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))),
-        if eligibility["rule"]["auto_merge"] == true { ", merged automatically once eligible" } else { "" },
+        eligibility["rule"]["approvers"]
+            .as_array()
+            .filter(|approvers| !approvers.is_empty())
+            .map_or(String::new(), |approvers| format!(
+                " from {}",
+                approvers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        if eligibility["rule"]["auto_merge"] == true {
+            ", merged automatically once eligible"
+        } else {
+            ""
+        },
     ));
     out
 }
@@ -487,6 +586,8 @@ fn body(
     - session: &ContractSession - session
     - config: &DeliveryConfig - configuration
     - files: &[String] - files the session changed
+    - trailers: &str - commit trailers binding the commit to its session, task, contract, and
+      attestation
  * Output
     - Result<(PathBuf, String, String, bool), String> working directory, branch, base, and
       whether the base must be checked out again afterwards
@@ -495,12 +596,18 @@ fn prepare_branch(
     session: &ContractSession,
     config: &DeliveryConfig,
     files: &[String],
+    trailers: &str,
 ) -> Result<(PathBuf, String, String, bool), String> {
     let repository = root_directory()?;
     let current = git_in(&repository, &["branch", "--show-current"])?;
+    // The configured base, else the connected repository's default branch, else the checkout
     let base = config
         .base_branch
         .clone()
+        .or_else(|| {
+            crate::repo::connected()
+                .and_then(|record| record["default_branch"].as_str().map(String::from))
+        })
         .unwrap_or_else(|| current.clone());
     let (directory, branch, restore) = match crate::effects::workspace_of(session) {
         Some(worktree) => {
@@ -540,7 +647,7 @@ fn prepare_branch(
     let staged = git_in(&directory, &["diff", "--cached", "--name-only"])?;
     if !staged.is_empty() {
         let message = format!(
-            "{}{}\n\nDelivered by Crane from contract session {} (contract {}).",
+            "{}{}\n\nDelivered by Crane from contract session {} (contract {}).\n\n{trailers}",
             session
                 .identity()
                 .1
@@ -558,8 +665,9 @@ fn prepare_branch(
     Ok((directory, branch, base, restore))
 }
 
-/** Open or update the pull request: the local provider keeps the record and body in the delivery
- * directory and merges with git; the github provider pushes the branch and uses the gh CLI
+/** Open or update the pull request through the repository provider abstraction (the local
+ * provider keeps a record and merges with git; GitHub pushes and uses its CLI); the body is kept
+ * in the delivery directory
  * Input
     - config: &DeliveryConfig - configuration
     - id: &str - delivery id
@@ -581,106 +689,40 @@ fn open_pull_request(
     let existing = &state["pull_request"];
     let branch = state["branch"].as_str().unwrap_or_default();
     let base = state["base"].as_str().unwrap_or_default();
-    let (number, url) = match config.provider.as_str() {
-        "github" => {
-            let repository = root_directory()?;
-            git_in(&repository, &["push", "-u", "origin", branch])?;
-            let path = file.to_string_lossy().to_string();
-            if let Some(number) = existing["number"].as_u64() {
-                gh(&[
-                    "pr",
-                    "edit",
-                    &number.to_string(),
-                    "--title",
-                    title,
-                    "--body-file",
-                    &path,
-                ])?;
-                (
-                    number,
-                    existing["url"].as_str().unwrap_or_default().to_string(),
-                )
-            } else {
-                let url = gh(&[
-                    "pr",
-                    "create",
-                    "--base",
-                    base,
-                    "--head",
-                    branch,
-                    "--title",
-                    title,
-                    "--body-file",
-                    &path,
-                ])?;
-                let number = url
-                    .rsplit('/')
-                    .next()
-                    .and_then(|number| number.trim().parse::<u64>().ok())
-                    .ok_or_else(|| format!("gh did not return a pull request URL: {url}"))?;
-                (number, url.trim().to_string())
-            }
-        }
-        _ => {
-            let number = match existing["number"].as_u64() {
-                Some(number) => number,
-                None => {
-                    // Local numbers count the deliveries that opened a pull request
-                    let deliveries = root()?.join("runtime").join("delivery");
-                    fs::read_dir(&deliveries)
-                        .map_err(io_error)?
-                        .filter_map(|entry| entry.ok())
-                        .filter(|entry| entry.path().join("pull_request.md").exists())
-                        .count() as u64
-                }
-            };
-            let fallback = format!("local://{}/pull/{number}", branch);
-            (
-                number,
-                config
-                    .pr_url_template
-                    .as_ref()
-                    .map_or(fallback, |template| {
-                        template
-                            .replace("{number}", &number.to_string())
-                            .replace("{branch}", branch)
-                    }),
-            )
-        }
-    };
+    let provider = named(&config.provider)
+        .ok_or_else(|| format!("unknown delivery provider '{}'", config.provider))?;
+    // Local numbers count the deliveries that opened a pull request
+    let local_number = fs::read_dir(root()?.join("runtime").join("delivery"))
+        .map_err(io_error)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join("pull_request.md").exists())
+        .count() as u64;
+    let repository = root_directory()?;
+    let (number, url) = provider.open_pull_request(&PullRequest {
+        repository: &repository,
+        branch,
+        base,
+        head: state["head"].as_str().unwrap_or_default(),
+        title,
+        body_file: &file,
+        number: existing["number"].as_u64(),
+        url: existing["url"].as_str(),
+        local_number,
+        url_template: config.pr_url_template.as_deref(),
+        cli: &config.github_cli,
+    })?;
     Ok(json!({
         "action": if existing.is_null() { "opened" } else { "updated" },
-        "provider": config.provider,
+        "provider": provider.name(),
         "number": number,
         "url": url,
         "title": title,
         "branch": branch,
         "base": base,
+        "head": state["head"],
+        "binding_digest": state["binding_digest"],
         "body_digest": sha256(text.as_bytes()),
     }))
-}
-
-/** Run the gh CLI
- * Input
-    - args: &[&str] - arguments
- * Output
-    - Result<String, String> stdout
-*/
-fn gh(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(args)
-        .current_dir(root_directory()?)
-        .output()
-        .map_err(|error| format!("gh: {error} (the github provider needs the GitHub CLI)"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(format!(
-            "gh {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
 }
 
 /** Deliver a session: require its reconciliation (finalizing it when needed, which runs the
@@ -696,6 +738,15 @@ fn gh(args: &[&str]) -> Result<String, String> {
 pub(crate) fn run(id: &str) -> Result<Value, String> {
     let session = session(id)?;
     refuse_agents(Some(&session), "run")?;
+    if !state(&journal(id)?)["merged"].is_null() {
+        return Err(format!(
+            "delivery {id} is already merged; nothing to deliver"
+        ));
+    }
+    // Only a verified session is delivered: a governed one once the orchestrator verified it, any
+    // other once its finalization reconciled to PASS (checked below)
+    crate::session_orchestrator::delivery_allowed(id)?;
+    let governed = crate::session_orchestrator::load(id)?;
     let config = policy::load()?;
     if session.lifecycle() != Lifecycle::Finalized {
         crate::agent_session::finalize(id)?;
@@ -738,8 +789,18 @@ pub(crate) fn run(id: &str) -> Result<Value, String> {
         .filter_map(|file| governance.constraint(file))
         .flat_map(|constraint| constraint.zones)
         .collect::<BTreeSet<_>>();
-    let (workdir, branch, base, restore) = prepare_branch(&session, &config, &files)?;
+    let task_contract = governance.task_contract.clone().unwrap_or(Value::Null);
+    let trailers = format!(
+        "Crane-Session: {id}\nCrane-Task: {}\nCrane-Contract-Digest: {}\nCrane-Attestation: {}",
+        session.identity().1.unwrap_or("none"),
+        task_contract["digest"].as_str().unwrap_or("none"),
+        attestation["attestation_digest"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    let (workdir, branch, base, restore) = prepare_branch(&session, &config, &files, &trailers)?;
     let head = git_in(&workdir, &["rev-parse", "HEAD"])?;
+    let tree = git_in(&workdir, &["rev-parse", "HEAD^{tree}"])?;
     // Final contract tests, repository tests, and checks, all on the delivery branch
     let results = crate::effects::within(&workdir, || {
         let repository = crate::repository::git(&["rev-parse", "--show-toplevel"])?;
@@ -780,6 +841,44 @@ pub(crate) fn run(id: &str) -> Result<Value, String> {
     };
     checks.insert(0, json!({"name": REPOSITORY_TESTS, "kind": "tests", "status": repository_tests, "output_digest": sha256(ordinary.to_string().as_bytes())}));
     let final_state = &attestation["final_state"];
+    let contract_tests = json!({"passed": summary["passed"], "failed": summary["failed"], "not_applicable": summary["not_applicable"], "check": CONTRACT_TESTS});
+    // The binding ties the pull request, the approvals, and the merge to exactly this checked
+    // state: repository, task, contract, checkpoint, commit and tree, check results, attestation
+    let checkpoint = match crate::task_contracts::stored(
+        session.identity().1.unwrap_or_default(),
+        task_contract["version"].as_u64().unwrap_or(0),
+    ) {
+        Ok(contract) => contract["bindings"]["checkpoint"].clone(),
+        Err(_) => session
+            .contracts()
+            .contracts
+            .first()
+            .map_or(Value::Null, |contract| json!({"name": contract.checkpoint, "sha": contract.checkpoint_sha.clone().ok()})),
+    };
+    let (owner, name) = crate::repo::owner_and_name();
+    let binding = json!({
+        "repository": {"identity": session.describe()["repository_id"], "owner": owner, "name": name},
+        "task": session.identity().1,
+        "contract_id": task_contract["contract_id"],
+        "contract_digest": task_contract["digest"],
+        "contract_version": session.contracts().version,
+        "checkpoint": checkpoint,
+        "base": base,
+        "branch": branch,
+        "head": head,
+        "tree": tree,
+        "checks_digest": sha256(json!({"checks": checks, "contract_tests": contract_tests}).to_string().as_bytes()),
+        "attestation": attestation["attestation_digest"],
+        "zones": zones,
+        "autonomy": final_state["autonomy"],
+    });
+    let binding_digest = sha256(binding.to_string().as_bytes());
+    let verification = match &governed {
+        Some(record) => {
+            json!({"by": "orchestrator", "phase": record["phase"], "attestation": record["termination"]["attestation_digest"]})
+        }
+        None => json!({"by": "finalization", "decision": decision}),
+    };
     record(
         id,
         json!({
@@ -797,12 +896,18 @@ pub(crate) fn run(id: &str) -> Result<Value, String> {
             "decision": decision,
             "attestation_digest": attestation["attestation_digest"],
             "contract_version": session.contracts().version,
-            "contract_tests": {"passed": summary["passed"], "failed": summary["failed"], "not_applicable": summary["not_applicable"], "check": CONTRACT_TESTS},
+            "contract_tests": contract_tests,
             "checks": checks,
+            "tree": tree,
+            "binding": binding,
+            "binding_digest": binding_digest,
+            "verification": verification,
+            "task_contract": task_contract,
+            "checkpoint": checkpoint,
         }),
     )?;
     let mut current = state(&journal(id)?);
-    let eligibility = evaluate(&config, &facts(&current, now_unix())?);
+    let eligibility = evaluate(&config, &facts(&current, now_unix(), config.approval_ttl)?);
     let title = format!(
         "{}{}",
         session
@@ -825,7 +930,7 @@ pub(crate) fn run(id: &str) -> Result<Value, String> {
     event["kind"] = json!("pull_request");
     record(id, event)?;
     current = state(&journal(id)?);
-    session.record(json!({"event": "delivery_submitted", "branch": current["branch"], "head": current["head"], "pull_request": {"number": pull_request["number"], "url": pull_request["url"]}, "checks": current["checks"], "contract_tests": current["contract_tests"], "criticality": current["criticality"], "rule": eligibility["rule"]["name"]}))?;
+    session.record(json!({"event": "delivery_submitted", "branch": current["branch"], "head": current["head"], "binding_digest": current["binding_digest"], "pull_request": {"number": pull_request["number"], "url": pull_request["url"]}, "checks": current["checks"], "contract_tests": current["contract_tests"], "criticality": current["criticality"], "rule": eligibility["rule"]["name"]}))?;
     if let Some(task) = session.identity().1 {
         crate::orchestration::delivery_progress(task, None)?;
     }
@@ -836,7 +941,10 @@ pub(crate) fn run(id: &str) -> Result<Value, String> {
     status(id)
 }
 
-/** Report a delivery: its state, its merge evaluation, and its chain
+/** Report a delivery: its state, its merge evaluation (the merge rule for its autonomy and zone
+ * criticality, plus the policies that must still hold: the binding is intact, the task contract is
+ * still current, a governed session is still DELIVERY_READY, approvals have not expired), its
+ * delivery state, and its chain
  * Input
     - id: &str - delivery id
  * Output
@@ -851,11 +959,111 @@ pub(crate) fn status(id: &str) -> Result<Value, String> {
     }
     let config = policy::load()?;
     let mut current = state(&events);
+    let now = now_unix();
     current["eligibility"] = if current["head"].is_null() {
         Value::Null
     } else {
-        evaluate(&config, &facts(&current, now_unix())?)
+        let mut eligibility = evaluate(&config, &facts(&current, now, config.approval_ttl)?);
+        let mut missing = Vec::new();
+        if !current["binding"].is_null() {
+            if sha256(current["binding"].to_string().as_bytes())
+                != current["binding_digest"].as_str().unwrap_or_default()
+            {
+                missing.push("the delivery binding does not match its digest".to_string());
+            }
+            let tree = current["head"].as_str().and_then(|head| {
+                git_in(
+                    &root_directory().ok()?,
+                    &["rev-parse", &format!("{head}^{{tree}}")],
+                )
+                .ok()
+            });
+            if tree.as_deref() != current["tree"].as_str() {
+                missing.push("the checked commit is not in the repository any more".to_string());
+            }
+        }
+        if let (Some(task), Some(version)) = (
+            current["task"].as_str(),
+            current["task_contract"]["version"].as_u64(),
+        ) {
+            if let Some(reason) = crate::task_contracts::obsolete(task, version) {
+                missing.push(reason);
+            }
+        }
+        if let Err(reason) = crate::session_orchestrator::delivery_allowed(id) {
+            missing.push(reason);
+        }
+        if let Some(ttl) = config.approval_ttl {
+            let approvals = current["approvals"].as_array().cloned().unwrap_or_default();
+            let fresh = |by: &Value| {
+                approvals.iter().any(|approval| {
+                    approval["by"] == *by
+                        && current_round(approval, &current)
+                        && approval["at"].as_u64().unwrap_or(0) + ttl > now
+                })
+            };
+            let mut reported = BTreeSet::new();
+            for approval in &approvals {
+                if current_round(approval, &current)
+                    && approval["at"].as_u64().unwrap_or(0) + ttl <= now
+                    && !fresh(&approval["by"])
+                    && reported.insert(approval["by"].to_string())
+                {
+                    missing.push(format!(
+                        "the approval by {} expired (approvals count for {ttl} seconds)",
+                        approval["by"].as_str().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        if !missing.is_empty() && current["merged"].is_null() {
+            if let Some(list) = eligibility["missing"].as_array_mut() {
+                list.extend(missing.into_iter().map(Value::from));
+            }
+            eligibility["eligible"] = json!(false);
+            eligibility["auto_merge"] = json!(false);
+        }
+        eligibility
     };
+    let failed_after = current["merge_failures"]
+        .as_array()
+        .and_then(|failures| failures.last())
+        .is_some_and(|failure| current_round(failure, &current));
+    let rejected = current["blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|block| block["kind"] == "rejection" && current_round(block, &current));
+    current["delivery_state"] = json!(if !current["merged"].is_null() {
+        "COMPLETE"
+    } else if current["head"].is_null() {
+        "BLOCKED"
+    } else if failed_after {
+        "MERGE_FAILED"
+    } else if rejected {
+        "REJECTED"
+    } else if current["eligibility"]["eligible"] == true {
+        "APPROVED"
+    } else {
+        "AWAITING_APPROVAL"
+    });
+    Ok(current)
+}
+
+/** Report a delivery that has a submitted round, the only kind that can be approved, excepted,
+ * or merged (a delivery that was blocked before its pull request has nothing to decide on)
+ * Input
+    - id: &str - delivery id
+ * Output
+    - Result<Value, String> the delivery status
+*/
+fn submitted(id: &str) -> Result<Value, String> {
+    let current = status(id)?;
+    if current["head"].is_null() {
+        return Err(format!(
+            "delivery {id} has no submitted pull request yet; run 'crane deliver run {id}' after the session reconciles"
+        ));
+    }
     Ok(current)
 }
 
@@ -881,23 +1089,26 @@ fn actor(config: &DeliveryConfig, by: &str) -> Option<String> {
     - kind: &str - approval, rejection, or changes_requested
     - by: &str - approver name (CLI) or "slack:USER_ID"
     - head: Option<&str> - the commit the decision is about (Slack buttons carry it)
+    - binding: Option<&str> - the delivery binding the decision is about (Slack buttons carry it)
     - reason: &str - why
     - via: &str - cli or slack
  * Output
-    - Result<Value, String> the delivery status
+    - Result<Value, String> the delivery status, with already_recorded when the same person
+      already made the same decision on this round (nothing is recorded again)
 */
 pub(crate) fn decide(
     id: &str,
     kind: &str,
     by: &str,
     head: Option<&str>,
+    binding: Option<&str>,
     reason: &str,
     via: &str,
 ) -> Result<Value, String> {
     let session = session(id)?;
     refuse_agents(Some(&session), kind)?;
     let config = policy::load()?;
-    let current = status(id)?;
+    let current = submitted(id)?;
     if !current["merged"].is_null() {
         return Err(format!("delivery {id} is already merged"));
     }
@@ -911,18 +1122,40 @@ pub(crate) fn decide(
         ));
     };
     let round = current["head"].as_str().unwrap_or_default();
-    if head.is_some_and(|head| head != round) {
+    let bound = current["binding_digest"].as_str();
+    let stale_binding = binding.is_some_and(|binding| Some(binding) != bound);
+    if head.is_some_and(|head| head != round) || stale_binding {
         record(
             id,
-            json!({"kind": "unauthorized_action", "by": name, "action": kind, "via": via, "reason": "stale commit"}),
+            json!({"kind": "unauthorized_action", "by": name, "action": kind, "via": via, "reason": "stale commit or binding", "head": head, "binding": binding}),
         )?;
         return Err(format!(
-            "that message is about an earlier commit; the delivery is now at {round}"
+            "that message is about an earlier commit or check result; the delivery is now at {round} (binding {})",
+            bound.unwrap_or("none")
         ));
+    }
+    let list = if kind == "approval" {
+        "approvals"
+    } else {
+        "blocks"
+    };
+    let repeated = current[list].as_array().into_iter().flatten().any(|entry| {
+        entry["by"] == name.as_str()
+            && entry["kind"] == kind
+            && current_round(entry, &current)
+            && (kind != "approval"
+                || config
+                    .approval_ttl
+                    .is_none_or(|ttl| entry["at"].as_u64().unwrap_or(0) + ttl > now_unix()))
+    });
+    if repeated {
+        let mut after = status(id)?;
+        after["already_recorded"] = json!(true);
+        return Ok(after);
     }
     record(
         id,
-        json!({"kind": kind, "by": name, "head": round, "reason": reason, "via": via}),
+        json!({"kind": kind, "by": name, "head": round, "binding": bound, "checks_digest": current["binding"]["checks_digest"], "reason": reason, "via": via}),
     )?;
     session.record(json!({"event": format!("delivery_{kind}"), "by": name, "head": round, "reason": reason, "via": via}))?;
     let after = status(id)?;
@@ -964,7 +1197,7 @@ pub(crate) fn except(
     let session = session(id)?;
     refuse_agents(Some(&session), "exception")?;
     let config = policy::load()?;
-    let current = status(id)?;
+    let current = submitted(id)?;
     if check == CONTRACT_TESTS {
         return Err("contract tests can never be excepted".into());
     }
@@ -1028,11 +1261,39 @@ pub(crate) fn except(
     )?;
     session.record(json!({"event": "delivery_exception", "id": exception_id, "check": check, "head": round, "by": name, "reason": reason, "expires_at": expires_at, "via": via}))?;
     tell(&config, id, &format!("{name} approved a scoped exception for {check} on delivery {id} (until {expires_at}): {reason}"))?;
+    refresh_pull_request(&config, id, &session)?;
     let after = status(id)?;
     if after["eligibility"]["auto_merge"] == true {
         return merge(id, &format!("crane (auto-merge after {name}'s exception)"));
     }
     Ok(after)
+}
+
+/** Update the pull request body of the current round (after an exception), so it always shows
+ * what the merge relies on
+ * Input
+    - config: &DeliveryConfig - configuration
+    - id: &str - delivery id
+    - session: &ContractSession - session
+ * Output
+    - Result<(), String>
+*/
+fn refresh_pull_request(
+    config: &DeliveryConfig,
+    id: &str,
+    session: &ContractSession,
+) -> Result<(), String> {
+    let current = status(id)?;
+    let attestation = attest(&session.document(), &session.events())?;
+    let text = body(session, &current, &attestation, &current["eligibility"]);
+    let title = current["pull_request"]["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut event = open_pull_request(config, id, &current, &title, &text)?;
+    event["kind"] = json!("pull_request");
+    record(id, event)?;
+    Ok(())
 }
 
 /** Handle a signed Slack interaction: verify it came from Slack, then carry out the click
@@ -1078,6 +1339,7 @@ pub(crate) fn slack_action(body: &str, timestamp: &str, signature: &str) -> Resu
             "approval",
             &by,
             Some(&click.head),
+            click.binding.as_deref(),
             &reason,
             "slack",
         ),
@@ -1086,6 +1348,7 @@ pub(crate) fn slack_action(body: &str, timestamp: &str, signature: &str) -> Resu
             "rejection",
             &by,
             Some(&click.head),
+            click.binding.as_deref(),
             &reason,
             "slack",
         ),
@@ -1094,6 +1357,7 @@ pub(crate) fn slack_action(body: &str, timestamp: &str, signature: &str) -> Resu
             "changes_requested",
             &by,
             Some(&click.head),
+            click.binding.as_deref(),
             &reason,
             "slack",
         ),
@@ -1112,21 +1376,26 @@ pub(crate) fn slack_action(body: &str, timestamp: &str, signature: &str) -> Resu
     }
 }
 
-/** Merge a delivery once the merge policy allows it, then establish the new trusted state: verify
- * that the merge commit contains the checked commit, record it, make it a trusted checkpoint,
- * complete the task (and only then its Jira or Asana issue), and re-finalize the session
- * attestation with the delivery
+/** Merge a delivery once the merge policy allows it: refused unless eligible (the merge rule for
+ * its autonomy and zones, the binding, the task contract, the session's verification); the
+ * provider merges exactly the checked commit; a failed merge is recorded and leaves the session,
+ * the task, and the trusted checkpoint untouched; merging a merged delivery changes nothing
  * Input
     - id: &str - delivery id
     - by: &str - who merges
  * Output
-    - Result<Value, String> the delivery status
+    - Result<Value, String> the delivery status (already_merged when it was)
 */
 pub(crate) fn merge(id: &str, by: &str) -> Result<Value, String> {
     let session = session(id)?;
     refuse_agents(Some(&session), "merge")?;
     let config = policy::load()?;
-    let current = status(id)?;
+    let current = submitted(id)?;
+    if !current["merged"].is_null() {
+        let mut after = status(id)?;
+        after["already_merged"] = json!(true);
+        return Ok(after);
+    }
     let eligibility = &current["eligibility"];
     if eligibility["eligible"] != true {
         return Err(format!(
@@ -1141,62 +1410,150 @@ pub(crate) fn merge(id: &str, by: &str) -> Result<Value, String> {
         ));
     }
     let repository = root_directory()?;
-    let branch = current["branch"].as_str().unwrap_or_default();
+    let provider = named(&config.provider)
+        .ok_or_else(|| format!("unknown delivery provider '{}'", config.provider))?;
+    let body_file = directory(id)?.join("pull_request.md");
+    let merged = provider.merge_pull_request(&PullRequest {
+        repository: &repository,
+        branch: current["branch"].as_str().unwrap_or_default(),
+        base: current["base"].as_str().unwrap_or_default(),
+        head: current["head"].as_str().unwrap_or_default(),
+        title: current["pull_request"]["title"]
+            .as_str()
+            .unwrap_or_default(),
+        body_file: &body_file,
+        number: current["pull_request"]["number"].as_u64(),
+        url: current["pull_request"]["url"].as_str(),
+        local_number: 0,
+        url_template: config.pr_url_template.as_deref(),
+        cli: &config.github_cli,
+    });
+    match merged {
+        Ok(merge_sha) => complete(id, &merge_sha, by, &current),
+        Err(error) => {
+            failed_merge(id, &config, &session, &current, by, &error)?;
+            Err(format!("the merge of delivery {id} failed: {error}; the session and its task are not completed"))
+        }
+    }
+}
+
+/** Record a failed merge: in the delivery journal (MERGE_FAILED), on the session, and to Slack;
+ * nothing is completed and no checkpoint is trusted
+ * Input
+    - id: &str - delivery id
+    - config: &DeliveryConfig - configuration
+    - session: &ContractSession - session
+    - current: &Value - delivery status
+    - by: &str - who merged
+    - error: &str - why it failed
+ * Output
+    - Result<(), String>
+*/
+fn failed_merge(
+    id: &str,
+    config: &DeliveryConfig,
+    session: &ContractSession,
+    current: &Value,
+    by: &str,
+    error: &str,
+) -> Result<(), String> {
+    record(
+        id,
+        json!({"kind": "merge_failed", "by": by, "head": current["head"], "binding": current["binding_digest"], "reason": error}),
+    )?;
+    session.record(json!({"event": "delivery_merge_failed", "by": by, "head": current["head"], "reason": error}))?;
+    tell(
+        config,
+        id,
+        &format!("The merge of delivery {id} failed: {error}. Nothing was completed."),
+    )
+}
+
+/** Handle a merge reported by the provider (a merge made on the host, or a webhook delivered more
+ * than once): the same merge again changes nothing; a different merge of a merged delivery is
+ * refused; a merge of a delivery that was not eligible is recorded as unauthorized and never
+ * completes the task or becomes a trusted checkpoint; otherwise the delivery is completed
+ * Input
+    - id: &str - delivery id
+    - merge_sha: &str - the merge commit the provider reports
+    - by: &str - who reports it
+ * Output
+    - Result<Value, String> the delivery status
+*/
+pub(crate) fn merged(id: &str, merge_sha: &str, by: &str) -> Result<Value, String> {
+    let session = session(id)?;
+    refuse_agents(Some(&session), "merged")?;
+    let config = policy::load()?;
+    let current = submitted(id)?;
+    let reported = git_in(
+        &root_directory()?,
+        &["rev-parse", &format!("{merge_sha}^{{commit}}")],
+    )
+    .map_err(|_| format!("merge commit {merge_sha} is not in this repository; fetch it first"))?;
+    if !current["merged"].is_null() {
+        if current["merged"]["sha"] == reported.as_str() {
+            let mut after = status(id)?;
+            after["already_merged"] = json!(true);
+            return Ok(after);
+        }
+        record(
+            id,
+            json!({"kind": "unauthorized_action", "by": by, "action": "merged", "reason": format!("delivery is merged as {}, not {reported}", current["merged"]["sha"].as_str().unwrap_or_default())}),
+        )?;
+        return Err(format!(
+            "delivery {id} is already merged as {}; the report of {reported} was refused",
+            current["merged"]["sha"].as_str().unwrap_or_default()
+        ));
+    }
+    if current["eligibility"]["eligible"] != true {
+        let reasons = current["eligibility"]["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        record(
+            id,
+            json!({"kind": "merge_failed", "by": by, "head": current["head"], "binding": current["binding_digest"], "sha": reported, "reason": format!("merged without eligibility: {reasons}")}),
+        )?;
+        tell(&config, id, &format!("Delivery {id} was merged as {reported} without meeting the merge policy ({reasons}); it is not completed and not trusted."))?;
+        return Err(format!(
+            "delivery {id} was merged without meeting the merge policy ({reasons}); it is not completed"
+        ));
+    }
+    complete(id, &reported, by, &current)
+}
+
+/** Complete a merged delivery: verify the merge contains exactly the checked commit, record it,
+ * make the merge commit the trusted checkpoint (and the connected repository's trusted state),
+ * complete the task (and only then its Jira or Asana issue), note it on the governed session, and
+ * re-finalize the session attestation; the delivery becomes COMPLETE
+ * Input
+    - id: &str - delivery id
+    - merge_sha: &str - merge commit
+    - by: &str - who merged
+    - current: &Value - delivery status before the merge
+ * Output
+    - Result<Value, String> the delivery status
+*/
+fn complete(id: &str, merge_sha: &str, by: &str, current: &Value) -> Result<Value, String> {
+    let session = session(id)?;
+    let config = policy::load()?;
+    let repository = root_directory()?;
+    let eligibility = &current["eligibility"];
     let base = current["base"].as_str().unwrap_or_default();
     let head = current["head"].as_str().unwrap_or_default();
-    let merge_sha = match config.provider.as_str() {
-        "github" => {
-            let number = current["pull_request"]["number"].to_string();
-            gh(&["pr", "merge", &number, "--merge"])?;
-            git_in(&repository, &["fetch", "origin", base])?;
-            git_in(&repository, &["rev-parse", &format!("origin/{base}")])?
-        }
-        _ => {
-            if git_in(&repository, &["branch", "--show-current"])? != base {
-                return Err(format!("check out {base} to merge delivery {id}"));
-            }
-            let dirty = git_in(
-                &repository,
-                &["status", "--porcelain", "--untracked-files=no"],
-            )?;
-            if dirty.lines().any(|line| !line[3..].starts_with(".crane/")) {
-                return Err(format!(
-                    "{base} has uncommitted changes; commit or stash them before merging"
-                ));
-            }
-            let title = current["pull_request"]["title"]
-                .as_str()
-                .unwrap_or_default();
-            let number = &current["pull_request"]["number"];
-            if let Err(error) = git_in(
-                &repository,
-                &[
-                    "merge",
-                    "--no-ff",
-                    "--no-edit",
-                    "-m",
-                    &format!("Merge pull request #{number} from {branch}\n\n{title}"),
-                    branch,
-                ],
-            ) {
-                let _ = git_in(&repository, &["merge", "--abort"]);
-                return Err(format!("the merge failed and was aborted: {error}"));
-            }
-            git_in(&repository, &["rev-parse", "HEAD"])?
-        }
-    };
     // A merge counts only when the merged history contains exactly the commit that was checked
     let verified = git_in(
         &repository,
-        &["merge-base", "--is-ancestor", head, &merge_sha],
+        &["merge-base", "--is-ancestor", head, merge_sha],
     )
     .is_ok();
     if !verified {
-        record(
-            id,
-            json!({"kind": "blocked", "reason": format!("merge {merge_sha} does not contain the checked commit {head}")}),
-        )?;
-        return Err(format!("merge {merge_sha} does not contain the checked commit {head}; the task is not completed"));
+        let error = format!("merge {merge_sha} does not contain the checked commit {head}");
+        failed_merge(id, &config, &session, current, by, &error)?;
+        return Err(format!("{error}; the task is not completed"));
     }
     let name = format!(
         "trusted_{}",
@@ -1208,24 +1565,29 @@ pub(crate) fn merge(id: &str, by: &str) -> Result<Value, String> {
             })
             .collect::<String>()
     );
-    let checkpoint = crate::commands::checkpoint::create_at(&name, &merge_sha, base)?;
+    let checkpoint = crate::commands::checkpoint::create_at(&name, merge_sha, base)?;
+    crate::repo::trust(
+        &checkpoint.name,
+        merge_sha,
+        &format!("delivery {id} merged"),
+    )?;
     record(
         id,
-        json!({"kind": "merged", "sha": merge_sha, "by": by, "head": head, "base": base, "verified": true, "trusted_checkpoint": checkpoint.name, "rule": eligibility["rule"]["name"], "approvals": eligibility["approvals"], "excepted": eligibility["excepted"]}),
+        json!({"kind": "merged", "sha": merge_sha, "by": by, "head": head, "base": base, "binding": current["binding_digest"], "verified": true, "trusted_checkpoint": checkpoint.name, "rule": eligibility["rule"]["name"], "approvals": eligibility["approvals"], "excepted": eligibility["excepted"]}),
     )?;
+    // The task is not completed here: its tracker issue is completed by the completion dispatcher
+    // once Jira confirms it, from a completion event queued now that the merge is verified
     let mut completion = Value::Null;
     if let Some(task) = session.identity().1 {
-        if let Some(tracker) = crate::orchestration::delivery_progress(task, Some(&merge_sha))? {
-            let messages = tracker_completion(&config, &tracker, task, &merge_sha, &current)?;
-            completion = json!({"task": task, "tracker": tracker["source"], "external_id": tracker["external_id"], "outbox": messages});
-        } else {
-            completion = json!({"task": task, "tracker": null, "outbox": []});
-        }
+        crate::orchestration::delivery_progress(task, Some(merge_sha))?;
+        let event = crate::task_completion::enqueue(id, task, merge_sha, current, &config)?;
+        completion = json!({"task": task, "tracker": event["tracker"], "external_id": event["external_id"], "completion_event": event["event_id"], "status": event["status"], "outbox": event["outbox"]});
         record(
             id,
-            json!({"kind": "task_completed", "task": task, "tracker": completion["tracker"], "external_id": completion["external_id"], "outbox": completion["outbox"]}),
+            json!({"kind": "task_completion_queued", "task": task, "tracker": completion["tracker"], "external_id": completion["external_id"], "completion_event": completion["completion_event"], "status": completion["status"], "outbox": completion["outbox"]}),
         )?;
     }
+    crate::session_orchestrator::delivered(id, merge_sha, by)?;
     session.record(json!({"event": "delivery_merged", "merge_sha": merge_sha, "head": head, "by": by, "trusted_checkpoint": checkpoint.name, "pull_request": current["pull_request"]["number"], "rule": eligibility["rule"]["name"], "approvals": eligibility["approvals"]["by"], "excepted": eligibility["excepted"], "task_completion": completion}))?;
     let finalized = attest(&session.document(), &session.events())?;
     if let Some(directory) = session.directory() {
@@ -1250,48 +1612,19 @@ pub(crate) fn merge(id: &str, by: &str) -> Result<Value, String> {
     status(id)
 }
 
-/** Queue the tracker completion for a verified merge: a comment with the merge and attestation,
- * then the transition to done (Jira) or completion (Asana)
+/** Append an event to a delivery's journal on behalf of another component (the task completion
+ * dispatcher confirming the tracker completion)
  * Input
-    - config: &DeliveryConfig - configuration
-    - tracker: &Value - {source, external_id}
-    - task: &str - task id
-    - merge_sha: &str - verified merge commit
-    - state: &Value - delivery state
+    - id: &str - delivery id
+    - event: Value - event fields (with "kind")
  * Output
-    - Result<Vec<String>, String> outbox files
+    - Result<(), String>
 */
-fn tracker_completion(
-    config: &DeliveryConfig,
-    tracker: &Value,
-    task: &str,
-    merge_sha: &str,
-    state: &Value,
-) -> Result<Vec<String>, String> {
-    let external = tracker["external_id"].as_str().unwrap_or(task);
-    let text = format!(
-        "Merged by Crane as {merge_sha} ({}). Contract {} held; attestation {}.",
-        state["pull_request"]["url"].as_str().unwrap_or_default(),
-        state["contract_version"].as_str().unwrap_or_default(),
-        state["attestation_digest"].as_str().unwrap_or_default()
-    );
-    let delivery = state["delivery_id"].as_str().unwrap_or_default();
-    let requests = match tracker["source"].as_str() {
-        Some("jira") => vec![
-            json!({"method": "POST", "path": format!("/rest/api/3/issue/{external}/comment"), "body": {"body": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}}}),
-            json!({"method": "POST", "path": format!("/rest/api/3/issue/{external}/transitions"), "body": {"transition": {"id": config.trackers["jira"]["done_transition"].as_str().unwrap_or("done")}}}),
-        ],
-        Some("asana") => vec![
-            json!({"method": "POST", "path": format!("/tasks/{external}/stories"), "body": {"data": {"text": text}}}),
-            json!({"method": "PUT", "path": format!("/tasks/{external}"), "body": {"data": {"completed": true}}}),
-        ],
-        _ => Vec::new(),
-    };
-    let channel = tracker["source"].as_str().unwrap_or("tracker");
-    requests
-        .into_iter()
-        .map(|request| outbox(channel, delivery, request))
-        .collect()
+pub(crate) fn note(id: &str, event: Value) -> Result<(), String> {
+    if id.is_empty() || journal(id)?.is_empty() {
+        return Ok(());
+    }
+    record(id, event).map(|_| ())
 }
 
 /** Render a delivery status for a terminal

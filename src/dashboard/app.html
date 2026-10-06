@@ -55,11 +55,11 @@ button.ghost { background: transparent; border: 1px solid var(--line); color: va
 <main id="main"></main>
 <script>
 "use strict";
-const SCREENS = ["Repository", "Zones", "Contracts", "Agent Sessions", "Policy Simulator", "Attestations"];
+const SCREENS = ["Flow", "Repository", "Tasks", "Zones", "Contracts", "Agent Sessions", "Policy Simulator", "Attestations"];
 const params = new URLSearchParams(location.search);
 let token = params.get("token") || sessionStorage.getItem("craneToken") || "";
 if (params.get("token")) { sessionStorage.setItem("craneToken", token); history.replaceState(null, "", "/"); }
-let current = sessionStorage.getItem("craneScreen") || "Repository";
+let current = sessionStorage.getItem("craneScreen") || "Flow";
 let draft = {name: "", checkpoint: "baseline", rules: [{rule: "preserve", kind: "function", target: "", scope: "block", change_type: ""}]};
 let targets = [];
 
@@ -99,23 +99,32 @@ async function render() {
   if (!token) { main.replaceChildren(panel("Open the dashboard from its link", h("p", {}, "Run ", h("code", {}, "crane dashboard"), " and open the printed link; it carries the access token."))); return; }
   try {
     const connection = await api("GET", "/api/connection");
-    if (!connection) { main.replaceChildren(connectPanel()); return; }
-    document.getElementById("repo").textContent = (connection.remote || connection.root) + " · " + (connection.default_branch || "");
-    main.replaceChildren(await ({"Repository": repositoryScreen, "Zones": zonesScreen, "Contracts": contractsScreen, "Agent Sessions": sessionsScreen, "Policy Simulator": simulatorScreen, "Attestations": attestationsScreen})[current]());
+    if (!connection || connection.connection_status !== "connected") { main.replaceChildren(connectPanel(connection)); return; }
+    const repo = await api("GET", "/api/repo");
+    document.getElementById("repo").textContent = [repo.full_name || repo.local_path, repo.provider, repo.current_branch || repo.default_branch, "checkpoint " + repo.trusted_checkpoint.status, "discovery " + repo.discovery.state].join(" · ");
+    main.replaceChildren(await ({"Flow": flowScreen, "Repository": repositoryScreen, "Tasks": tasksScreen, "Zones": zonesScreen, "Contracts": contractsScreen, "Agent Sessions": sessionsScreen, "Policy Simulator": simulatorScreen, "Attestations": attestationsScreen})[current]());
   } catch (error) { main.replaceChildren(panel("Something went wrong", h("p", {class: "bad"}, error.message))); }
 }
 
-function connectPanel() {
-  return panel("Connect this repository",
-    h("p", {}, "Crane connects once: it records the repository's identity, remote, default branch, and languages, and every screen works from that and Crane's own records afterwards."),
-    h("button", {class: "act", onclick: async () => { await api("POST", "/api/connection", {}); render(); }}, "Connect repository"));
+function connectPanel(previous) {
+  return panel(previous ? "Reconnect " + (previous.full_name || "this repository") : "Connect this repository",
+    previous ? h("p", {class: "warn"}, "This repository was disconnected; its configuration and history are kept.") : null,
+    h("p", {}, "Crane connects once: it records the repository's identity, provider, owner, name, and default branch, makes sure a trusted checkpoint exists, and runs discovery. Every screen works from that afterwards."),
+    h("button", {class: "act", onclick: async () => { await api("POST", "/api/connection", {}); render(); }}, previous ? "Reconnect repository" : "Connect repository"));
 }
 
 async function repositoryScreen() {
-  const data = await api("GET", "/api/repository");
+  const [data, connection] = await Promise.all([api("GET", "/api/repository"), api("GET", "/api/repo")]);
+  const checkpoint = connection.trusted_checkpoint;
   targets = data.inventory.targets;
   const repo = data.inventory.repository, coverage = data.policy_coverage;
   return h("div", {},
+    panel("Repository", h("div", {class: "stats"},
+      stat(connection.full_name || "–", "repository"), stat(connection.provider, "provider"), stat(connection.current_branch || connection.default_branch || "–", "branch (default " + text(connection.default_branch) + ")"),
+      stat(checkpoint.name + " · " + checkpoint.status, "trusted checkpoint" + (checkpoint.commits_since ? " (" + checkpoint.commits_since + " commits behind)" : "")),
+      stat(connection.discovery.state, "discovery"), stat(connection.connection_status, "connection")),
+      connection.web_url ? h("p", {}, h("a", {href: connection.web_url, rel: "noopener"}, connection.web_url)) : null,
+      connection.policy_version.changed || connection.zone_version.changed ? h("div", {class: "notice warn"}, "Policies or zones changed since connecting; refresh the connection to record them.") : null),
     panel("Semantic inventory", h("div", {class: "stats"},
       stat(repo.files, "files"), stat(repo.symbols, "symbols"), stat((data.inventory.services || []).length, "services"), stat((data.inventory.modules || []).length, "modules"),
       stat(coverage.callables_percent + "%", "functions covered by contracts"), stat(coverage.critical_covered + " / " + coverage.critical, "critical candidates covered")),
@@ -129,14 +138,39 @@ async function repositoryScreen() {
 }
 
 async function zonesScreen() {
-  const data = await api("GET", "/api/zones");
-  return panel("Zones",
+  const [data, review] = await Promise.all([api("GET", "/api/zones"), api("GET", "/api/zones/recommendations")]);
+  const detail = h("div", {});
+  const open = async id => {
+    const record = await api("GET", "/api/zones/recommendations/" + encodeURIComponent(id));
+    const rec = record.recommendation, approver = h("input", {placeholder: "your name"}), reason = h("input", {placeholder: "reason"});
+    const confirm = h("input", {placeholder: "first 12 digest characters", size: 26});
+    const decide = async (action, body) => { try { await api("POST", "/api/zones/recommendations/" + encodeURIComponent(id) + "/" + action, body); render(); } catch (error) { alert(error.message); } };
+    detail.replaceChildren(panel("Recommended zone " + record.zone_id,
+      h("div", {class: "row"}, badge(record.status), record.active ? badge("active") : null, h("span", {class: "chip"}, "revision " + record.revision), h("span", {class: "chip"}, "confidence " + rec.confidence), h("code", {}, record.digest)),
+      h("div", {class: "stats"}, stat(rec.criticality, "criticality"), stat(rec.autonomy, "suggested autonomy"), stat(rec.safety_state, "suggested safety state"), stat(rec.affected.files.length, "files"), stat(rec.affected.entities, "symbols")),
+      h("h3", {}, "Rationale"), h("ul", {}, rec.rationale.map(line => h("li", {}, line))),
+      h("h3", {}, "Signals and sources"), table(["Signal", "Evidence"], rec.signals.map(signal => [h("code", {}, signal.signal), signal.detail || ((signal.symbols || signal.files) + " " + (signal.examples ? signal.examples.join(", ") : ""))])),
+      h("p", {class: "muted"}, "Sources: " + rec.sources.join(", ")),
+      h("div", {class: "split"}, h("div", {}, h("h3", {}, "Selectors and affected resources"), h("pre", {}, rec.selectors.join("\n") + "\n\n" + rec.affected.files.join("\n"))), h("div", {}, h("h3", {}, "Zone file it writes when approved"), h("pre", {}, record.zone_text))),
+      h("h3", {}, "History"), table(["Action", "By", "Revision"], record.history.map(entry => [entry.action, entry.by, entry.revision])),
+      ["proposed", "in_review"].includes(record.status) ? h("div", {class: "row"},
+        record.status === "proposed" ? h("button", {class: "ghost", onclick: () => decide("review", {by: approver.value})}, "Start review") : null,
+        approver, confirm, h("button", {class: "act", onclick: () => decide("approve", {approver: approver.value, confirm: confirm.value})}, "Approve and activate"),
+        reason, h("button", {class: "ghost", onclick: () => decide("reject", {approver: approver.value, reason: reason.value})}, "Reject")) : null));
+  };
+  const recommendations = panel("Recommended zones (proposals: nothing governs agents until a human approves)",
+    h("div", {class: "row"}, h("button", {class: "act", onclick: async () => { await api("POST", "/api/zones/recommendations", {}); render(); }}, "Discover and recommend"),
+      h("span", {class: "muted"}, review.discovery ? "last discovery " + review.discovery.run + " at " + new Date(review.discovery.at * 1000).toLocaleString() : "no discovery yet")),
+    table(["Recommendation", "Status", "Zone", "Criticality", "Autonomy", "Files", "Confidence", "Sources"],
+      review.recommendations.map(item => [h("b", {}, item.id), badge(item.status), item.zone_id, badge(item.criticality), item.autonomy, item.files, item.confidence, (item.sources || []).join(", ")]),
+      index => open(review.recommendations[index].id)), detail);
+  return h("div", {}, recommendations, panel("Active zones",
     table(["Zone", "Selectors", "Criticality", "Autonomy (declared → effective)", "Safety state", "Resolved resources"],
       (data.zones || []).map(zone => [h("b", {}, zone.zone_id),
         h("div", {}, zone.selectors.map(selector => h("div", {}, h("code", {}, selector.selector), " ", badge(selector.status)))),
         badge(zone.criticality), zone.default_autonomy + " → " + zone.effective_autonomy, badge(zone.effective_safety_state),
         h("div", {}, h("span", {class: "chip"}, zone.files.length + " files"), h("span", {class: "chip"}, zone.entities.length + " symbols"), h("details", {}, h("summary", {}, "files"), h("pre", {}, zone.files.join("\n"))))])),
-    data.conflicts && data.conflicts.length ? h("div", {class: "notice warn"}, data.conflicts.length + " conflicts: " + text(data.conflicts)) : null);
+    data.conflicts && data.conflicts.length ? h("div", {class: "notice warn"}, data.conflicts.length + " conflicts: " + text(data.conflicts)) : null));
 }
 
 function editorRows(onchange) {
@@ -202,6 +236,84 @@ async function contractsScreen() {
       h("h3", {}, "Active"), table(["Policy", "Rules", "Digest"], data.active.map(policy => [h("b", {}, policy.name), policy.draft ? policy.draft.rules.length : "invalid", h("code", {}, policy.digest.slice(7, 19))]), index => open(data.active[index].name)),
       h("h3", {}, "Proposals"), table(["Proposal", "Status", "Revision", "Origin"], data.proposals.map(proposal => [h("b", {}, proposal.name), badge(proposal.status), proposal.revision, text(proposal.origin && proposal.origin.kind)]), index => open(data.proposals[index].name))),
     detail, packPanel);
+}
+
+async function flowScreen() {
+  const flow = await api("GET", "/api/flow"), layers = flow.layers, current = flow.current, status = h("p", {class: "muted"});
+  const short = value => value ? String(value).replace("sha256:", "").slice(0, 12) : "–";
+  const advance = async task => {
+    status.textContent = "Advancing…";
+    try { const result = await api("POST", "/api/flow/" + encodeURIComponent(task) + "/advance", {by: "dashboard"}); status.textContent = result.steps.map(step => step.from + " → " + step.to + ": " + step.action).join(" · ") || "Nothing to advance automatically."; }
+    catch (error) { status.textContent = error.message; status.className = "bad"; }
+  };
+  const chain = task => [
+    ["Repository", (layers.repository.full_name || "–") + " · " + (layers.repository.provider || "–") + " · checkpoint " + (layers.repository.trusted_checkpoint ? layers.repository.trusted_checkpoint.name : "–")],
+    ["Discovery", layers.discovery ? layers.discovery.state : "–"],
+    ["Policy", layers.policies ? "version " + short(layers.policies.policy_version) + " · active " + layers.policies.active.join(", ") + (layers.policies.pending.length ? " · pending " + layers.policies.pending.join(", ") : "") : "–"],
+    ["Zones", layers.zones ? "version " + short(layers.zones.zone_set_version) + " · " + layers.zones.active.join(", ") + (layers.zones.pending.length ? " · review " + layers.zones.pending.join(", ") : "") : "–"],
+    ["Task", task ? task.task.task_id + " " + (task.task.title || "") : "–"],
+    ["Contract", task && task.contract ? task.contract.contract_id + " " + task.contract.status + " " + short(task.contract.digest) : "–"],
+    ["Agent", task && task.agent ? task.agent.profile : (layers.agents ? layers.agents.connected.join(", ") || "none connected" : "–")],
+    ["Session", task && task.session ? task.session.session_id + " · " + (task.session.phase || task.session.lifecycle) : "–"],
+    ["Authority", task && task.authority ? task.authority.autonomy + " · " + task.authority.safety : "–"],
+    ["Verification", task && task.verification ? text(task.verification.final_status) : "–"],
+    ["Attestation", task && task.attestation ? short(task.attestation.digest) : "–"],
+    ["PR", task && task.pull_request ? "#" + task.pull_request.number + " " + task.pull_request.url : "–"],
+    ["Approval", task && task.approval ? task.approval.delivery_state : "–"],
+    ["Merge", task && task.merge ? short(task.merge.sha) + " · " + task.merge.trusted_checkpoint : "–"],
+    ["Task completion", task && task.task_completion ? task.task_completion.status + " · " + task.task_completion.event_id : "–"],
+  ];
+  const focus = flow.tasks.find(task => task.task.task_id === current.task) || flow.tasks.find(task => task.stage.stage !== "TASK_READY") || null;
+  return h("div", {},
+    panel("Golden path", h("div", {class: "stats"}, stat(current.stage, "stage"), stat(current.step + " / 14", "step"), stat(current.waiting_for, "waiting for")), h("p", {}, current.reason), h("p", {}, "Next: ", h("code", {}, current.next)),
+      focus ? h("div", {class: "row"}, h("button", {class: "act", onclick: () => advance(focus.task.task_id)}, "Advance " + focus.task.task_id)) : null, status),
+    panel("Lifecycle", table(["Layer", "State"], chain(focus))),
+    panel("Tasks", table(["Task", "Stage", "Contract", "Session", "Merge", "Completion", "Links"], flow.tasks.map(task => [h("code", {}, task.task.task_id), badge(task.stage.stage), task.contract ? task.contract.contract_id : "–", task.session ? task.session.session_id : "–", task.merge ? short(task.merge.sha) : "–", task.task_completion ? task.task_completion.status : "–", task.links.consistent ? "consistent" : badge("INCONSISTENT")]))));
+}
+
+async function tasksScreen() {
+  const data = await api("GET", "/api/tasks"), detail = h("div", {});
+  const state = task => task.ready_to_run ? "READY TO RUN" : task.state;
+  const open = async id => {
+    const task = await api("GET", "/api/tasks/" + encodeURIComponent(id)), status = h("p", {class: "muted"});
+    const act = async (action, body) => {
+      status.textContent = "Working…";
+      try { await api("POST", "/api/tasks/" + encodeURIComponent(id) + "/" + action, body); await render(); await open(id); }
+      catch (error) { status.textContent = error.message; status.className = "bad"; }
+    };
+    const contract = task.task_contract, binding = task.launch ? task.launch.binding : null, actions = h("div", {class: "row"});
+    if (["AVAILABLE", "NEEDS_CLARIFICATION", "FAILED", "BLOCKED"].includes(task.state)) actions.append(h("button", {class: "act", onclick: () => act("prepare", {by: "dashboard"})}, "Plan task"));
+    if (task.state === "CONTRACT_PENDING_APPROVAL") {
+      const approver = h("input", {placeholder: "approver"}), confirm = h("input", {placeholder: "digest prefix (12+)", value: contract.digest.slice(7, 19)});
+      actions.append(approver, confirm, h("button", {class: "act", onclick: () => act("approve", {approver: approver.value, confirm: confirm.value})}, "Approve contract"));
+    }
+    if (task.state === "READY" && !task.ready_to_run) {
+      const agent = h("select", {}, h("option", {value: "claude"}, "Claude Code"), h("option", {value: "codex"}, "Codex"));
+      const autonomy = h("select", {}, ["delegated", "assisted", "autonomous", "observe"].map(mode => h("option", {value: mode}, mode)));
+      actions.append(agent, autonomy, h("button", {class: "act", onclick: () => act("launch", {agent: agent.value, autonomy: autonomy.value, by: "dashboard"})}, "Launch session"));
+    }
+    detail.replaceChildren(panel(task.task_id + " · " + task.title,
+      h("div", {class: "stats"}, stat(state(task), "status"), stat(contract ? contract.contract_id + " (" + contract.status + ")" : null, "contract"), stat(task.agent, "selected agent"), stat(task.checkpoint ? task.checkpoint.name + " " + task.checkpoint.sha.slice(0, 12) : null, "checkpoint"), stat(task.session ? task.session.session_id + " (" + (task.session.lifecycle || "?") + ")" : null, "session")),
+      h("p", {}, task.reason), actions, status,
+      contract ? h("div", {}, h("h3", {}, "Task contract"), table(["Section", "Contents"], [
+        ["MUST_CHANGE", contract.contract.MUST_CHANGE.map(item => item.qualified).join(", ")],
+        ["MUST_NOT_CHANGE", contract.contract.MUST_NOT_CHANGE.map(item => item.qualified).join(", ")],
+        ["MAY_CHANGE", contract.contract.MAY_CHANGE.length + " symbols"],
+        ["REQUIRES_APPROVAL", contract.contract.REQUIRES_APPROVAL.map(item => item.reason).join("; ")],
+        ["TASK_SCOPE", contract.contract.TASK_SCOPE.modules.join(", ")],
+        ["EXPECTED_TESTS", contract.contract.EXPECTED_TESTS.length + " expectations"],
+        ["Clarifications", contract.clarifications.filter(item => item.blocking !== false).map(item => item.message).join("; ") || "none"],
+        ["Digest", h("code", {}, contract.digest)]])) : null,
+      binding ? h("div", {}, h("h3", {}, "Session binding (" + task.launch_verified + ")"), table(["Bound to", "Value"], [
+        ["task", binding.task_id], ["contract", binding.contract.contract_id + " " + binding.contract.digest.slice(0, 19)],
+        ["repository", (binding.repository.owner || "") + "/" + (binding.repository.name || "") + " " + binding.repository.identity.slice(0, 19)],
+        ["checkpoint", binding.checkpoint.name + " " + binding.checkpoint.sha], ["agent", binding.agent],
+        ["autonomy", binding.autonomy.mode + " (" + binding.autonomy.safety + ")"], ["budget", binding.budget.mutating_actions + " actions, " + binding.budget.files + " files"],
+        ["zones", binding.zones.zone_set_version], ["policy version", binding.policy_version], ["binding digest", h("code", {}, task.launch.binding_digest)]])) : null));
+  };
+  return h("div", {}, panel("Tasks for this repository", table(["Task", "Status", "Title", "Contract", "Selected agent", "Checkpoint", "Session"],
+    data.tasks.map(task => [h("code", {}, task.task_id), badge(state(task)), task.title, task.contract ? task.contract.contract_id + " " + task.contract.status : "–", text(task.agent), task.checkpoint ? task.checkpoint.name : "–", task.session ? task.session.session_id + " (" + (task.session.lifecycle || "?") + ")" : "–"]),
+    index => open(data.tasks[index].task_id)), data.unmapped.length ? h("p", {class: "muted"}, data.unmapped.length + " tasks belong to projects not mapped to this repository.") : null), detail);
 }
 
 async function sessionsScreen() {

@@ -20,19 +20,18 @@ use serde_json::{json, Value};
 use crate::evidence::{attest, records, verify_chain};
 use crate::inventory::{discover, Options};
 use crate::proposals::store::{agent_environment, Proposal};
-use crate::repository::{git, root};
+use crate::repository::root;
 use crate::session::{session_ids, ContractSession};
-use crate::util::{io_error, now_unix, sha256};
+use crate::util::{io_error, sha256};
 
 /** Version of the connection record and the API */
 pub(crate) const API_FORMAT: u64 = 1;
 
-/** File in .crane recording the repository connection */
-pub(crate) const CONNECTION_FILE: &str = "connection.json";
-
 /** The six screens and the endpoints that serve them */
 pub(crate) const SCREENS: &[(&str, &str)] = &[
+    ("Flow", "/api/flow"),
     ("Repository", "/api/repository"),
+    ("Tasks", "/api/tasks"),
     ("Zones", "/api/zones"),
     ("Contracts", "/api/contracts"),
     ("Agent Sessions", "/api/sessions"),
@@ -40,82 +39,27 @@ pub(crate) const SCREENS: &[(&str, &str)] = &[
     ("Attestations", "/api/attestations"),
 ];
 
-/** Read the repository connection
+/** Read the repository connection (the registry in crate::repo)
  * Input
     - None
  * Output
     - Result<Option<Value>, String>
 */
 pub(crate) fn connection() -> Result<Option<Value>, String> {
-    match fs::read_to_string(root()?.join(CONNECTION_FILE)) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|error| format!(".crane/{CONNECTION_FILE}: {error}")),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io_error(error)),
-    }
+    crate::repo::load()
 }
 
-/** Connect the repository once: record its identity, remote, default branch, and languages, so
- * every screen works from repository metadata without further configuration; connecting again
- * returns the existing connection (refresh updates the metadata but keeps who connected and when),
- * and a connection made for another repository is refused
+/** Connect the repository through the registry (see crate::repo::connect)
  * Input
     - refresh: bool - update the metadata of an existing connection
  * Output
-    - Result<Value, String> the connection, with already_connected
+    - Result<Value, String>
 */
 pub(crate) fn connect(refresh: bool) -> Result<Value, String> {
-    let (repository, identity) = crate::session::repository_identity()?;
-    let existing = connection()?;
-    if let Some(existing) = &existing {
-        if existing["repository_id"] != identity.as_str() {
-            return Err(format!(
-                "this .crane is connected to another repository ({}); remove .crane/{CONNECTION_FILE} to connect this one",
-                existing["repository_id"].as_str().unwrap_or("unknown")
-            ));
-        }
-        if !refresh {
-            let mut value = existing.clone();
-            value["already_connected"] = json!(true);
-            return Ok(value);
-        }
-    }
-    if let Some(marker) = agent_environment() {
-        return Err(format!(
-            "crane connect refuses to run in an agent environment ({marker} is set)"
-        ));
-    }
-    let inventory = discover(&Options { full: false })?;
-    let languages = inventory.languages().into_iter().map(|(name, totals)| json!({"language": name, "files": totals.files, "enforceable": totals.enforceable})).collect::<Vec<_>>();
-    let remote = git(&["remote", "get-url", "origin"]).ok();
-    let branch = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .ok()
-        .map(|reference| reference.trim_start_matches("origin/").to_string())
-        .or_else(|| git(&["branch", "--show-current"]).ok())
-        .filter(|branch| !branch.is_empty());
-    let now = now_unix();
-    let mut value = json!({
-        "connection_format": API_FORMAT,
-        "repository_id": identity,
-        "root": repository.to_string_lossy(),
-        "remote": remote,
-        "default_branch": branch,
-        "head": inventory.head,
-        "languages": languages,
-        "files": inventory.snapshot.files.len(),
-        "symbols": inventory.graph.entities.len(),
-        "connected_at": existing.as_ref().map_or(json!(now), |existing| existing["connected_at"].clone()),
-        "connected_by": existing.as_ref().map_or_else(|| json!(git(&["config", "user.email"]).ok()), |existing| existing["connected_by"].clone()),
-        "refreshed_at": existing.is_some().then_some(now),
-    });
-    fs::write(
-        root()?.join(CONNECTION_FILE),
-        serde_json::to_string_pretty(&value).map_err(io_error)? + "\n",
-    )
-    .map_err(io_error)?;
-    value["already_connected"] = json!(false);
-    Ok(value)
+    crate::repo::connect(&crate::repo::ConnectOptions {
+        refresh,
+        ..Default::default()
+    })
 }
 
 /** The Repository screen: the semantic inventory, critical regions, policy coverage, and policy
@@ -525,11 +469,12 @@ pub(crate) fn route(method: &str, path: &str, body: &Value) -> (u16, Value) {
                 _ => Err((405, "use GET or POST".into())),
             };
         }
-        if connection().map_err(failed)?.is_none() {
-            return Err((
-                409,
-                "connect the repository first: crane connect (or POST /api/connection)".into(),
-            ));
+        match connection().map_err(failed)? {
+            None => return Err((409, "connect the repository first: crane repo connect (or POST /api/connection)".into())),
+            Some(record) if record["connection_status"] != "connected" => {
+                return Err((409, "the repository is disconnected: crane repo connect (or POST /api/connection) reconnects it".into()))
+            }
+            Some(_) => {}
         }
         if method == "POST" {
             if let Some(marker) = agent_environment() {
@@ -538,7 +483,33 @@ pub(crate) fn route(method: &str, path: &str, body: &Value) -> (u16, Value) {
         }
         let value = match (method, rest) {
             ("GET", ["repository"]) => repository().map_err(failed)?,
+            ("GET", ["repo"]) => crate::repo::status().map_err(failed)?,
             ("GET", ["zones"]) => zones().map_err(failed)?,
+            ("GET", ["zones", "recommendations"]) => {
+                crate::zones::review::summary().map_err(failed)?
+            }
+            ("POST", ["zones", "recommendations"]) => {
+                crate::zones::review::run(body["by"].as_str().map(String::from)).map_err(failed)?
+            }
+            ("GET", ["zones", "recommendations", id]) => {
+                crate::zones::review::load(id).map_err(|error| (404, error))?
+            }
+            ("POST", ["zones", "recommendations", id, action]) => {
+                let text = |key: &str| body[key].as_str().map(String::from);
+                match *action {
+                    "review" => crate::zones::review::claim(id, text("by")).map_err(failed)?,
+                    "approve" => {
+                        crate::zones::review::approve(id, text("approver"), text("confirm"))
+                            .map_err(failed)?
+                    }
+                    "reject" => crate::zones::review::reject(id, text("approver"), text("reason"))
+                        .map_err(failed)?,
+                    other => {
+                        return Err((404, format!("unknown zone recommendation action '{other}'")))
+                    }
+                }
+            }
+            ("GET", ["zones", "audit"]) => crate::zones::review::audit_log().map_err(failed)?,
             ("GET", ["contracts"]) => contracts().map_err(failed)?,
             ("GET", ["contracts", name]) => contract(name).map_err(|error| (404, error))?,
             ("POST", ["contracts", "preview"]) => match editor::agentscript(body) {
@@ -605,8 +576,112 @@ pub(crate) fn route(method: &str, path: &str, body: &Value) -> (u16, Value) {
                 }
                 contract(name).map_err(failed)?
             }
+            ("GET", ["flow"]) => crate::flow::status(None).map_err(failed)?,
+            ("GET", ["flow", "audit"]) => crate::flow::audit(None).map_err(failed)?,
+            ("GET", ["flow", task]) => crate::flow::status(Some(task)).map_err(failed)?,
+            ("POST", ["flow", task, "advance"]) => crate::flow::advance(
+                task,
+                body["now"] == true,
+                body["by"].as_str().unwrap_or("crane dashboard"),
+            )
+            .map_err(failed)?,
+            ("GET", ["tasks"]) => crate::intake::list().map_err(failed)?,
+            ("GET", ["tasks", task]) if *task != "contracts" => {
+                crate::intake::show(task).map_err(|error| (404, error))?
+            }
+            ("POST", ["tasks", task, action]) if *task != "contracts" => {
+                let text = |key: &str| body[key].as_str().map(String::from);
+                let by = text("by").unwrap_or_else(|| "crane dashboard".into());
+                match *action {
+                    "prepare" => {
+                        crate::intake::prepare(task, text("checkpoint"), &by).map_err(failed)?
+                    }
+                    "approve" => crate::intake::approve(task, text("approver"), text("confirm"))
+                        .map_err(failed)?,
+                    "launch" => crate::intake::launch(
+                        task,
+                        text("agent"),
+                        text("autonomy")
+                            .map(|value| crate::zones::model::Autonomy::parse(&value))
+                            .transpose()
+                            .map_err(failed)?,
+                        body["isolate"] == true,
+                        &by,
+                    )
+                    .map_err(failed)?,
+                    other => return Err((404, format!("unknown task action '{other}'"))),
+                }
+            }
+            ("GET", ["tasks", "contracts"]) => crate::task_contracts::list().map_err(failed)?,
+            ("GET", ["tasks", "contracts", task]) => crate::task_contracts::load(task, None)
+                .map_err(failed)?
+                .ok_or_else(|| (404, format!("task {task} has no contract")))?,
+            ("GET", ["tasks", "contracts", task, "history"]) => {
+                crate::task_contracts::history(task).map_err(failed)?
+            }
+            ("POST", ["tasks", "contracts", task, action]) => {
+                let text = |key: &str| body[key].as_str().map(String::from);
+                match *action {
+                    "compile" => crate::task_contracts::compile(
+                        task,
+                        body["checkpoint"].as_str().unwrap_or("baseline"),
+                        &text("by").map_or_else(
+                            || "crane dashboard".to_string(),
+                            |by| format!("{by} (crane dashboard)"),
+                        ),
+                    )
+                    .map_err(failed)?,
+                    "approve" => {
+                        crate::task_contracts::approve(task, text("approver"), text("confirm"))
+                            .map_err(failed)?
+                    }
+                    "reject" => {
+                        crate::task_contracts::reject(task, text("approver"), text("reason"))
+                            .map_err(failed)?
+                    }
+                    other => return Err((404, format!("unknown task contract action '{other}'"))),
+                }
+            }
+            ("GET", ["policies", "activation"]) => {
+                crate::task_contracts::activation::record().map_err(failed)?
+            }
             ("GET", ["sessions"]) => sessions().map_err(failed)?,
             ("GET", ["sessions", id]) => session(id).map_err(|error| (404, error))?,
+            ("POST", ["sessions", "run"]) => {
+                let task = body["task"]
+                    .as_str()
+                    .ok_or((400, "body.task is required".to_string()))?;
+                let driver = match body["actions"].as_array() {
+                    Some(actions) => crate::session_orchestrator::Driver::Script(actions.clone()),
+                    None => crate::session_orchestrator::Driver::Detach,
+                };
+                crate::session_orchestrator::run(
+                    task,
+                    body["agent"].as_str().map(String::from),
+                    body["autonomy"]
+                        .as_str()
+                        .map(crate::zones::model::Autonomy::parse)
+                        .transpose()
+                        .map_err(failed)?,
+                    driver,
+                    body["approve"] == true,
+                    body["by"].as_str().unwrap_or("crane dashboard"),
+                )
+                .map_err(failed)?
+            }
+            ("GET", ["sessions", id, "lifecycle"]) => crate::session_orchestrator::load(id)
+                .map_err(failed)?
+                .ok_or_else(|| {
+                    (
+                        404,
+                        format!("session {id} is not governed by the orchestrator"),
+                    )
+                })?,
+            ("POST", ["sessions", id, "finish"]) => crate::session_orchestrator::terminate(
+                id,
+                body["by"].as_str().unwrap_or("crane dashboard"),
+            )
+            .map_err(failed)?,
             ("POST", ["simulate"]) => simulate(body).map_err(failed)?,
             ("GET", ["attestations"]) => attestations().map_err(failed)?,
             ("GET", ["attestations", id]) => attestation(id).map_err(|error| (404, error))?,

@@ -1,6 +1,6 @@
 // Task orchestration: external trackers (through TaskSourceAdapter) feed one lifecycle that
-// receives a task, fetches its context, maps it to this repository, plans and proposes a versioned
-// task contract, waits for human approval, starts the contract session, validates it, and follows
+// receives a task, fetches its context, maps it to this repository, compiles a versioned task
+// contract (crate::task_contracts), waits for human approval, starts the contract session, validates it, and follows
 // the task to completion or cancellation. Events are replayed from the CLI or posted to a minimal
 // local HTTP endpoint; there is no message bus.
 
@@ -22,7 +22,7 @@ use crate::agent_session::{self, SessionOptions};
 use crate::proposals::store::{require_human, Proposal};
 use crate::repository::root;
 use crate::session::{read_attestation, session_ids, ContractSession};
-use crate::tasks::{plan, proposal_content};
+use crate::task_contracts;
 use crate::util::{io_error, now_unix, sha256};
 use crate::zones::model::Autonomy;
 use adapters::{adapter, EventKind, SourceEvent, TaskSourceAdapter};
@@ -244,7 +244,7 @@ fn tasks_directory() -> Result<PathBuf, String> {
     - value: Value - the configuration document
 */
 pub(crate) struct SourceConfig {
-    value: Value,
+    pub(crate) value: Value,
 }
 
 impl SourceConfig {
@@ -273,7 +273,7 @@ impl SourceConfig {
      * Output
         - bool
     */
-    fn for_society(&self, assignees: &[String]) -> bool {
+    pub(crate) fn for_society(&self, assignees: &[String]) -> bool {
         match self.value["agent_assignees"].as_array() {
             Some(agents) if !agents.is_empty() => agents.iter().any(|agent| {
                 agent.as_str().is_some_and(|agent| {
@@ -293,7 +293,7 @@ impl SourceConfig {
      * Output
         - Option<&Value> {"repositories": [...], "team": ...}
     */
-    fn mapping(&self, source: &str, project: &str) -> Option<&Value> {
+    pub(crate) fn mapping(&self, source: &str, project: &str) -> Option<&Value> {
         self.value[source]["projects"].get(project)
     }
 
@@ -304,7 +304,7 @@ impl SourceConfig {
      * Output
         - String
     */
-    fn text(&self, key: &str, default: &str) -> String {
+    pub(crate) fn text(&self, key: &str, default: &str) -> String {
         self.value[key].as_str().unwrap_or(default).to_string()
     }
 }
@@ -648,6 +648,7 @@ fn process(
             if record.state().terminal() {
                 "already finished".to_string()
             } else if kind == EventKind::Closed && record.state() == TaskState::Merged {
+                crate::task_completion::completed_externally(&record.id)?;
                 finish(
                     &mut record,
                     TaskState::Completed,
@@ -783,26 +784,25 @@ fn analyze(
             false,
         )?;
     }
-    let version = record.value["contract_version"].as_u64().unwrap_or(0) + 1;
-    record.value["contract_version"] = json!(version);
     record.value["task_digest"] = json!(digest);
     let tasks = root()?.join("tasks");
     fs::create_dir_all(&tasks).map_err(io_error)?;
     let text = serde_json::to_string_pretty(&normalized).map_err(io_error)? + "\n";
     fs::write(tasks.join(format!("{}.json", record.id)), &text).map_err(io_error)?;
-    let archive = TaskRecord::path(&record.id)?.with_file_name(format!("task.v{version}.json"));
-    if let Some(folder) = archive.parent() {
-        fs::create_dir_all(folder).map_err(io_error)?;
-    }
-    fs::write(archive, &text).map_err(io_error)?;
     if let Some(previous) = record.value["proposal"].as_str().map(String::from) {
         if let Ok(mut proposal) = Proposal::load(&previous) {
-            proposal.supersede(&format!("contract version {version}"))?;
+            proposal.supersede("a new task version")?;
         }
     }
+    // The task contract layer plans, binds, versions, and proposes the contract
     let checkpoint = config.text("checkpoint", "baseline");
-    let planned = match plan(&input, &digest, &checkpoint) {
-        Ok(planned) => planned,
+    let generator = format!(
+        "crane task ingest ({} {})",
+        adapter.name(),
+        event.kind.name()
+    );
+    let compiled = match task_contracts::compile(&record.id, &checkpoint, &generator) {
+        Ok(compiled) => compiled,
         Err(error) => {
             record.transition(
                 TaskState::Failed,
@@ -812,16 +812,27 @@ fn analyze(
             return Ok(format!("failed: {error}"));
         }
     };
-    let status = planned["status"].as_str().unwrap_or_default().to_string();
-    if let Some(versions) = record.value["versions"].as_array_mut() {
-        versions.push(json!({"version": version, "task_digest": digest, "event": cause, "plan_status": status}));
+    let version = compiled["version"].as_u64().unwrap_or(1);
+    record.value["contract_version"] = json!(version);
+    let archive = TaskRecord::path(&record.id)?.with_file_name(format!("task.v{version}.json"));
+    if let Some(folder) = archive.parent() {
+        fs::create_dir_all(folder).map_err(io_error)?;
     }
-    if status != "planned" {
-        let details = planned["clarifications"]
+    fs::write(archive, &text).map_err(io_error)?;
+    let status = compiled["plan_status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Some(versions) = record.value["versions"].as_array_mut() {
+        versions.push(json!({"version": version, "task_digest": digest, "event": cause, "plan_status": status, "contract_status": compiled["status"], "contract_digest": compiled["digest"]}));
+    }
+    if compiled["status"] != "proposed" {
+        let details = compiled["clarifications"]
             .as_array()
             .into_iter()
             .flatten()
-            .chain(planned["conflicts"].as_array().into_iter().flatten())
+            .filter(|item| item["blocking"] != false)
+            .chain(compiled["conflicts"].as_array().into_iter().flatten())
             .filter_map(|item| item["message"].as_str())
             .collect::<Vec<_>>()
             .join("; ");
@@ -829,30 +840,96 @@ fn analyze(
         record.transition(TaskState::Blocked, cause, &format!("{status}: {details}"))?;
         return Ok(format!("blocked: {status}"));
     }
-    let name = format!(
-        "{}_v{version}",
-        planned["policy_name"].as_str().unwrap_or("task")
-    );
-    Proposal::ensure_free(&name)?;
-    let content = proposal_content(&record.id, &name, &checkpoint)?;
-    Proposal::create(
-        &name,
-        &checkpoint,
-        json!({"kind": "task", "task_id": record.id, "contract_version": version}),
-        content,
-        &format!(
-            "crane task ingest ({} {})",
-            adapter.name(),
-            event.kind.name()
-        ),
-    )?;
-    record.value["proposal"] = json!(name);
+    let name = compiled["proposal"]["proposal_id"]
+        .as_str()
+        .or(compiled["contract_id"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    record.value["proposal"] = compiled["proposal"]["proposal_id"].clone();
     record.transition(
         TaskState::ContractProposed,
         cause,
         &format!("task contract {name} proposed; waiting for human approval"),
     )?;
     Ok(format!("proposed {name}"))
+}
+
+/** Adopt a task contract version compiled after the one the record follows (a human compiled the
+ * task again, after it was blocked or while its earlier version waited), when it is proposed or
+ * already approved
+ * Input
+    - record: &mut TaskRecord - task record
+    - cause: &str - event id or command
+ * Output
+    - Result<bool, String> whether a newer version was adopted
+*/
+fn adopt(record: &mut TaskRecord, cause: &str) -> Result<bool, String> {
+    let Some(latest) = task_contracts::load(&record.id, None).ok().flatten() else {
+        return Ok(false);
+    };
+    let version = latest["version"].as_u64().unwrap_or(0);
+    if version <= record.value["contract_version"].as_u64().unwrap_or(0)
+        || !matches!(latest["status"].as_str(), Some("proposed" | "approved"))
+    {
+        return Ok(false);
+    }
+    record.value["contract_version"] = json!(version);
+    record.value["proposal"] = latest["proposal"]["proposal_id"].clone();
+    if let Some(versions) = record.value["versions"].as_array_mut() {
+        versions.push(json!({"version": version, "task_digest": latest["bindings"]["task"]["task_digest"], "event": cause, "plan_status": latest["plan_status"], "contract_status": latest["status"], "contract_digest": latest["digest"]}));
+    }
+    let id = latest["contract_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    record.transition(
+        TaskState::Analyzing,
+        cause,
+        &format!("task contract {id} was compiled"),
+    )?;
+    record.transition(
+        TaskState::ContractProposed,
+        cause,
+        &format!("task contract {id} proposed; waiting for human approval"),
+    )?;
+    Ok(true)
+}
+
+/** Stop a task whose contract was invalidated (its checkpoint, policies, zones, autonomy, budget,
+ * organization, or task changed): its sessions are cancelled and it is blocked until a human
+ * compiles and approves the contract again
+ * Input
+    - record: &mut TaskRecord - task record
+    - cause: &str - event id or command
+ * Output
+    - Result<bool, String> whether the task was stopped
+*/
+fn stop_if_invalidated(record: &mut TaskRecord, cause: &str) -> Result<bool, String> {
+    let version = record.value["contract_version"].as_u64().unwrap_or(0);
+    let Some(contract) = task_contracts::load(&record.id, Some(version))
+        .ok()
+        .flatten()
+    else {
+        return Ok(false);
+    };
+    if contract["status"] != "invalidated" {
+        return Ok(false);
+    }
+    let reason = format!(
+        "contract {} invalidated: {}",
+        contract["contract_id"].as_str().unwrap_or_default(),
+        contract["invalidation"]["message"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    stop_sessions(record, &reason, false)?;
+    record.transition(
+        TaskState::Analyzing,
+        cause,
+        "the task contract was invalidated",
+    )?;
+    record.transition(TaskState::Blocked, cause, &reason)?;
+    Ok(true)
 }
 
 /** End every contract session of a task (recorded ones and any bound to the task id) through
@@ -940,12 +1017,47 @@ fn advance_automatically(
 ) -> Result<(), String> {
     for _ in 0..6 {
         match record.state() {
+            TaskState::Blocked => {
+                if !adopt(record, cause)? {
+                    return Ok(());
+                }
+            }
             TaskState::ContractProposed => {
-                let Some(name) = record.value["proposal"].as_str().map(String::from) else {
+                if adopt(record, cause)? {
+                    continue;
+                }
+                let version = record.value["contract_version"].as_u64().unwrap_or(0);
+                let contract = task_contracts::load(&record.id, Some(version))
+                    .ok()
+                    .flatten();
+                let Some(name) =
+                    record.value["proposal"]
+                        .as_str()
+                        .map(String::from)
+                        .or_else(|| {
+                            contract.as_ref().and_then(|contract| {
+                                contract["contract_id"].as_str().map(String::from)
+                            })
+                        })
+                else {
                     return Ok(());
                 };
-                let proposal = Proposal::load(&name)?;
-                match proposal.status() {
+                // The contract follows its proposal, so either approval path is seen here
+                let status = match &contract {
+                    Some(contract) => match contract["status"].as_str().unwrap_or_default() {
+                        "approved" => "approved",
+                        "rejected" => "rejected",
+                        "invalidated" => {
+                            stop_if_invalidated(record, cause)?;
+                            return Ok(());
+                        }
+                        _ => "pending",
+                    }
+                    .to_string(),
+                    None => Proposal::load(&name)?.status().to_string(),
+                };
+                let proposal = Proposal::load(&name).ok();
+                match status.as_str() {
                     "approved" => {
                         if let Some(previous) =
                             record.value["active_proposal"].as_str().map(String::from)
@@ -957,8 +1069,14 @@ fn advance_automatically(
                             }
                         }
                         record.value["active_proposal"] = json!(name);
-                        let approver = proposal.document["activation"]["approver"]
-                            .as_str()
+                        let approver = contract
+                            .as_ref()
+                            .and_then(|contract| contract["approval"]["approver"].as_str())
+                            .or_else(|| {
+                                proposal.as_ref().and_then(|proposal| {
+                                    proposal.document["activation"]["approver"].as_str()
+                                })
+                            })
                             .unwrap_or("a human")
                             .to_string();
                         record.transition(
@@ -968,8 +1086,14 @@ fn advance_automatically(
                         )?;
                     }
                     "rejected" => {
-                        let reason = proposal.document["rejection"]["reason"]
-                            .as_str()
+                        let reason = contract
+                            .as_ref()
+                            .and_then(|contract| contract["rejection"]["reason"].as_str())
+                            .or_else(|| {
+                                proposal.as_ref().and_then(|proposal| {
+                                    proposal.document["rejection"]["reason"].as_str()
+                                })
+                            })
                             .unwrap_or("no reason given")
                             .to_string();
                         record.transition(
@@ -982,6 +1106,9 @@ fn advance_automatically(
                 }
             }
             TaskState::Approved => {
+                if stop_if_invalidated(record, cause)? {
+                    return Ok(());
+                }
                 let session = start_session(record, config)?;
                 record.transition(
                     TaskState::Executing,
@@ -990,6 +1117,9 @@ fn advance_automatically(
                 )?;
             }
             TaskState::Executing => {
+                if stop_if_invalidated(record, cause)? {
+                    return Ok(());
+                }
                 let Some(session) = record.sessions().last().cloned() else {
                     return Ok(());
                 };
@@ -1175,20 +1305,41 @@ pub(crate) fn delivery_progress(id: &str, merged: Option<&str>) -> Result<Option
                     record.state().name()
                 ));
             }
-            credit_milestone(id, TaskState::Completed)?;
+            // MERGED, not COMPLETED: the task completes once its tracker completion is confirmed
             record.value["merge_sha"] = json!(sha);
-            finish(
-                &mut record,
-                TaskState::Completed,
-                cause,
-                &format!("merged as {sha} and verified"),
-            )?;
             record.save()?;
             Ok(Some(
                 json!({"source": record.value["source"], "external_id": record.value["external_id"]}),
             ))
         }
     }
+}
+
+/** Complete a merged task once its tracker completion is confirmed (by the completion dispatcher,
+ * or because the issue was already completed); a task that is not MERGED is left as it is
+ * Input
+    - id: &str - task id
+    - event: &str - completion event id
+ * Output
+    - Result<bool, String> whether the task was completed now
+*/
+pub(crate) fn completion_confirmed(id: &str, event: &str) -> Result<bool, String> {
+    let _lock = Lock::acquire()?;
+    let Some(mut record) = TaskRecord::load(id)? else {
+        return Ok(false);
+    };
+    if record.state() != TaskState::Merged {
+        return Ok(false);
+    }
+    credit_milestone(id, TaskState::Completed)?;
+    record.value["completion_event"] = json!(event);
+    let reason = format!(
+        "merged as {} and completed in the tracker ({event})",
+        record.value["merge_sha"].as_str().unwrap_or_default()
+    );
+    finish(&mut record, TaskState::Completed, event, &reason)?;
+    record.save()?;
+    Ok(true)
 }
 
 /** Regenerate the budget of a task's open sessions for a milestone a human reported: a pull

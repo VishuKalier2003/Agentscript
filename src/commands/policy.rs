@@ -25,6 +25,68 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("crane policy {operation} requires a proposal name"))
     };
     match operation {
+        "status" | "activation" => {
+            let state = crate::task_contracts::activation::record()?;
+            if json {
+                println!("{}", pretty(&state)?);
+                return Ok(());
+            }
+            let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+            println!("Persistent policy version: {}", text(&state["policy_version"]));
+            println!(
+                "Organization: {} (team {})",
+                state["organization"]["organization"].as_str().unwrap_or("unspecified"),
+                state["organization"]["team"].as_str().unwrap_or("unspecified")
+            );
+            for layer in ["organization", "repository", "task"] {
+                let policies = state["policies"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|policy| policy["layer"] == layer)
+                    .collect::<Vec<_>>();
+                println!("{layer} policies ({}):", policies.len());
+                for policy in policies {
+                    let origin = match policy["origin"].as_str() {
+                        Some(origin) => origin.to_string(),
+                        None => format!(
+                            "approved from proposal {} by {}",
+                            text(&policy["origin"]["proposal"]),
+                            text(&policy["origin"]["approver"])
+                        ),
+                    };
+                    println!(
+                        "  {:<28} {} {}",
+                        text(&policy["policy"]),
+                        policy["malformed"].as_str().map_or_else(
+                            || format!("{} rules, checkpoint {}", policy["rules"], text(&policy["checkpoint"])),
+                            |error| format!("MALFORMED ({error})")
+                        ),
+                        origin
+                    );
+                }
+            }
+            for missing in state["layers"]["organization"]["declared_but_missing"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!("  declared by the organization but not active: {}", text(missing));
+            }
+            let history = state["history"].as_array().cloned().unwrap_or_default();
+            println!("Activation history ({} versions recorded):", history.len());
+            for entry in history.iter().rev().take(5) {
+                let changes = entry["changes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|change| format!("{} {}", text(&change["change"]), text(&change["policy"])))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  {} at {}: {}", text(&entry["policy_version"]).trim_start_matches("sha256:").chars().take(12).collect::<String>(), entry["at"], if changes.is_empty() { "first record".into() } else { changes });
+            }
+            Ok(())
+        }
         "propose" => {
             let minimum = Confidence::parse(&option(args, "--min-confidence").unwrap_or_else(|| "medium".into()))?;
             let proposal = Proposal::propose(
@@ -117,7 +179,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown policy operation '{other}'; use propose, proposals, show, edit, approve, reject, or regenerate"
+            "unknown policy operation '{other}'; use status, propose, proposals, show, edit, approve, reject, or regenerate"
         )),
     }
 }

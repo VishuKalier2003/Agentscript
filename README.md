@@ -26,7 +26,43 @@ It also implements the Git-backed workflow discussed during design:
 - `crane agent install --profile claude`
 - `crane status`
 
-## Core idea
+## The golden path
+
+One approved engineering task can be executed by an AI agent under Society
+governance and automatically progress from repository connection to verified
+merge and task completion.
+
+| # | Step | CLI (the dashboard's Flow screen and `/api/flow` show the same) |
+|---|---|---|
+| 1 | Connect the GitHub repository | `crane repo connect` |
+| 2 | Discover the repository | runs with the connection (`crane repo connect --refresh` again) |
+| 3 | Review recommended zones | `crane zones recommend`, `crane zones review ID`, `crane zones approve ID ...` |
+| 4 | Approve policies | `crane policy propose` or the policy editor, then `crane policy approve NAME ...` |
+| 5 | Connect Claude or Codex | `crane agent install --profile claude\|codex`, `crane agent hooks ...` |
+| 6 | Select the Jira task | `crane task list`, `crane task prepare PAY-1830` |
+| 7 | Review and approve the contract | `crane task show PAY-1830`, `crane task approve PAY-1830 ...` |
+| 8 | Start the agent | `crane session run PAY-1830 --agent codex --detach`, then start Codex with `CRANE_SESSION` |
+| 9 | Society governs execution | every tool call goes through the authority engine |
+| 10 | Verify the changes | `crane session finish SESSION` |
+| 11 | Generate the PR and attestation | `crane flow advance PAY-1830` |
+| 12 | Review in Slack | the Slack buttons (or `crane deliver approve`) |
+| 13 | Merge | `crane flow advance PAY-1830` |
+| 14 | Close the Jira task automatically | `crane flow advance PAY-1830` (the completion dispatcher) |
+
+**Where you are.** `crane flow status [TASK]` shows one top-level stage (and
+who acts next) above every layer:
+
+- repository, discovery, policy, zones;
+- task, contract, agent, session, authority;
+- verification, attestation, PR, approval, merge, task completion.
+
+It also checks that the identifiers linking the layers agree.
+
+**Moving on.** `crane flow advance TASK` runs only the steps that need no human
+decision: deliver, merge once the merge policy is satisfied, and complete the
+Jira issue.
+
+## Core idea## Core idea
 
 A checkpoint is an explicit trusted Git commit.
 
@@ -257,6 +293,52 @@ generated hook entries deliberately if that file already exists. The hooks
 never create or move checkpoints, modify policies, or edit source code, and
 they work for every language supported by the verifier.
 
+### Attaching Claude Code or Codex to an approved session
+
+After `crane task launch PAY-1821 --agent claude`, start the agent in the
+repository with the Society session it was launched for:
+
+```bash
+crane agent install --profile claude               # additive and idempotent
+crane agent hooks --profile claude                 # validates events, matchers, rules, crane on PATH
+CRANE_SESSION=claude-task-PAY-1821-v1 claude       # or CRANE_TASK_ID=PAY-1821
+crane agent status --session claude-task-PAY-1821-v1
+crane agent uninstall --profile claude             # removes only Crane's hooks and rules
+```
+
+**Binding.** Claude Code and Codex use their own session ids. A hook binds
+each event to its Society session deterministically:
+
+1. the session named by `CRANE_SESSION`;
+2. otherwise the agent's launched session of the task's current approved
+   contract (`CRANE_TASK_ID`);
+3. otherwise the session keyed by the provider's own id.
+
+The attachment, with the provider's session id, model, and transcript, is
+journaled.
+
+**Adapters only translate.** The adapters turn each payload into the common
+`AgentAction`:
+
+- **Claude:** `Read`/`Edit`/`Write`/`MultiEdit`/`Bash`/MCP tools.
+- **Codex:** `apply_patch` (also through the shell), shell commands as
+  strings or argument vectors, and Codex's read-only tools.
+
+The authority engine decides everything else: contract, zones, autonomy,
+budget, and safety.
+
+**Failures never allow.** None of these can authorize anything:
+
+- a hook that cannot bind its session (unknown, ended, or another provider's
+  session);
+- a payload for another event;
+- an agent working outside the session's repository;
+- unreadable input;
+- a crash.
+
+Each gets the provider's blocking answer. Claude: exit code 2. Codex: exit
+code 2, a deny decision, or decision "block".
+
 ### Automatic Codex CLI hooks
 
 Run this once from an application repository:
@@ -466,6 +548,157 @@ exactly what is missing. A task that must change permanently protected code
 returns `task_conflicts_with_policy`. `--json` prints the plan, and
 `--propose` stores the contract as a pending proposal that only a human can
 approve.
+
+### Compiled task contracts and policy activation
+
+`crane task contract compile PAY-1821` turns a task into a versioned,
+executable contract (`.crane/task-contracts/PAY-1821/v1.json`). It holds the
+six sections, the AgentScript that enforces them, and a digest. The contract
+is bound to:
+
+- the repository;
+- the task;
+- the checkpoint SHA;
+- the persistent policy version;
+- the zone set;
+- the autonomy policy;
+- the budget model;
+- the organization.
+
+```bash
+crane policy status                          # active policies: organization, repository, task layers
+crane task contract compile PAY-1821         # proposed | clarification_required | conflicts_with_policy
+crane task contract show PAY-1821            # sections, bindings, authority, how to approve
+crane task contract approve PAY-1821 --approver NAME --confirm DIGEST_PREFIX
+crane task contract history PAY-1821         # versions and the hash-chained audit log
+```
+
+"Fix duplicate payment processing in PaymentService" compiles to a contract
+bounded to the `PaymentService` class and its module. The organization's
+policies still hold inside it (`charge` stays preserved), and changes in the
+Critical payments zone still need approval. It does not compile to
+repository-wide authority.
+
+**Vague tasks.** A vague task ("Fix the payment bug") compiles to
+`clarification_required`. That contract lists what is missing, has no scope,
+and can never be approved.
+
+**Sessions.** A session bound to a task holds at most assisted autonomy (every
+change needs approval) until the task's contract is approved. Once it is
+approved, writes outside the task scope need approval in delegated and
+autonomous mode alike.
+
+**Invalidation.** When the checkpoint, persistent policies, zones, autonomy
+policy, budget model, organization, or repository change, the contract is
+invalidated: its task policy is retired, it cannot be approved, and the task's
+sessions lose their authority. It must be compiled and approved again. A
+changed task becomes a new version instead.
+
+**Agents.** Agents can read contracts. They can never compile, approve, or
+reject one, and trying quarantines the session.
+
+### From a Jira task to a session ready to run
+
+```bash
+crane repo connect                                # once
+crane task list                                   # tracker tasks mapped to this repository, with state
+crane task show PAY-1821                          # the task as Society reads it, contract, binding
+crane task prepare PAY-1821                       # fetch, validate, compile the contract
+crane task approve PAY-1821 --approver NAME --confirm DIGEST_PREFIX
+crane task launch PAY-1821 --agent claude         # READY TO RUN: session claude-task-PAY-1821-v1
+```
+
+**Where tasks come from.** In local mode, tasks are the tracker snapshots in
+`.crane/sources/jira/issues/` and `.crane/sources/asana/tasks/`, as the
+trackers' APIs return them. Their projects map to repositories in
+`.crane/sources/config.json`.
+
+**States.** A task's state is derived from the facts each time it is read:
+the tracker, the contract, and the launched session.
+
+| State | Meaning |
+|---|---|
+| `AVAILABLE` | mapped here, not planned yet |
+| `PLANNING` | the contract is being compiled |
+| `NEEDS_CLARIFICATION` | the task is too vague to bound |
+| `CONTRACT_PENDING_APPROVAL` | the contract waits for a human |
+| `READY` | approved; after launch, "READY TO RUN" (the session is bound and waits for the agent) |
+| `RUNNING` | the agent connected to the session |
+| `COMPLETED` | done in the tracker, or the contract or session was finished |
+| `BLOCKED` | a human has to act (conflict, rejection, an invalidated or obsolete contract) |
+| `FAILED` | fetching or planning failed |
+
+**The launch binding.** The launched session's binding covers:
+
+- the task id and the contract digest;
+- the repository and the checkpoint;
+- the agent;
+- autonomy, budget, and zones;
+- the policy version.
+
+It is digest-checked every time the task is read.
+
+**Idempotence and obsolete contracts.**
+
+- Planning, approving, and launching again change nothing.
+- A second agent is refused while one holds the contract.
+- A launch is refused when the contract is not approved, is invalidated, is
+  not the latest version, or its ticket changed in the tracker since it was
+  planned.
+- A session whose contract was superseded or invalidated can no longer change
+  anything.
+
+**Dashboard.** The Tasks screen shows each task with its status, contract,
+selected agent, checkpoint, and session. The same actions are available at
+`/api/tasks`.
+
+### Running a task through the governed lifecycle
+
+One command launches an approved task and drives it to a verdict:
+
+```bash
+crane session run PAY-1830 --agent codex --actions actions.json   # Crane executes permitted actions
+crane session run PAY-1830 --agent claude -- claude -p "Do PAY-1830" # a real agent; its hooks attach
+crane session run PAY-1830 --agent claude --detach                 # start the agent yourself, then:
+crane session finish claude-task-PAY-1830-v1
+crane session lifecycle claude-task-PAY-1830-v1
+```
+
+**The lifecycle:**
+
+1. TASK_READY
+2. SESSION_CREATED
+3. AGENT_CONNECTED
+4. RUNNING (DEGRADED or QUARANTINED when safety drops)
+5. STOPPING
+6. RECONCILING
+7. VERIFIED
+8. DELIVERY_READY, or FAILED at any point before VERIFIED
+
+**The binding.** The session is bound immutably to:
+
+- the repository and the task;
+- the contract and its digest;
+- the policy and zone versions;
+- the checkpoint;
+- the agent;
+- the autonomy mode, safety state, and budget;
+- the organization configuration.
+
+**Each action.** For every action, the binding is checked first. The existing
+authority engine then decides it: ALLOW, DENY, APPROVAL, or QUARANTINE.
+Permitted actions are executed, then the resulting repository state is
+verified incrementally.
+
+**Termination.** Execution is frozen, then:
+
+- the repository is reconciled as it is, whatever the agent claims;
+- the contract tests run;
+- the repository tests of the testing policy run (`session_tests` in
+  `.crane/testing.json`: `affected`, `all`, or `none`);
+- the attestation is written.
+
+Only a DELIVERY_READY session can be delivered. A FAILED session stays FAILED.
 
 ## Jira and Asana
 
@@ -717,6 +950,183 @@ crane deliver exception SESSION_ID --check lint --approver NAME --reason TEXT --
 crane deliver merge SESSION_ID
 crane task serve   # also accepts Slack button clicks on POST /slack/actions
 ```
+
+### Verified delivery
+
+```bash
+crane deliver run codex-task-PAY-1830-v1        # only from a verified session: commit, tests, PR, Slack
+crane deliver approve codex-task-PAY-1830-v1 --approver payments-lead
+crane deliver merge codex-task-PAY-1830-v1      # only when the merge policy allows it
+crane deliver merged codex-task-PAY-1830-v1 --sha MERGE_SHA   # a merge reported by the host
+```
+
+**Verification first.** A governed session is delivered only when the
+orchestrator verified it (`DELIVERY_READY`). Any other session is delivered
+only once its finalization reconciled to PASS.
+
+**The binding.** The delivery commit carries trailers: `Crane-Session`,
+`Crane-Task`, `Crane-Contract-Digest`, and `Crane-Attestation`. The round
+records a binding digest over:
+
+- the repository, task, contract digest, and checkpoint;
+- the base and branch;
+- the checked commit and its tree;
+- the check results;
+- the attestation;
+- the zones and autonomy.
+
+**The pull request** shows that binding, the affected zones, the validation
+results, the attestation, the autonomy mode, and the exceptions.
+
+**Slack.** Slack messages and buttons name the repository, task, commit,
+contract, attestation, and binding. Slack signatures (HMAC) are verified as
+before.
+
+**Approvals** are idempotent (the same approver counts once) and bound to the
+round's binding: commit and checks. They are also time-bound when
+`merge_policy.approval_ttl_seconds` is set.
+
+**Merge eligibility.** A merge needs the merge rule for the session's autonomy
+and zone criticality. Merging also requires that:
+
+- the binding is still intact;
+- the task contract is still current;
+- the governed session is still `DELIVERY_READY`.
+
+**After a merge.** A successful merge makes the merge commit the trusted
+checkpoint and the connected repository's trusted state, completes the task,
+and the delivery becomes `COMPLETE`.
+
+**Failures and repeats.**
+
+- A failed merge is recorded (`MERGE_FAILED`) and completes nothing.
+- Merging again, or a repeated merge callback, changes nothing.
+- A host merge that did not meet the policy is never completed.
+
+**Providers.** Pull requests and merges go through the repository provider
+abstraction. The `local` provider keeps records and merges with git. The
+`github` provider pushes the branch and runs the GitHub CLI (`github_cli`),
+merging only the checked head commit.
+
+### Jira completion after a verified merge
+
+A task's Jira issue is completed only after Society has verified that its
+governed change merged. None of these complete it: the agent stopping, local
+tests passing, the pull request, or an approval.
+
+**The lifecycle:**
+
+1. RUNNING
+2. VERIFIED
+3. DELIVERY_PENDING
+4. PR_REVIEW
+5. MERGED
+6. TASK_COMPLETION_PENDING (COMPLETION_RETRY_PENDING while Jira is unreachable)
+7. COMPLETED
+
+```bash
+crane task completions list                 # completion events and their state
+crane task completions send                 # send the due events (--now ignores the backoff)
+crane task completions reconcile --send     # after a restart: recover, re-queue, send
+```
+
+**The completion event.** A merge creates one completion event per repository,
+task, and merge commit. The event:
+
+- stores the task, repository, merge SHA, attestation, contract digest, and
+  event id;
+- queues its Jira comment and transition in the delivery outbox.
+
+**The dispatcher.** It reaches Jira through the transport configured in
+`.crane/delivery.json` (`trackers.jira.transport`; `examples/jira_transport.py`
+is a ready one). Crane makes no network calls itself. Each attempt:
+
+1. checks the issue's status (an issue already done was completed
+   externally);
+2. comments once (the comment carries the event id, so it is never posted
+   twice);
+3. transitions the issue;
+4. checks the status again.
+
+**Retries.** When Jira is unavailable, the event is kept and retried with
+backoff. The task waits in COMPLETION_RETRY_PENDING and is never marked
+failed, and the engineering session is never rerun.
+
+## Repository connection
+
+Connect the repository once:
+
+```bash
+crane repo connect      # or: crane connect
+```
+
+Connecting does all of this in one step:
+- initializes `.crane` if needed;
+- makes sure the trusted checkpoint (`baseline`) exists, creating it at HEAD only if it is
+  missing (an existing checkpoint is never moved);
+- runs discovery;
+- records the repository identity, provider, owner, name, default branch, and the policy and
+  zone versions in `.crane/connection.json`.
+
+The provider is read offline from the `origin` remote:
+
+| Provider | Remotes |
+| --- | --- |
+| `github` | github.com and `github.*` hosts |
+| `git` | any other host |
+| `local` | no remote |
+
+Credentials embedded in the remote URL are never stored.
+
+Connecting again changes nothing (`--refresh` updates the metadata). Discovery, zones, policies,
+task planning, sessions, delivery, and the dashboard all read this record.
+
+| Command | Shows |
+| --- | --- |
+| `crane repo status` | connection, branch, trusted checkpoint (current, stale with the commit count, missing, or invalid), discovery freshness, policy/zone drift |
+| `crane repo inspect` | the above plus branches, worktrees (session worktrees marked), checkpoints, capabilities, readiness, history |
+| `crane repo disconnect [--forget]` | disconnects: the dashboard stops; configuration and history are kept for a reconnect (`--forget` removes the record) |
+
+## Zone recommendations and review
+
+Zones can be recommended by discovery instead of written by hand:
+
+```bash
+crane zones recommend                       # discovery -> proposals (nothing is active yet)
+crane zones recommendations                 # list them
+crane zones review payments                 # rationale, signals, affected files, the zone file it would write
+crane zones approve payments --approver NAME --confirm DIGEST_PREFIX   # writes .crane/zones/payments.zone
+crane zones reject api --approver NAME --reason "too broad"
+crane zones audit                           # hash-chained approve/reject log
+```
+
+**Signals.** Recommendations reuse the signals Crane already has:
+- the inventory's risk signals (persistence, entry points, network calls, high fan-in);
+- the proposal engine's payment, authentication and secrets vocabulary;
+- its protected regions (migrations, infrastructure, production and secret configuration);
+- the Payments and Testing packs;
+- agent session history.
+
+**Categories.** Each module goes to its strongest category:
+
+| Category | Criticality | Suggested autonomy |
+| --- | --- | --- |
+| security | restricted | observe |
+| payments | critical | assisted |
+| data access | sensitive | delegated |
+| api | sensitive | delegated |
+| integrations | sensitive | delegated |
+| shared core | sensitive | delegated |
+| protected regions | critical (restricted for secrets) | assisted (observe for secrets) |
+| tests | routine | delegated |
+
+Every recommendation is resolved by the zone engine itself, so the resources it lists are exactly
+the ones it would govern.
+
+**Approval.** Only a human can approve or reject, quoting the reviewed digest. Approving twice
+changes nothing. Approval writes an ordinary `.crane/zones/*.zone` file, which governs sessions
+started afterwards. Agents can neither decide nor write zone files; trying quarantines the session.
+The dashboard's Zones screen offers the same review.
 
 ## Semantic control plane
 

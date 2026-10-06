@@ -1,6 +1,179 @@
 use crate::repository::ensure_initialized;
 use crate::zones::{inspect, Zones};
 
+/** Usage of the zone review commands */
+const REVIEW_USAGE: &str = "crane zones recommend [--by NAME] [--json] | recommendations [--json] | review ID [--claim] [--by NAME] [--json] | approve ID --approver NAME --confirm DIGEST_PREFIX | reject ID --approver NAME [--reason TEXT] | audit [--json]";
+
+/** Run a zone review command: discovery-driven recommendations, their review, approval or
+ * rejection by a human, and the audit log
+ * Input
+    - command: &str - recommend, recommendations, review, approve, reject, or audit
+    - args: &[String] - its arguments
+ * Output
+    - Result<(), String>
+*/
+fn review_command(command: &str, args: &[String]) -> Result<(), String> {
+    use crate::util::option;
+    use crate::zones::review;
+    let json = args.iter().any(|argument| argument == "--json");
+    let id = || {
+        args.iter()
+            .find(|argument| {
+                !argument.starts_with("--")
+                    && option(args, "--by").as_deref() != Some(argument.as_str())
+                    && option(args, "--approver").as_deref() != Some(argument.as_str())
+                    && option(args, "--confirm").as_deref() != Some(argument.as_str())
+                    && option(args, "--reason").as_deref() != Some(argument.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| format!("a recommendation id is required; use '{REVIEW_USAGE}'"))
+    };
+    let value = match command {
+        "recommend" => review::run(option(args, "--by"))?,
+        "recommendations" => review::summary()?,
+        "review" if args.iter().any(|argument| argument == "--claim") => {
+            review::claim(&id()?, option(args, "--by"))?
+        }
+        "review" => review::load(&id()?)?,
+        "approve" => review::approve(
+            &id()?,
+            option(args, "--approver"),
+            option(args, "--confirm"),
+        )?,
+        "reject" => review::reject(&id()?, option(args, "--approver"), option(args, "--reason"))?,
+        _ => review::audit_log()?,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    let text = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map_or_else(|| value.to_string(), String::from)
+    };
+    match command {
+        "recommend" => {
+            println!(
+                "Discovery {} ({} recommendations; nothing is active until a human approves):",
+                text(&value["run"]),
+                value["recommendations"].as_array().map_or(0, Vec::len)
+            );
+            for change in value["changes"].as_array().into_iter().flatten() {
+                println!("  {:<40} {}", text(&change["id"]), text(&change["change"]));
+            }
+            println!("Review with 'crane zones recommendations' and 'crane zones review ID'.");
+        }
+        "recommendations" => {
+            let list = value["recommendations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if list.is_empty() {
+                println!("No zone recommendations; run 'crane zones recommend'.");
+            }
+            for item in list {
+                println!(
+                    "  {:<34} {:<10} zone {:<22} {:<10} autonomy {:<10} {:>3} files  confidence {:<6} rev {}{}",
+                    text(&item["id"]), text(&item["status"]), text(&item["zone_id"]), text(&item["criticality"]), text(&item["autonomy"]), item["files"], text(&item["confidence"]), item["revision"],
+                    if item["active"] == true { "  [active]" } else { "" }
+                );
+            }
+        }
+        "audit" => {
+            println!(
+                "Zone audit log (chain {}):",
+                text(&value["chain"]["status"])
+            );
+            for event in value["events"].as_array().into_iter().flatten() {
+                println!(
+                    "  #{} {} {} rev {} by {}",
+                    event["seq"],
+                    text(&event["event"]),
+                    text(&event["recommendation"]),
+                    event["revision"],
+                    text(&event["by"])
+                );
+            }
+        }
+        _ => {
+            let recommendation = &value["recommendation"];
+            println!(
+                "Zone recommendation {} ({}{}), revision {}",
+                text(&value["id"]),
+                text(&value["status"]),
+                if value["active"] == true {
+                    ", active"
+                } else {
+                    ""
+                },
+                value["revision"]
+            );
+            if value["already_approved"] == true {
+                println!("Already approved; nothing changed.");
+            }
+            if value["already_rejected"] == true {
+                println!("Already rejected; nothing changed.");
+            }
+            println!("  digest: {}", text(&value["digest"]));
+            println!(
+                "  criticality {}, autonomy {}, safety {}; confidence {}; sources {}",
+                text(&recommendation["criticality"]),
+                text(&recommendation["autonomy"]),
+                text(&recommendation["safety_state"]),
+                text(&recommendation["confidence"]),
+                recommendation["sources"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for line in recommendation["rationale"].as_array().into_iter().flatten() {
+                println!("  - {}", text(line));
+            }
+            println!(
+                "  affects {} files, {} symbols: {}",
+                recommendation["affected"]["files"]
+                    .as_array()
+                    .map_or(0, Vec::len),
+                recommendation["affected"]["entities"],
+                recommendation["affected"]["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(6)
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            println!(
+                "  zone file it would write (zones/{}.zone):",
+                text(&value["zone_id"])
+            );
+            for line in text(&value["zone_text"]).lines() {
+                println!("    {line}");
+            }
+            if matches!(value["status"].as_str(), Some("proposed" | "in_review")) {
+                println!(
+                    "  approve: crane zones approve {} --approver NAME --confirm {}",
+                    text(&value["id"]),
+                    text(&value["digest"])
+                        .trim_start_matches("sha256:")
+                        .chars()
+                        .take(12)
+                        .collect::<String>()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /** Number of entities listed per zone in the summary */
 const LISTED: usize = 5;
 
@@ -16,6 +189,12 @@ const LISTED: usize = 5;
 */
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
     ensure_initialized()?;
+    if let Some(
+        command @ ("recommend" | "recommendations" | "review" | "approve" | "reject" | "audit"),
+    ) = args.first().map(String::as_str)
+    {
+        return review_command(command, &args[1..]);
+    }
     let json = args.iter().any(|argument| argument == "--json");
     let mut names = args.iter().filter(|argument| argument.as_str() != "--json");
     let only = names.next().map(String::as_str);

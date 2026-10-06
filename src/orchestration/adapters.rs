@@ -109,6 +109,26 @@ pub(crate) trait TaskSourceAdapter {
     */
     fn fetch(&self, event: &SourceEvent, snapshots: &Path) -> Result<Value, String>;
 
+    /** List the tasks available to choose from: in local mode, the snapshots under
+     * .crane/sources/SOURCE/, each as a Created event carrying the task as context
+     * Input
+        - snapshots: &Path - .crane/sources
+     * Output
+        - Result<Vec<SourceEvent>, String>
+        - Error if a snapshot cannot be read
+    */
+    fn list(&self, snapshots: &Path) -> Result<Vec<SourceEvent>, String>;
+
+    /** Check whether the tracker considers the task done (so it is no longer available)
+     * Input
+        - context: &Value - task context
+     * Output
+        - bool
+    */
+    fn done(&self, _context: &Value) -> bool {
+        false
+    }
+
     /** Return the project the task belongs to, the key of the repository mapping
      * Input
         - context: &Value - task context
@@ -151,6 +171,58 @@ pub(crate) trait TaskSourceAdapter {
         context: &Value,
         acceptance_field: Option<&str>,
     ) -> Result<TaskInput, String>;
+}
+
+/** Read every JSON snapshot in a folder, sorted by file name
+ * Input
+    - folder: &Path - snapshot folder
+ * Output
+    - Result<Vec<(String, Value)>, String> file stem and content; empty when the folder is missing
+*/
+fn snapshots_in(folder: &Path) -> Result<Vec<(String, Value)>, String> {
+    let mut paths = match fs::read_dir(folder) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let content = fs::read_to_string(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let value = serde_json::from_str(&content)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok((stem, value))
+        })
+        .collect()
+}
+
+/** Build the event that stands for a task chosen from a source's list
+ * Input
+    - task_id: String - Crane task id
+    - external_id: String - tracker id
+    - title: &str - task title
+    - context: Value - task context
+ * Output
+    - SourceEvent
+*/
+fn listed(task_id: String, external_id: String, title: &str, context: Value) -> SourceEvent {
+    SourceEvent {
+        event_id: format!("intake:{task_id}"),
+        external_id,
+        task_id,
+        kind: EventKind::Created,
+        detail: format!("listed: {title}"),
+        payload: context,
+    }
 }
 
 /** Select the adapter for a source name
@@ -427,6 +499,36 @@ impl TaskSourceAdapter for JiraAdapter {
         }
     }
 
+    /** List the issues in .crane/sources/jira/issues (as the Jira REST API returns them)
+     * Input
+        - snapshots: &Path - .crane/sources
+     * Output
+        - Result<Vec<SourceEvent>, String>
+    */
+    fn list(&self, snapshots: &Path) -> Result<Vec<SourceEvent>, String> {
+        Ok(snapshots_in(&snapshots.join("jira").join("issues"))?
+            .into_iter()
+            .map(|(stem, issue)| {
+                let key = issue["key"].as_str().unwrap_or(&stem).to_string();
+                let title = issue["fields"]["summary"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                listed(key.clone(), key, &title, issue)
+            })
+            .collect())
+    }
+
+    /** Check whether the issue's status category is done
+     * Input
+        - context: &Value - issue
+     * Output
+        - bool
+    */
+    fn done(&self, context: &Value) -> bool {
+        context["fields"]["status"]["statusCategory"]["key"] == "done"
+    }
+
     /** Return the Jira project key
      * Input
         - context: &Value - issue
@@ -637,6 +739,34 @@ impl TaskSourceAdapter for AsanaAdapter {
             )
         })?;
         serde_json::from_str(&content).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    /** List the tasks in .crane/sources/asana/tasks (as the Asana API returns them)
+     * Input
+        - snapshots: &Path - .crane/sources
+     * Output
+        - Result<Vec<SourceEvent>, String>
+    */
+    fn list(&self, snapshots: &Path) -> Result<Vec<SourceEvent>, String> {
+        Ok(snapshots_in(&snapshots.join("asana").join("tasks"))?
+            .into_iter()
+            .map(|(stem, context)| {
+                let task = Self::task(&context);
+                let gid = task["gid"].as_str().unwrap_or(&stem).to_string();
+                let title = task["name"].as_str().unwrap_or_default().to_string();
+                listed(format!("ASANA-{gid}"), gid, &title, context.clone())
+            })
+            .collect())
+    }
+
+    /** Check whether the task is completed
+     * Input
+        - context: &Value - task
+     * Output
+        - bool
+    */
+    fn done(&self, context: &Value) -> bool {
+        Self::task(context)["completed"] == true
     }
 
     /** Return the first project gid of the task

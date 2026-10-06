@@ -206,14 +206,17 @@ fn simulator_scopes() {
     );
 }
 
-/** The control plane has exactly the six screens of the task */
+/** The control plane has its eight screens: the golden path (Flow), the six of the semantic
+ * control plane, and Tasks */
 #[test]
-fn six_screens() {
+fn eight_screens() {
     let names = SCREENS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
     assert_eq!(
         names,
         [
+            "Flow",
             "Repository",
+            "Tasks",
             "Zones",
             "Contracts",
             "Agent Sessions",

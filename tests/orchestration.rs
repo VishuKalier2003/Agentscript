@@ -782,3 +782,49 @@ fn http_endpoint_ingests_webhooks() {
     let missing = repository.crane(&["task", "serve", "--once"], &[], "");
     assert!(text(&missing.stderr).contains("CRANE_WEBHOOK_TOKEN"));
 }
+
+/** A Jira task's contract is a versioned task contract: approving it through the policy proposal
+ * approves the contract; when a zone changes under an executing task its contract is invalidated,
+ * the session is cancelled, and the task is blocked until a human compiles and approves the
+ * contract again, which the next sync adopts as a new session
+ */
+#[test]
+fn invalidated_contract_blocks_the_task_until_recompiled() {
+    let repository = Repository::new();
+    repository.ingest("jira", &["01-created-PAY-1821.json"], &[]);
+    repository.approve("task_pay_1821_v1");
+    assert_eq!(repository.sync("PAY-1821")["state"], "EXECUTING");
+    let contract: Value = serde_json::from_slice(
+        &repository
+            .crane(&["task", "contract", "show", "PAY-1821", "--json"], &[], "")
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(contract["status"], "approved", "{contract}");
+    assert_eq!(contract["contract_id"], "PAY-1821@v1");
+
+    repository.write(
+        ".crane/zones/billing.zone",
+        "zone billing {\n    criticality sensitive;\n    autonomy delegated;\n    select subsystem billing;\n}\n",
+    );
+    let blocked = repository.sync("PAY-1821");
+    assert_eq!(blocked["state"], "BLOCKED");
+    assert!(blocked["reason"]
+        .as_str()
+        .unwrap()
+        .contains("contract PAY-1821@v1 invalidated: zones changed"));
+    let stopped = repository.hook("pre-tool-use", refund_edit(), "task-PAY-1821-v1");
+    assert_eq!(stopped.status.code(), Some(2));
+    assert!(text(&stopped.stdout).contains("was cancelled"));
+
+    let compiled = repository.crane(&["task", "contract", "compile", "PAY-1821"], &[], "");
+    assert!(compiled.status.success(), "{}", text(&compiled.stderr));
+    repository.approve("task_pay_1821_v2");
+    let resumed = repository.sync("PAY-1821");
+    assert_eq!(resumed["state"], "EXECUTING");
+    assert_eq!(resumed["contract_version"], 2);
+    assert_eq!(
+        resumed["sessions"],
+        json!(["generic-task-PAY-1821-v1", "generic-task-PAY-1821-v2"])
+    );
+}

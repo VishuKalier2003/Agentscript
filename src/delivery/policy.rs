@@ -113,6 +113,9 @@ impl Rule {
     - max_exception: u64 - longest an exception may last, in seconds
     - default_exception: u64 - duration of an exception approved in Slack, in seconds
     - trackers: Value - tracker completion settings ({"jira": {"done_transition": "31"}})
+    - approval_ttl: Option<u64> - seconds an approval counts after it is given (None: until the
+      round changes)
+    - github_cli: Vec<String> - the GitHub CLI the github provider runs (default ["gh"])
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeliveryConfig {
@@ -131,6 +134,8 @@ pub(crate) struct DeliveryConfig {
     pub(crate) max_exception: u64,
     pub(crate) default_exception: u64,
     pub(crate) trackers: Value,
+    pub(crate) approval_ttl: Option<u64>,
+    pub(crate) github_cli: Vec<String>,
 }
 
 impl Default for DeliveryConfig {
@@ -186,6 +191,8 @@ impl Default for DeliveryConfig {
             max_exception: 24 * 60 * 60,
             default_exception: 4 * 60 * 60,
             trackers: json!({}),
+            approval_ttl: None,
+            github_cli: vec!["gh".into()],
         }
     }
 }
@@ -341,6 +348,7 @@ impl DeliveryConfig {
                 "slack",
                 "exceptions",
                 "trackers",
+                "github_cli",
             ],
             "the delivery configuration",
         )?;
@@ -367,6 +375,12 @@ impl DeliveryConfig {
                     "unknown provider '{}'; use local or github",
                     config.provider
                 ));
+            }
+        }
+        if let Some(cli) = map.get("github_cli") {
+            config.github_cli = strings(Some(cli), "github_cli")?;
+            if config.github_cli.is_empty() {
+                return Err("github_cli needs a program".into());
             }
         }
         if let Some(checks) = map.get("checks") {
@@ -413,7 +427,18 @@ impl DeliveryConfig {
             }
         }
         if let Some(policy) = map.get("merge_policy") {
-            let policy = object(policy, &["rules", "default"], "merge_policy")?;
+            let policy = object(
+                policy,
+                &["rules", "default", "approval_ttl_seconds"],
+                "merge_policy",
+            )?;
+            if let Some(ttl) = policy.get("approval_ttl_seconds") {
+                config.approval_ttl = Some(
+                    ttl.as_u64()
+                        .filter(|ttl| *ttl > 0)
+                        .ok_or("merge_policy.approval_ttl_seconds must be a positive number")?,
+                );
+            }
             if let Some(rules) = policy.get("rules") {
                 config.rules = rules
                     .as_array()

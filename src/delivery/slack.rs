@@ -105,6 +105,8 @@ pub(crate) fn url_decode(text: &str) -> String {
     - user: String - Slack user id
     - delivery: String - delivery id (the session id)
     - head: String - the commit the message was about
+    - binding: Option<String> - the delivery binding the message was about (repository, task,
+      contract, commit, checks, attestation), absent in messages sent before bindings
     - check: Option<String> - the check an exception is for
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,7 @@ pub(crate) struct Click {
     pub(crate) user: String,
     pub(crate) delivery: String,
     pub(crate) head: String,
+    pub(crate) binding: Option<String>,
     pub(crate) check: Option<String>,
 }
 
@@ -154,6 +157,7 @@ pub(crate) fn parse(body: &str) -> Result<Click, String> {
             .as_str()
             .ok_or("the Slack button names no commit")?
             .to_string(),
+        binding: value["binding"].as_str().map(String::from),
         check: value["check"].as_str().map(String::from),
     })
 }
@@ -179,8 +183,21 @@ pub(crate) fn announcement(
 ) -> Value {
     let id = delivery["delivery_id"].as_str().unwrap_or_default();
     let head = delivery["head"].as_str().unwrap_or_default();
-    let value =
-        |check: Option<&str>| json!({"delivery": id, "head": head, "check": check}).to_string();
+    let binding = delivery["binding_digest"].as_str();
+    // Every button names exactly what it decides on; the binding digest covers it all
+    let value = |check: Option<&str>| {
+        json!({
+            "delivery": id,
+            "head": head,
+            "binding": binding,
+            "repository": delivery["binding"]["repository"]["name"],
+            "task": delivery["task"],
+            "contract": delivery["binding"]["contract_digest"],
+            "attestation": delivery["attestation_digest"],
+            "check": check,
+        })
+        .to_string()
+    };
     let checks = delivery["checks"]
         .as_array()
         .into_iter()
@@ -217,16 +234,26 @@ pub(crate) fn announcement(
         buttons.push(json!({"type": "button", "action_id": "approve_exception", "text": {"type": "plain_text", "text": format!("Approve exception: {check}")}, "value": value(Some(check)),
             "confirm": {"title": {"type": "plain_text", "text": "Approve a scoped exception?"}, "text": {"type": "mrkdwn", "text": format!("Only *{check}* on this commit, for this session, until it expires.")}, "confirm": {"type": "plain_text", "text": "Approve"}, "deny": {"type": "plain_text", "text": "Cancel"}}}));
     }
+    let binding = &delivery["binding"];
     let text = format!(
-        "*{}* {} — delivery of {} ({}), {} change by a {} session\nContract: {} · attestation {}\nChecks: {}\n{}",
+        "*{}* {} — delivery of {} ({}), {} change by a {} session\nRepository: {} · task {} · commit `{}`\nContract: {} `{}` · attestation `{}` · binding `{}`\nChecks: {}\n{}",
         delivery["pull_request"]["title"].as_str().unwrap_or("Pull request"),
         pr_url,
         id,
         delivery["task"].as_str().unwrap_or("no task"),
         eligibility["criticality"].as_str().unwrap_or_default(),
         eligibility["autonomy"].as_str().unwrap_or_default(),
-        delivery["contract_version"].as_str().unwrap_or_default(),
+        match (binding["repository"]["owner"].as_str(), binding["repository"]["name"].as_str()) {
+            (Some(owner), Some(name)) => format!("{owner}/{name}"),
+            (None, Some(name)) => name.to_string(),
+            _ => binding["repository"]["identity"].as_str().unwrap_or("this repository").to_string(),
+        },
+        delivery["task"].as_str().unwrap_or("none"),
+        head,
+        binding["contract_id"].as_str().unwrap_or("contract"),
+        binding["contract_digest"].as_str().or(delivery["contract_version"].as_str()).unwrap_or_default(),
         delivery["attestation_digest"].as_str().unwrap_or_default(),
+        delivery["binding_digest"].as_str().unwrap_or_default(),
         if checks.is_empty() { "none configured".to_string() } else { checks },
         if missing.is_empty() { "Eligible to merge.".to_string() } else { format!("Waiting for: {}", missing.join("; ")) },
     );

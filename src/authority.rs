@@ -456,7 +456,7 @@ impl Runtime<'_> {
     /** Apply the session's governance to a mutating action the contract allows: deny when the
      * autonomy budget is used up or the session is quarantined; otherwise take the lowest
      * autonomy of the session mode, its safety state (degraded caps at assisted), the zones of
-     * every written file, and the task scope (in delegated mode, a write outside the scope needs
+     * every written file, and the task scope (in delegated and autonomous mode, a write outside the scope needs
      * approval); observe denies, assisted needs human approval, delegated and autonomous allow
      * Input
         - paths: &[(String, bool)] - repository-relative paths written and whether each exists;
@@ -539,7 +539,7 @@ impl Runtime<'_> {
                 }
                 level = level.min(cap);
             }
-            if self.autonomy == Autonomy::Delegated && !governance.in_scope(path, *exists) {
+            if self.autonomy >= Autonomy::Delegated && !governance.in_scope(path, *exists) {
                 reasons.push(format!(
                     "{path}: outside the task scope ({}), so it needs human approval",
                     if governance.scope_modules.is_empty() {
@@ -1174,9 +1174,15 @@ pub(crate) fn changes_own_autonomy(command: &str) -> bool {
             ) | ("agent", "session", "resume" | "extend")
                 | (
                     "deliver",
-                    "run" | "approve" | "exception" | "merge" | "slack-action",
+                    "run" | "approve" | "exception" | "merge" | "merged" | "slack-action",
                     _
                 )
+                | ("zones", "approve" | "reject", _)
+                | ("task", "contract", "compile" | "approve" | "reject")
+                | ("task", "approve" | "launch", _)
+                | ("agent", "uninstall", _)
+                | ("session", "run" | "finish", _)
+                | ("flow", "advance", _)
         )
     })
 }
@@ -1210,7 +1216,7 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
         match tokens.get(index + 1).copied() {
             Some("checkpoint" | "protect" | "target" | "init") => true,
             Some("agent") => match tokens.get(index + 2).copied() {
-                Some("init" | "install" | "hook") => true,
+                Some("init" | "install" | "uninstall" | "hook") => true,
                 // Session management changes who holds authority; listing and showing only read
                 Some("session") => matches!(
                     tokens.get(index + 3).copied(),
@@ -1231,10 +1237,20 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
                 tokens.get(index + 2).copied(),
                 Some("approve" | "reject" | "edit" | "regenerate")
             ),
-            Some("task") => matches!(
-                tokens.get(index + 2).copied(),
-                Some("ingest" | "sync" | "advance" | "serve")
-            ),
+            Some("task") => match tokens.get(index + 2).copied() {
+                Some(
+                    "ingest" | "sync" | "advance" | "serve" | "prepare" | "approve" | "launch",
+                ) => true,
+                // Compiling, approving, or rejecting a task contract is a human's; showing reads
+                Some("contract") => matches!(
+                    tokens.get(index + 3).copied(),
+                    Some("compile" | "approve" | "reject")
+                ),
+                Some("completions") => {
+                    matches!(tokens.get(index + 3).copied(), Some("send" | "reconcile"))
+                }
+                _ => false,
+            },
             Some("autonomy") => matches!(
                 tokens.get(index + 2).copied(),
                 Some("promote" | "demote" | "approve" | "refill" | "credit")
@@ -1243,6 +1259,16 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
             Some("deliver") => !matches!(tokens.get(index + 2).copied(), Some("status")),
             // Connecting, serving the control plane, and changing contracts through its API
             Some("connect") => true,
+            Some("zones") => matches!(
+                tokens.get(index + 2).copied(),
+                Some("approve" | "reject" | "review")
+            ),
+            Some("session") => matches!(tokens.get(index + 2).copied(), Some("run" | "finish")),
+            Some("flow") => tokens.get(index + 2).copied() == Some("advance"),
+            Some("repo") => matches!(
+                tokens.get(index + 2).copied(),
+                Some("connect" | "disconnect")
+            ),
             Some("dashboard") => match tokens.get(index + 2).copied() {
                 Some("api") => tokens
                     .get(index + 3)

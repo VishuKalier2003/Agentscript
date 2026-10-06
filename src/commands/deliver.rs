@@ -3,12 +3,14 @@ use std::fs;
 use serde_json::Value;
 
 use crate::budget::manage::duration;
-use crate::delivery::{decide, except, merge, render, run as deliver, slack_action, status};
+use crate::delivery::{
+    decide, except, merge, merged, render, run as deliver, slack_action, status,
+};
 use crate::repository::ensure_initialized;
 use crate::util::option;
 
 /** Usage of crane deliver */
-const USAGE: &str = "crane deliver run|status SESSION_ID [--json] | approve|reject|request-changes SESSION_ID --approver NAME [--reason TEXT] | exception SESSION_ID --check NAME --approver NAME --reason TEXT [--expires DURATION] | merge SESSION_ID [--by NAME] | slack-action --body FILE --timestamp T --signature S";
+const USAGE: &str = "crane deliver run|status SESSION_ID [--json] | approve|reject|request-changes SESSION_ID --approver NAME [--reason TEXT] | exception SESSION_ID --check NAME --approver NAME --reason TEXT [--expires DURATION] | merge SESSION_ID [--by NAME] | merged SESSION_ID --sha MERGE_SHA [--by NAME] | slack-action --body FILE --timestamp T --signature S";
 
 /** Deliver sessions: run the delivery pipeline, report it, record human decisions and
  * exceptions, merge, and accept signed Slack actions
@@ -29,6 +31,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "--body",
         "--timestamp",
         "--signature",
+        "--binding",
+        "--sha",
     ];
     let mut positional = Vec::new();
     let mut arguments = args.iter();
@@ -56,6 +60,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             "approval",
             &required("--approver")?,
             None,
+            option(args, "--binding").as_deref(),
             &reason,
             "cli",
         )?,
@@ -64,6 +69,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             "rejection",
             &required("--approver")?,
             None,
+            option(args, "--binding").as_deref(),
             &reason,
             "cli",
         )?,
@@ -72,6 +78,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             "changes_requested",
             &required("--approver")?,
             None,
+            option(args, "--binding").as_deref(),
             &reason,
             "cli",
         )?,
@@ -92,6 +99,11 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         Some("merge") => merge(
             &id()?,
             &option(args, "--by").unwrap_or_else(|| "human".into()),
+        )?,
+        Some("merged") => merged(
+            &id()?,
+            &required("--sha")?,
+            &option(args, "--by").unwrap_or_else(|| "provider".into()),
         )?,
         Some("slack-action") => {
             let file = required("--body")?;
