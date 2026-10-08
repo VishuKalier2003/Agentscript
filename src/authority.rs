@@ -190,12 +190,18 @@ impl Decision {
     - reasons: Vec<String> - why, naming the clauses involved
     - resources: Vec<String> - normalized resources the action touches, such as
       "file:payment.py" and "symbol:function:PaymentService.charge"
+    - policies: Vec<String> - the policies whose clauses decided the action: the denying ones
+      when a contract clause denies it, otherwise the authorizing ones (for observability)
+    - zones: Vec<String> - every zone constraining the written files and changed symbols (for
+      observability)
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Verdict {
     pub(crate) decision: Decision,
     pub(crate) reasons: Vec<String>,
     pub(crate) resources: Vec<String>,
+    pub(crate) policies: Vec<String>,
+    pub(crate) zones: Vec<String>,
 }
 
 /** Runtime authority for one clause: where its item lives at the checkpoint, or why that could
@@ -388,6 +394,8 @@ impl Runtime<'_> {
             decision,
             reasons,
             resources,
+            policies: Vec::new(),
+            zones: Vec::new(),
         };
         if action.operation == Operation::Read {
             return verdict(Decision::Allow, vec!["read-only tool".into()], resources);
@@ -429,43 +437,71 @@ impl Runtime<'_> {
         }
         let mut denied = Vec::new();
         let mut allowed = Vec::new();
+        let mut changed = BTreeMap::new();
+        let mut causes = (BTreeSet::new(), BTreeSet::new());
         for change in &action.files {
-            self.check_change(change, &mut denied, &mut allowed, &mut resources);
-        }
-        if !denied.is_empty() {
-            return verdict(Decision::Deny, denied, resources);
+            self.check_change(
+                change,
+                &mut denied,
+                &mut allowed,
+                &mut resources,
+                &mut changed,
+                &mut causes,
+            );
         }
         let paths = action
             .files
             .iter()
             .filter_map(|change| self.relative(&change.path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .map(|path| {
                 let exists = self.root.join(&path).exists();
-                (path, exists)
+                let symbols = changed.get(&path).cloned().flatten();
+                (path, exists, symbols)
             })
             .collect::<Vec<_>>();
+        // Structured causes for observability: the deciding policies and the zones involved
+        let zones = self.governance.map_or_else(Vec::new, |governance| {
+            paths
+                .iter()
+                .filter_map(|(path, _, symbols)| governance.constraint_for(path, symbols.as_ref()))
+                .flat_map(|(constraint, _)| constraint.zones)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        });
+        let explained = |decision, reasons, resources, policies: BTreeSet<String>| Verdict {
+            policies: policies.into_iter().collect(),
+            zones: zones.clone(),
+            ..verdict(decision, reasons, resources)
+        };
+        if !denied.is_empty() {
+            return explained(Decision::Deny, denied, resources, causes.0);
+        }
         if let Some((decision, reasons)) = self.govern(&paths) {
-            return verdict(decision, reasons, resources);
+            return explained(decision, reasons, resources, causes.1);
         }
         if allowed.is_empty() {
             allowed.push("no contract clause covers this change".into());
         }
-        verdict(Decision::Allow, allowed, resources)
+        explained(Decision::Allow, allowed, resources, causes.1)
     }
 
     /** Apply the session's governance to a mutating action the contract allows: deny when the
-     * autonomy budget is used up or the session is quarantined; otherwise take the lowest
-     * autonomy of the session mode, its safety state (degraded caps at assisted), the zones of
-     * every written file, and the task scope (in delegated and autonomous mode, a write outside the scope needs
-     * approval); observe denies, assisted needs human approval, delegated and autonomous allow
+     * autonomy budget is used up or the session is quarantined; otherwise take the level
+     * write_level leaves (session mode, safety state, the zones of every written file and changed
+     * symbol, and the task scope); observe denies, assisted needs human approval, delegated and
+     * autonomous allow
      * Input
-        - paths: &[(String, bool)] - repository-relative paths written and whether each exists;
-          empty for shell and unknown tools, whose files are not known before they run
+        - paths: &[WrittenPath] - repository-relative paths written, whether each exists, and the
+          symbols each change touches; empty for shell and unknown tools, whose files are not
+          known before they run
      * Output
         - Option<(Decision, Vec<String>)> a denial or approval requirement with reasons, None to
           allow
     */
-    fn govern(&self, paths: &[(String, bool)]) -> Option<(Decision, Vec<String>)> {
+    fn govern(&self, paths: &[WrittenPath]) -> Option<(Decision, Vec<String>)> {
         let governance = self.governance?;
         if self.autonomy == Autonomy::Observe {
             // Checked before the budget: an observing session has no budget to exhaust
@@ -486,7 +522,7 @@ impl Runtime<'_> {
         }
         let new_files = paths
             .iter()
-            .filter(|(path, _)| !usage.files.contains(path))
+            .filter(|(path, _, _)| !usage.files.contains(path))
             .count() as u64;
         if usage.files.len() as u64 + new_files > usage.max_files {
             return Some((
@@ -507,50 +543,7 @@ impl Runtime<'_> {
                 )],
             ));
         }
-        let mut level = self.autonomy;
-        let mut reasons = Vec::new();
-        if level == Autonomy::Assisted {
-            reasons.push(
-                "the session's autonomy mode is assisted, so every change needs human approval"
-                    .to_string(),
-            );
-        }
-        if self.safety == SafetyState::Degraded && level > Autonomy::Assisted {
-            level = Autonomy::Assisted;
-            reasons.push(format!(
-                "the session is degraded ({why}), so changes need human approval"
-            ));
-        }
-        for (path, exists) in paths {
-            if let Some(constraint) = governance.constraint(path) {
-                let cap = constraint.autonomy.min(constraint.state.autonomy_cap());
-                if cap <= Autonomy::Assisted {
-                    reasons.push(format!(
-                        "{path}: zones {} ({}, {}) allow agents to {}",
-                        constraint.zones.join(", "),
-                        constraint.criticality.name(),
-                        constraint.state.name(),
-                        if cap == Autonomy::Observe {
-                            "only observe it"
-                        } else {
-                            "change it only with human approval"
-                        }
-                    ));
-                }
-                level = level.min(cap);
-            }
-            if self.autonomy >= Autonomy::Delegated && !governance.in_scope(path, *exists) {
-                reasons.push(format!(
-                    "{path}: outside the task scope ({}), so it needs human approval",
-                    if governance.scope_modules.is_empty() {
-                        "no module".to_string()
-                    } else {
-                        governance.scope_modules.join(", ")
-                    }
-                ));
-                level = level.min(Autonomy::Assisted);
-            }
-        }
+        let (level, reasons) = write_level(governance, self.autonomy, self.safety, &why, paths);
         match level {
             Autonomy::Observe => Some((Decision::Deny, reasons)),
             Autonomy::Assisted => Some((Decision::ApprovalRequired, reasons)),
@@ -633,6 +626,11 @@ impl Runtime<'_> {
         - denied: &mut Vec<String> - denial reasons, appended to
         - allowed: &mut Vec<String> - authorization reasons, appended to
         - resources: &mut Vec<String> - touched resources, appended to
+        - changed: &mut ChangedSymbols - qualified names of the symbols changed per path, None for
+          a path whose items cannot be determined (unsupported language or a new text that would
+          not parse), updated
+        - causes: &mut (BTreeSet<String>, BTreeSet<String>) - ids of the policies whose clauses
+          deny the change and of those that authorize it, appended to
      * Output
         - None (appends to the vectors)
     */
@@ -642,6 +640,8 @@ impl Runtime<'_> {
         denied: &mut Vec<String>,
         allowed: &mut Vec<String>,
         resources: &mut Vec<String>,
+        changed: &mut ChangedSymbols,
+        causes: &mut (BTreeSet<String>, BTreeSet<String>),
     ) {
         let Some(path) = self.relative(&change.path) else {
             return; // outside the repository, so no clause covers it
@@ -654,6 +654,23 @@ impl Runtime<'_> {
         for (kind, qualified) in &items.changed {
             resources.push(format!("symbol:{}:{qualified}", kind.noun()));
         }
+        let known = (language(&path).is_some() && items.after.is_ok()).then(|| {
+            items
+                .changed
+                .iter()
+                .map(|(_, qualified)| qualified.clone())
+                .collect::<BTreeSet<_>>()
+        });
+        // Several changes to one file: every changed symbol counts, and one unknown makes all unknown
+        let merged = match (changed.remove(&path), known) {
+            (None, known) => known,
+            (Some(Some(mut earlier)), Some(known)) => {
+                earlier.extend(known);
+                Some(earlier)
+            }
+            _ => None,
+        };
+        changed.insert(path.clone(), merged);
         for (index, contract, clause) in self.contracts.clauses() {
             let (Ok(footprint), Ok(commit)) = (&self.grants[index], &contract.checkpoint_sha)
             else {
@@ -668,20 +685,29 @@ impl Runtime<'_> {
                 contract.policy_id
             );
             let effect = self.effect(clause, footprint, commit, &path, &before, &after, &items);
+            let policy = contract.policy_id.clone();
             match (clause.permission(), effect) {
                 (_, Effect::None) => {}
                 (Permission::PermitWrite, _) => {
+                    causes.1.insert(policy);
                     allowed.push(format!("{path}: authorized by {label}"))
                 }
-                (Permission::DenyWrite, Effect::Restores) => allowed.push(format!(
-                    "{path}: restores code protected by {label} to its checkpoint version"
-                )),
+                (Permission::DenyWrite, Effect::Restores) => {
+                    causes.1.insert(policy);
+                    allowed.push(format!(
+                        "{path}: restores code protected by {label} to its checkpoint version"
+                    ))
+                }
                 (Permission::DenyWrite, Effect::Mutates) => {
+                    causes.0.insert(policy);
                     denied.push(format!("{path}: would modify code protected by {label}"))
                 }
-                (Permission::DenyWrite, Effect::Unknown(why)) => denied.push(format!(
-                    "{path}: cannot confirm that code protected by {label} stays unchanged ({why})"
-                )),
+                (Permission::DenyWrite, Effect::Unknown(why)) => {
+                    causes.0.insert(policy);
+                    denied.push(format!(
+                        "{path}: cannot confirm that code protected by {label} stays unchanged ({why})"
+                    ))
+                }
             }
         }
     }
@@ -760,6 +786,82 @@ impl Runtime<'_> {
             .join("/");
         (!relative.is_empty()).then_some(relative)
     }
+}
+
+/** A path a write changes: repository-relative path, whether it exists now, and the qualified
+ * names of the symbols the change touches (None when they cannot be determined) */
+pub(crate) type WrittenPath = (String, bool, Option<BTreeSet<String>>);
+
+/** Qualified names of the symbols changed per path, None for a path whose items are unknown */
+type ChangedSymbols = BTreeMap<String, Option<BTreeSet<String>>>;
+
+/** Work out the autonomy level a write may run at and why it is lowered: the session's autonomy
+ * mode, its safety state (degraded caps at assisted), the zones of every written file (for a file
+ * whose zones select only some symbols, the zones of the symbols the change touches; all of them
+ * when those are unknown), and the task scope (in delegated and autonomous mode, a write outside
+ * the scope needs approval); shared by the pre-tool decision and the zone map view, so both always
+ * agree
+ * Input
+    - governance: &Governance - the session's frozen governance
+    - autonomy: Autonomy - the session's current autonomy mode
+    - safety: SafetyState - the session's safety state (quarantine is handled by the caller)
+    - why: &str - why the session is not active
+    - paths: &[WrittenPath] - paths written
+ * Output
+    - (Autonomy, Vec<String>) the level and the reasons it is lowered
+*/
+pub(crate) fn write_level(
+    governance: &Governance,
+    autonomy: Autonomy,
+    safety: SafetyState,
+    why: &str,
+    paths: &[WrittenPath],
+) -> (Autonomy, Vec<String>) {
+    let mut level = autonomy;
+    let mut reasons = Vec::new();
+    if level == Autonomy::Assisted {
+        reasons.push(
+            "the session's autonomy mode is assisted, so every change needs human approval"
+                .to_string(),
+        );
+    }
+    if safety == SafetyState::Degraded && level > Autonomy::Assisted {
+        level = Autonomy::Assisted;
+        reasons.push(format!(
+            "the session is degraded ({why}), so changes need human approval"
+        ));
+    }
+    for (path, exists, symbols) in paths {
+        if let Some((constraint, on)) = governance.constraint_for(path, symbols.as_ref()) {
+            let cap = constraint.autonomy.min(constraint.state.autonomy_cap());
+            if cap <= Autonomy::Assisted {
+                reasons.push(format!(
+                    "{on}: zones {} ({}, {}) allow agents to {}",
+                    constraint.zones.join(", "),
+                    constraint.criticality.name(),
+                    constraint.state.name(),
+                    if cap == Autonomy::Observe {
+                        "only observe it"
+                    } else {
+                        "change it only with human approval"
+                    }
+                ));
+            }
+            level = level.min(cap);
+        }
+        if autonomy >= Autonomy::Delegated && !governance.in_scope(path, *exists) {
+            reasons.push(format!(
+                "{path}: outside the task scope ({}), so it needs human approval",
+                if governance.scope_modules.is_empty() {
+                    "no module".to_string()
+                } else {
+                    governance.scope_modules.join(", ")
+                }
+            ));
+            level = level.min(Autonomy::Assisted);
+        }
+    }
+    (level, reasons)
 }
 
 /** Canonicalize a path that may not exist yet, by canonicalizing its longest existing ancestor
@@ -1269,6 +1371,9 @@ pub(crate) fn runs_mutating_crane(command: &str) -> bool {
                 tokens.get(index + 2).copied(),
                 Some("connect" | "disconnect")
             ),
+            // Serving the observability API opens a listener and granting or revoking a viewer
+            // changes who may read; querying it (and listing viewers) only reads
+            Some("observe") => matches!(tokens.get(index + 2).copied(), Some("serve" | "viewer")),
             Some("dashboard") => match tokens.get(index + 2).copied() {
                 Some("api") => tokens
                     .get(index + 3)

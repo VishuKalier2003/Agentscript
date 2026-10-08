@@ -839,9 +839,20 @@ fn manager_starts_sessions_for_the_agent_host() {
         context.contains("300 of 300 mutating actions and 1 of 1 files left"),
         "{context}"
     );
+    // The zone map adds at most one line per file (15 at most) after the zones line
+    let zone_map = context
+        .lines()
+        .skip_while(|line| !line.contains("per-symbol decisions"))
+        .skip(1)
+        .take_while(|line| line.starts_with("- "))
+        .count();
     assert!(
-        context.lines().count() < 40,
+        context.lines().count() - zone_map < 40 && zone_map <= 16,
         "the context stays concise: {context}"
+    );
+    assert!(
+        context.contains("PaymentService.charge: DENY preserve(payments_core)"),
+        "{context}"
     );
     assert!(!context.contains("grants") && !context.contains("return fee(amount)"));
     let first = repository.billing_edit("m1", &[], "        return amount * 2.0;");

@@ -36,6 +36,12 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT: u64 = 30 * 60;
     - autonomy: Autonomy - lowest effective autonomy (with organizational grants applied)
     - state: SafetyState - worst effective state
     - grant: Option<String> - the organizational grants that opened a restricted zone, if any
+    - symbols: BTreeMap<String, FileConstraint> - constraints that apply only when the symbol
+      with that qualified name changes (from symbol selectors); empty when every zone covers the
+      whole file. The fields above stay the most restrictive of everything, which is what applies
+      when the changed symbols are not known
+    - whole: Option<Box<FileConstraint>> - with symbols, the constraints on every change to the
+      file (None when only symbols are zoned)
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileConstraint {
@@ -44,6 +50,102 @@ pub(crate) struct FileConstraint {
     pub(crate) autonomy: Autonomy,
     pub(crate) state: SafetyState,
     pub(crate) grant: Option<String>,
+    pub(crate) symbols: BTreeMap<String, FileConstraint>,
+    pub(crate) whole: Option<Box<FileConstraint>>,
+}
+
+impl FileConstraint {
+    /** Combine two constraints into the most restrictive of both (zones only restrict)
+     * Input
+        - other: FileConstraint - second constraint
+     * Output
+        - FileConstraint without symbol detail
+    */
+    pub(crate) fn merge(self, other: FileConstraint) -> FileConstraint {
+        let grants = self
+            .grant
+            .into_iter()
+            .chain(other.grant)
+            .collect::<BTreeSet<_>>();
+        FileConstraint {
+            zones: self
+                .zones
+                .into_iter()
+                .chain(other.zones)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            criticality: self.criticality.max(other.criticality),
+            autonomy: self.autonomy.min(other.autonomy),
+            state: self.state.max(other.state),
+            grant: (!grants.is_empty()).then(|| grants.into_iter().collect::<Vec<_>>().join(", ")),
+            symbols: BTreeMap::new(),
+            whole: None,
+        }
+    }
+
+    /** Serialize for the session binding; symbol detail is written only when present, so bindings
+     * made before symbol-level zones keep their digest
+     * Input
+        - None (uses self)
+     * Output
+        - Value JSON object
+    */
+    fn to_json(&self) -> Value {
+        let mut entry = json!({
+            "zones": self.zones,
+            "criticality": self.criticality.name(),
+            "autonomy": self.autonomy.name(),
+            "state": self.state.name(),
+        });
+        // Written only when present, so bindings made before grants keep their digest
+        if let Some(grant) = &self.grant {
+            entry["grant"] = json!(grant);
+        }
+        if !self.symbols.is_empty() {
+            entry["symbols"] = self
+                .symbols
+                .iter()
+                .map(|(name, constraint)| (name.clone(), constraint.to_json()))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+            entry["whole"] = self
+                .whole
+                .as_ref()
+                .map_or(Value::Null, |whole| whole.to_json());
+        }
+        entry
+    }
+
+    /** Read back from a session binding
+     * Input
+        - value: &Value - JSON written by to_json
+     * Output
+        - Result<FileConstraint, String>
+    */
+    fn from_json(value: &Value) -> Result<Self, String> {
+        let mut symbols = BTreeMap::new();
+        for (name, constraint) in value["symbols"].as_object().into_iter().flatten() {
+            symbols.insert(name.clone(), Self::from_json(constraint)?);
+        }
+        Ok(Self {
+            zones: value["zones"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|zone| zone.as_str().map(String::from))
+                .collect(),
+            criticality: Criticality::parse(value["criticality"].as_str().unwrap_or_default())?,
+            autonomy: Autonomy::parse(value["autonomy"].as_str().unwrap_or_default())?,
+            state: SafetyState::parse(value["state"].as_str().unwrap_or_default())?,
+            grant: value["grant"].as_str().map(String::from),
+            symbols,
+            whole: match &value["whole"] {
+                Value::Null => None,
+                whole => Some(Box::new(Self::from_json(whole)?)),
+            },
+        })
+    }
 }
 
 /** Everything a session is governed by besides its contract, fixed at creation and covered by the
@@ -144,20 +246,57 @@ impl Governance {
         self.files
             .iter()
             .filter(|(other, _)| other.rsplit_once('/').map_or("", |(other, _)| other) == folder)
-            .map(|(_, constraint)| constraint.clone())
-            .reduce(|left, right| FileConstraint {
-                zones: left
-                    .zones
-                    .into_iter()
-                    .chain(right.zones)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-                criticality: left.criticality.max(right.criticality),
-                autonomy: left.autonomy.min(right.autonomy),
-                state: left.state.max(right.state),
+            .map(|(_, constraint)| FileConstraint {
                 grant: None,
+                ..constraint.clone()
             })
+            .reduce(FileConstraint::merge)
+    }
+
+    /** Return the zone constraints on a change to a path that changes the given symbols: for a
+     * file whose zones select some of its symbols, the whole-file constraints plus those of every
+     * changed symbol they select; when the changed symbols are not known, or the file has no
+     * symbol-level zones, everything constraint() returns (fail closed)
+     * Input
+        - path: &str - repository-relative path
+        - changed: Option<&BTreeSet<String>> - qualified names of the symbols the change adds,
+          removes, or modifies; None when they cannot be determined
+     * Output
+        - Option<(FileConstraint, String)> the constraint and what it is on ("path" or
+          "path::Symbol, ..."), None when no zone restricts the change
+    */
+    pub(crate) fn constraint_for(
+        &self,
+        path: &str,
+        changed: Option<&BTreeSet<String>>,
+    ) -> Option<(FileConstraint, String)> {
+        let found = self.files.get(path);
+        let (Some(found), Some(changed)) = (found, changed) else {
+            return self
+                .constraint(path)
+                .map(|constraint| (constraint, path.to_string()));
+        };
+        if found.symbols.is_empty() {
+            return Some((found.clone(), path.to_string()));
+        }
+        let touched = found
+            .symbols
+            .keys()
+            .filter(|name| changed.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let label = if touched.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}::{}", touched.join(", "))
+        };
+        found
+            .whole
+            .iter()
+            .map(|whole| (**whole).clone())
+            .chain(touched.iter().map(|name| found.symbols[name].clone()))
+            .reduce(FileConstraint::merge)
+            .map(|constraint| (constraint, label))
     }
 
     /** Check whether a path is in the task scope: one of its files, or a file created during the
@@ -197,17 +336,7 @@ impl Governance {
             "zone_set_version": self.zone_set_version,
             "zones": self.zones,
             "files": self.files.iter().map(|(path, constraint)| {
-                let mut entry = json!({
-                    "zones": constraint.zones,
-                    "criticality": constraint.criticality.name(),
-                    "autonomy": constraint.autonomy.name(),
-                    "state": constraint.state.name(),
-                });
-                // Written only when present, so bindings made before grants keep their digest
-                if let Some(grant) = &constraint.grant {
-                    entry["grant"] = json!(grant);
-                }
-                (path.clone(), entry)
+                (path.clone(), constraint.to_json())
             }).collect::<serde_json::Map<_, _>>(),
             "task_title": self.task_title,
             "scope": self.scope,
@@ -258,18 +387,7 @@ impl Governance {
             .as_object()
             .ok_or("governance 'files' must be an object")?
         {
-            files.insert(
-                path.clone(),
-                FileConstraint {
-                    zones: strings(&constraint["zones"]),
-                    criticality: Criticality::parse(
-                        constraint["criticality"].as_str().unwrap_or_default(),
-                    )?,
-                    autonomy: Autonomy::parse(constraint["autonomy"].as_str().unwrap_or_default())?,
-                    state: SafetyState::parse(constraint["state"].as_str().unwrap_or_default())?,
-                    grant: constraint["grant"].as_str().map(String::from),
-                },
-            );
+            files.insert(path.clone(), FileConstraint::from_json(constraint)?);
         }
         Ok(Self {
             autonomy: Autonomy::parse(value["autonomy"].as_str().unwrap_or_default())?,
@@ -424,7 +542,7 @@ impl SessionOptions {
             }
             governance.zones.push(summary);
         }
-        for (file, effective) in &zones.resolution.files {
+        let constraint_of = |effective: &crate::zones::resolve::Effective| {
             let mut autonomy = Autonomy::Autonomous;
             let mut grants = Vec::new();
             for index in &effective.zones {
@@ -441,20 +559,48 @@ impl SessionOptions {
                     None => autonomy = autonomy.min(zones.resolution.zones[*index].autonomy),
                 }
             }
-            governance.files.insert(
-                snapshot.files[*file].path.clone(),
-                FileConstraint {
-                    zones: effective
-                        .zones
-                        .iter()
-                        .map(|index| zones.resolution.zones[*index].zone.zone_id.clone())
-                        .collect(),
-                    criticality: effective.criticality,
-                    autonomy,
-                    state: effective.state,
-                    grant: (!grants.is_empty()).then(|| grants.join(", ")),
-                },
-            );
+            FileConstraint {
+                zones: effective
+                    .zones
+                    .iter()
+                    .map(|index| zones.resolution.zones[*index].zone.zone_id.clone())
+                    .collect(),
+                criticality: effective.criticality,
+                autonomy,
+                state: effective.state,
+                grant: (!grants.is_empty()).then(|| grants.join(", ")),
+                symbols: BTreeMap::new(),
+                whole: None,
+            }
+        };
+        // Symbol-level constraints, keyed by file and qualified name (overloads combine)
+        let mut by_symbol: BTreeMap<usize, BTreeMap<String, FileConstraint>> = BTreeMap::new();
+        for (entity, effective) in &zones.resolution.symbols {
+            let entry = &zones.inventory.graph.entities[*entity];
+            let name = crate::inventory::graph::Graph::symbol(snapshot, entry)
+                .qualified
+                .clone();
+            let constraint = constraint_of(effective);
+            let names = by_symbol.entry(entry.file).or_default();
+            let merged = match names.remove(&name) {
+                Some(known) => known.merge(constraint),
+                None => constraint,
+            };
+            names.insert(name, merged);
+        }
+        for (file, effective) in &zones.resolution.files {
+            let mut constraint = constraint_of(effective);
+            if let Some(symbols) = by_symbol.remove(file) {
+                constraint.whole = zones
+                    .resolution
+                    .whole
+                    .get(file)
+                    .map(|whole| Box::new(constraint_of(whole)));
+                constraint.symbols = symbols;
+            }
+            governance
+                .files
+                .insert(snapshot.files[*file].path.clone(), constraint);
         }
         if let Some(task) = task {
             let modules_of = |contract: &Value| {
@@ -702,6 +848,8 @@ pub(crate) fn on_start(
     }
     session.record(json!({
         "event": "session_start",
+        // The Crane version the adapter ran with, for observability
+        "crane_version": env!("CARGO_PKG_VERSION"),
         "model": model,
         "source": source,
         "resumed": resumable,
@@ -789,8 +937,24 @@ pub(crate) fn context(session: &ContractSession) -> String {
             )
         })
         .collect::<Vec<_>>();
+    let view = crate::zones::view::for_session(session);
+    let pointer = match &view {
+        Ok(Some(_)) => format!("; {}", crate::zones::view::POINTER),
+        _ => String::new(),
+    };
     if !zones.is_empty() {
-        out.push_str(&format!("zones: {}\n", zones.join(", ")));
+        out.push_str(&format!("zones: {}{pointer}\n", zones.join(", ")));
+    } else if !pointer.is_empty() {
+        out.push_str(&format!("{}\n", crate::zones::view::POINTER));
+    }
+    match view {
+        Ok(Some(lines)) => {
+            for line in lines {
+                out.push_str(&format!("{line}\n"));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => out.push_str(&format!("zone map view unavailable: {error}\n")),
     }
     if !session.resumable() {
         out.push_str("This session has ended; every mutating tool call will be denied.\n");
@@ -816,7 +980,18 @@ pub(crate) fn authorize(
     event: &str,
 ) -> Result<Verdict, String> {
     session.lapse_if_idle()?;
-    let mut verdict = session.runtime(protected).decide(action);
+    let runtime = session.runtime(protected);
+    let mut verdict = runtime.decide(action);
+    // The repository files a read touched, for observability (paths outside it are left out)
+    let read = (action.operation == Operation::Read)
+        .then(|| {
+            action
+                .arguments
+                .iter()
+                .filter_map(|path| runtime.relative(path))
+                .collect::<Vec<_>>()
+        })
+        .filter(|read| !read.is_empty());
     // A session bound to an approved task contract loses its authority once that contract is
     // superseded, retired, or invalidated: no change may run against an obsolete contract
     if action.operation != Operation::Read && verdict.decision != Decision::Deny {
@@ -854,6 +1029,8 @@ pub(crate) fn authorize(
         "resources": verdict.resources,
         "decision": verdict.decision.name(),
         "reasons": verdict.reasons,
+        "policies": verdict.policies,
+        "zones": verdict.zones,
         "arguments_digest": action.digest,
         "result": match verdict.decision {
             Decision::Allow => "authorized",
@@ -865,6 +1042,9 @@ pub(crate) fn authorize(
         entry["budget_reserve"] = reserve;
     }
     entry["summary"] = summary(action);
+    if let Some(read) = read {
+        entry["summary"]["read"] = json!(read);
+    }
     session.record(entry)?;
     if action.command.as_deref().is_some_and(changes_own_autonomy) {
         // The command was denied above; trying it at all is a critical violation
@@ -995,7 +1175,7 @@ pub(crate) fn start(
     let (session, created) = open(agent, provider_session, options)?;
     if created {
         session.record(
-            json!({"event": "session_start", "source": "manager", "model": null, "resumed": false}),
+            json!({"event": "session_start", "source": "manager", "crane_version": env!("CARGO_PKG_VERSION"), "model": null, "resumed": false}),
         )?;
         // A human starting the session approves it, which may complete an inherited recovery
         apply(

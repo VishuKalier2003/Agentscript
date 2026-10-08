@@ -2,7 +2,81 @@ use crate::repository::ensure_initialized;
 use crate::zones::{inspect, Zones};
 
 /** Usage of the zone review commands */
-const REVIEW_USAGE: &str = "crane zones recommend [--by NAME] [--json] | recommendations [--json] | review ID [--claim] [--by NAME] [--json] | approve ID --approver NAME --confirm DIGEST_PREFIX | reject ID --approver NAME [--reason TEXT] | audit [--json]";
+const REVIEW_USAGE: &str = "crane zones recommend [--by NAME] [--json] | recommendations [--json] | review ID|map [--claim] [--by NAME] [--json] | approve ID|map --approver NAME --confirm DIGEST_PREFIX | reject ID|map --approver NAME [--reason TEXT] | audit [--json]";
+
+/** Usage of the zone map view */
+const MAP_USAGE: &str = "crane zones map [--file PATH] [--session ID] [--json]";
+
+/** Review, approve, or reject the compact zone map (.crane/zones.map)
+ * Input
+    - command: &str - review, approve, or reject
+    - args: &[String] - arguments after "map"
+ * Output
+    - Result<(), String>
+*/
+fn map_command(command: &str, args: &[String]) -> Result<(), String> {
+    use crate::util::option;
+    use crate::zones::{map, view};
+    let value = match command {
+        "review" => map::review(&inspect()?.inventory, option(args, "--by"))?,
+        "approve" => {
+            let record = map::approve(option(args, "--approver"), option(args, "--confirm"))?;
+            view::refresh();
+            record
+        }
+        _ => map::reject(option(args, "--approver"), option(args, "--reason"))?,
+    };
+    if args.iter().any(|argument| argument == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+        );
+    } else {
+        print!("{}", map::render(&value));
+    }
+    Ok(())
+}
+
+/** Print the agent's zone map view (per file, every symbol with its criticality, autonomy,
+ * expected decision, and contract markers) and, for the whole repository, write it to
+ * .crane/runtime/zones.agent.md; it is advisory and grants nothing
+ * Input
+    - args: &[String] - [--file PATH] [--session ID] [--json]
+ * Output
+    - Result<(), String>
+*/
+fn view_command(args: &[String]) -> Result<(), String> {
+    use crate::util::option;
+    use crate::zones::view::{build, markdown, save, Subject};
+    if let Some(unknown) = args.iter().find(|argument| {
+        argument.starts_with("--")
+            && !matches!(argument.as_str(), "--file" | "--session" | "--json")
+    }) {
+        return Err(format!("unknown option '{unknown}'; use '{MAP_USAGE}'"));
+    }
+    let zones = inspect()?;
+    let subject = match option(args, "--session") {
+        Some(id) => Subject::of(
+            &crate::session::ContractSession::load(&id)?
+                .ok_or_else(|| format!("no contract session '{id}'"))?,
+        ),
+        None => Subject::new_sessions()?,
+    };
+    let file = option(args, "--file");
+    let view = build(&zones, &subject, file.as_deref())?;
+    if file.is_none() {
+        save(&view)?;
+    }
+    if args.iter().any(|argument| argument == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).map_err(|error| error.to_string())?
+        );
+    } else {
+        print!("{}", markdown(&view));
+    }
+    Ok(())
+}
 
 /** Run a zone review command: discovery-driven recommendations, their review, approval or
  * rejection by a human, and the audit log
@@ -15,6 +89,11 @@ const REVIEW_USAGE: &str = "crane zones recommend [--by NAME] [--json] | recomme
 fn review_command(command: &str, args: &[String]) -> Result<(), String> {
     use crate::util::option;
     use crate::zones::review;
+    if args.first().is_some_and(|argument| argument == "map")
+        && matches!(command, "review" | "approve" | "reject")
+    {
+        return map_command(command, &args[1..]);
+    }
     let json = args.iter().any(|argument| argument == "--json");
     let id = || {
         args.iter()
@@ -35,11 +114,15 @@ fn review_command(command: &str, args: &[String]) -> Result<(), String> {
             review::claim(&id()?, option(args, "--by"))?
         }
         "review" => review::load(&id()?)?,
-        "approve" => review::approve(
-            &id()?,
-            option(args, "--approver"),
-            option(args, "--confirm"),
-        )?,
+        "approve" => {
+            let record = review::approve(
+                &id()?,
+                option(args, "--approver"),
+                option(args, "--confirm"),
+            )?;
+            crate::zones::view::refresh();
+            record
+        }
         "reject" => review::reject(&id()?, option(args, "--approver"), option(args, "--reason"))?,
         _ => review::audit_log()?,
     };
@@ -77,10 +160,22 @@ fn review_command(command: &str, args: &[String]) -> Result<(), String> {
             }
             for item in list {
                 println!(
-                    "  {:<34} {:<10} zone {:<22} {:<10} autonomy {:<10} {:>3} files  confidence {:<6} rev {}{}",
-                    text(&item["id"]), text(&item["status"]), text(&item["zone_id"]), text(&item["criticality"]), text(&item["autonomy"]), item["files"], text(&item["confidence"]), item["revision"],
-                    if item["active"] == true { "  [active]" } else { "" }
+                    "{:<24} {:<10} {} files, confidence {}{}",
+                    text(&item["id"]),
+                    text(&item["status"]),
+                    item["files"],
+                    text(&item["confidence"]),
+                    if item["active"] == true {
+                        ", ACTIVE"
+                    } else {
+                        ""
+                    }
                 );
+                println!("    {}", text(&item["decision_needed"]));
+                println!("    if approved: {}", text(&item["if_approved"]));
+                if let Some(approve) = item["approve"].as_str() {
+                    println!("    next: {approve}");
+                }
             }
         }
         "audit" => {
@@ -99,77 +194,7 @@ fn review_command(command: &str, args: &[String]) -> Result<(), String> {
                 );
             }
         }
-        _ => {
-            let recommendation = &value["recommendation"];
-            println!(
-                "Zone recommendation {} ({}{}), revision {}",
-                text(&value["id"]),
-                text(&value["status"]),
-                if value["active"] == true {
-                    ", active"
-                } else {
-                    ""
-                },
-                value["revision"]
-            );
-            if value["already_approved"] == true {
-                println!("Already approved; nothing changed.");
-            }
-            if value["already_rejected"] == true {
-                println!("Already rejected; nothing changed.");
-            }
-            println!("  digest: {}", text(&value["digest"]));
-            println!(
-                "  criticality {}, autonomy {}, safety {}; confidence {}; sources {}",
-                text(&recommendation["criticality"]),
-                text(&recommendation["autonomy"]),
-                text(&recommendation["safety_state"]),
-                text(&recommendation["confidence"]),
-                recommendation["sources"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(text)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            for line in recommendation["rationale"].as_array().into_iter().flatten() {
-                println!("  - {}", text(line));
-            }
-            println!(
-                "  affects {} files, {} symbols: {}",
-                recommendation["affected"]["files"]
-                    .as_array()
-                    .map_or(0, Vec::len),
-                recommendation["affected"]["entities"],
-                recommendation["affected"]["files"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .take(6)
-                    .map(text)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            println!(
-                "  zone file it would write (zones/{}.zone):",
-                text(&value["zone_id"])
-            );
-            for line in text(&value["zone_text"]).lines() {
-                println!("    {line}");
-            }
-            if matches!(value["status"].as_str(), Some("proposed" | "in_review")) {
-                println!(
-                    "  approve: crane zones approve {} --approver NAME --confirm {}",
-                    text(&value["id"]),
-                    text(&value["digest"])
-                        .trim_start_matches("sha256:")
-                        .chars()
-                        .take(12)
-                        .collect::<String>()
-                );
-            }
-        }
+        _ => print!("{}", review::render(&value)),
     }
     Ok(())
 }
@@ -194,6 +219,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     ) = args.first().map(String::as_str)
     {
         return review_command(command, &args[1..]);
+    }
+    if args.first().is_some_and(|argument| argument == "map") {
+        return view_command(&args[1..]);
     }
     let json = args.iter().any(|argument| argument == "--json");
     let mut names = args.iter().filter(|argument| argument.as_str() != "--json");
@@ -221,18 +249,57 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         }
     }
     if json {
+        let value = zones.to_json(only);
         println!(
             "{}",
-            serde_json::to_string_pretty(&zones.to_json(only)).map_err(|error| error.to_string())?
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
         );
     } else {
         print!("{}", render(&zones, only));
+        print!(
+            "{}",
+            render_map(&crate::zones::map::status(&zones.inventory)?)
+        );
     }
     if zones.problems.is_empty() {
         Ok(())
     } else {
         Err("one or more zone definitions are invalid".into())
     }
+}
+
+/** Render the zone map's state for a terminal: whether the approved map matches the file, its
+ * parse errors, and its shadowed and unresolved lines
+ * Input
+    - map: &serde_json::Value - result of map::status
+ * Output
+    - String, empty when there is no map
+*/
+fn render_map(map: &serde_json::Value) -> String {
+    if map["state"] == "none" {
+        return String::new();
+    }
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+    let mut out = format!(
+        "Zone map (.crane/zones.map): {}
+",
+        text(&map["state"])
+    );
+    if !matches!(map["state"].as_str(), Some("active")) {
+        out.push_str("  review it with 'crane zones review map', then approve it\n");
+    }
+    for item in map["errors"].as_array().into_iter().flatten() {
+        out.push_str(&format!("  invalid: {}\n", text(item)));
+    }
+    for item in map["shadowed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(map["unresolved"].as_array().into_iter().flatten())
+    {
+        out.push_str(&format!("  {}\n", text(&item["message"])));
+    }
+    out
 }
 
 /** Render the zones for a terminal: each zone with its declared and effective values and its

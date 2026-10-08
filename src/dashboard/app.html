@@ -143,10 +143,15 @@ async function zonesScreen() {
   const open = async id => {
     const record = await api("GET", "/api/zones/recommendations/" + encodeURIComponent(id));
     const rec = record.recommendation, approver = h("input", {placeholder: "your name"}), reason = h("input", {placeholder: "reason"});
-    const confirm = h("input", {placeholder: "first 12 digest characters", size: 26});
+    const sum = record.summary || {};
+    const confirm = h("input", {placeholder: sum.approval_code ? "type " + sum.approval_code : "first 12 digest characters", size: 26});
     const decide = async (action, body) => { try { await api("POST", "/api/zones/recommendations/" + encodeURIComponent(id) + "/" + action, body); render(); } catch (error) { alert(error.message); } };
     detail.replaceChildren(panel("Recommended zone " + record.zone_id,
       h("div", {class: "row"}, badge(record.status), record.active ? badge("active") : null, h("span", {class: "chip"}, "revision " + record.revision), h("span", {class: "chip"}, "confidence " + rec.confidence), h("code", {}, record.digest)),
+      table(["In plain words", ""], [["Decision needed", h("b", {}, sum.decision_needed || "")], ["Covers", sum.covers || ""], ["If approved", sum.if_approved || ""], ["Why", sum.why || ""],
+        ["Already protected", sum.already_protected ? "yes, by active zones" : "no"], ["Matches code", sum.matches_real_code ? "yes" : "NO: a selector matches nothing"],
+        ["Proposed", (sum.proposed_by || "unknown") + " on " + (sum.proposed_at || "")]].concat(sum.approve ? [["From a terminal", h("pre", {}, sum.approve + "
+" + sum.reject)]] : [])),
       h("div", {class: "stats"}, stat(rec.criticality, "criticality"), stat(rec.autonomy, "suggested autonomy"), stat(rec.safety_state, "suggested safety state"), stat(rec.affected.files.length, "files"), stat(rec.affected.entities, "symbols")),
       h("h3", {}, "Rationale"), h("ul", {}, rec.rationale.map(line => h("li", {}, line))),
       h("h3", {}, "Signals and sources"), table(["Signal", "Evidence"], rec.signals.map(signal => [h("code", {}, signal.signal), signal.detail || ((signal.symbols || signal.files) + " " + (signal.examples ? signal.examples.join(", ") : ""))])),
@@ -161,8 +166,8 @@ async function zonesScreen() {
   const recommendations = panel("Recommended zones (proposals: nothing governs agents until a human approves)",
     h("div", {class: "row"}, h("button", {class: "act", onclick: async () => { await api("POST", "/api/zones/recommendations", {}); render(); }}, "Discover and recommend"),
       h("span", {class: "muted"}, review.discovery ? "last discovery " + review.discovery.run + " at " + new Date(review.discovery.at * 1000).toLocaleString() : "no discovery yet")),
-    table(["Recommendation", "Status", "Zone", "Criticality", "Autonomy", "Files", "Confidence", "Sources"],
-      review.recommendations.map(item => [h("b", {}, item.id), badge(item.status), item.zone_id, badge(item.criticality), item.autonomy, item.files, item.confidence, (item.sources || []).join(", ")]),
+    table(["Recommendation", "Status", "Decision needed", "Criticality", "Autonomy", "Files", "Confidence"],
+      review.recommendations.map(item => [h("b", {}, item.id), badge(item.status), item.decision_needed || item.zone_id, badge(item.criticality), item.autonomy, item.files, item.confidence]),
       index => open(review.recommendations[index].id)), detail);
   return h("div", {}, recommendations, panel("Active zones",
     table(["Zone", "Selectors", "Criticality", "Autonomy (declared → effective)", "Safety state", "Resolved resources"],

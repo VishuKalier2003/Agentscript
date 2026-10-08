@@ -154,7 +154,9 @@ impl SafetyState {
 
 /** What a selector names; semantic kinds survive file moves, path kinds do not
  * Variants
-    - Symbol - a symbol by id ("java:com.acme.Pay.charge") or qualified name ("Pay.charge")
+    - Symbol - a symbol by id ("java:com.acme.Pay.charge"), by file and qualified name
+      ("payments/service.py::PaymentService.charge", or "...::PaymentService.*" for its members),
+      or by qualified name ("Pay.charge"); it restricts changes to that symbol only
     - Module - a module by id ("java:com.acme.payments") or name ("com.acme.payments")
     - Service - a service by path ("services/payments") or name ("payments")
     - Subsystem - every service, module, and folder with a name segment matching ("payments")

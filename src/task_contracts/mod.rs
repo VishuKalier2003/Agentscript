@@ -127,6 +127,20 @@ fn read(task: &str, version: u64) -> Result<Value, String> {
     Ok(record)
 }
 
+/** Read a task's latest contract exactly as stored, without bringing it up to date or writing
+ * anything (load refreshes and persists invalidations; read-only observability must not)
+ * Input
+    - task: &str - task id
+ * Output
+    - Result<Option<Value>, String> None when the task has no contract
+*/
+pub(crate) fn peek(task: &str) -> Result<Option<Value>, String> {
+    match versions(task)?.last() {
+        Some(version) => read(task, *version).map(Some),
+        None => Ok(None),
+    }
+}
+
 /** Write a contract version through a temporary file
  * Input
     - record: &Value - contract
@@ -140,12 +154,156 @@ fn save(record: &Value) -> Result<(), String> {
     )?;
     fs::create_dir_all(file.parent().ok_or("invalid task contract path")?).map_err(io_error)?;
     let temporary = file.with_extension(format!("tmp{}", std::process::id()));
+    // The record is written with its human summary first
     fs::write(
         &temporary,
-        serde_json::to_string_pretty(record).map_err(io_error)? + "\n",
+        crate::human::pretty(&with_summary(record.clone()))?,
     )
     .map_err(io_error)?;
     fs::rename(&temporary, &file).map_err(io_error)
+}
+
+/** Attach the human summary to a contract (derived from its own fields, never part of its digest)
+ * Input
+    - record: Value - contract
+ * Output
+    - Value
+*/
+pub(crate) fn with_summary(mut record: Value) -> Value {
+    record["summary"] = summarize(&record);
+    record
+}
+
+/** Summarize a contract for people: the decision it needs, what the agent must and must not
+ * change, what still needs a human, the tests, and the commands that act on it
+ * Input
+    - record: &Value - contract
+ * Output
+    - Value
+*/
+pub(crate) fn summarize(record: &Value) -> Value {
+    use crate::human;
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let task = text(&record["task_id"]);
+    let contract = &record["contract"];
+    let items = |section: &str| {
+        contract[section]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| format!("{} ({})", text(&item["qualified"]), text(&item["file"])))
+            .collect::<Vec<_>>()
+    };
+    let at = |value: &Value| human::when_value(&value["at"]).unwrap_or_default();
+    let first = |section: &str| {
+        record[section]
+            .as_array()
+            .and_then(|list| list.iter().find(|item| item["blocking"] != false))
+            .map_or(String::new(), |item| text(&item["message"]))
+    };
+    let invalidated = record["invalidation"]["message"].as_str();
+    let status = text(&record["status"]);
+    let decision = match (status.as_str(), invalidated) {
+        (_, Some(message)) => format!("Recompile: {message}"),
+        ("proposed", _) => {
+            format!("Approve or reject: let an AI agent work on {task} within this contract")
+        }
+        ("clarification_required", _) => format!(
+            "Clarify the task in the tracker, then recompile: {}",
+            first("clarifications")
+        ),
+        ("conflicts_with_policy", _) => format!(
+            "Resolve the conflict with active policy, then recompile: {}",
+            first("conflicts")
+        ),
+        ("unrelated", _) => "None: the task does not touch this repository".into(),
+        ("approved", _) => format!(
+            "None: approved by {} on {}; an agent session can start",
+            text(&record["approval"]["approver"]),
+            at(&record["approval"])
+        ),
+        ("rejected", _) => format!(
+            "None: rejected by {} on {}{}",
+            text(&record["rejection"]["by"]),
+            at(&record["rejection"]),
+            record["rejection"]["reason"]
+                .as_str()
+                .map_or(String::new(), |reason| format!(" ({reason})"))
+        ),
+        ("superseded", _) => "None: a newer version replaced it".into(),
+        (other, _) => format!("None: the contract is {}", other.replace('_', " ")),
+    };
+    let tests = contract["EXPECTED_TESTS"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            if let Some(test) = item["test"].as_str() {
+                format!("run {test}")
+            } else if let Some(file) = item["test_file"].as_str() {
+                format!("run the tests in {file}")
+            } else if let Some(list) = item["add_regression_test"].as_array() {
+                format!(
+                    "add a regression test for {}",
+                    list.iter()
+                        .map(|name| human::symbol(&text(name)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                format!(
+                    "add a test for {}",
+                    human::symbol(&text(&item["add_test_for"]))
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    let scope = &contract["TASK_SCOPE"];
+    let names = |value: &Value| human::strings(value).join(", ");
+    let code = human::code(record["digest"].as_str().unwrap_or_default());
+    let must_not = items("MUST_NOT_CHANGE");
+    let mut summary = json!({
+        "decision_needed": decision,
+        "task": format!("{task}: {}", text(&record["task"]["title"])),
+        "status": match status.as_str() {
+            "proposed" => "waiting for review",
+            "approved" if invalidated.is_some() => "approved, but out of date",
+            "approved" => "approved: an agent may work within it",
+            "clarification_required" => "the task is unclear; no agent may work on it",
+            "conflicts_with_policy" => "the task conflicts with active policy; no agent may work on it",
+            "unrelated" => "the task does not touch this repository",
+            "rejected" => "rejected",
+            "superseded" => "replaced by a newer version",
+            other => other,
+        },
+        "grants_authority": status == "approved" && invalidated.is_none(),
+        "must_change": items("MUST_CHANGE"),
+        "must_not_change": if must_not.len() > 8 { json!(format!("{} and {} more", must_not[..8].join(", "), must_not.len() - 8)) } else { json!(must_not) },
+        "may_change": contract["MAY_CHANGE"].as_array().map_or(0, Vec::len),
+        "needs_human_approval": contract["REQUIRES_APPROVAL"].as_array().into_iter().flatten().map(|item| text(&item["reason"])).collect::<Vec<_>>(),
+        "scope": format!("services: {}; modules: {}; files: {}", names(&scope["services"]), names(&scope["modules"]), names(&scope["files"])),
+        "tests": tests,
+        "version": record["version"],
+        "approval_code": code,
+        "compiled": format!("by {} on {}", text(&record["compiled"]["by"]), at(&record["compiled"])),
+        "review": format!("crane task contract show {task}"),
+    });
+    match status.as_str() {
+        "proposed" if invalidated.is_none() => {
+            summary["approve"] = json!(format!(
+                "crane task contract approve {task} --approver YOUR_NAME --confirm {code}"
+            ));
+            summary["reject"] = json!(format!(
+                "crane task contract reject {task} --approver YOUR_NAME --reason \"WHY\""
+            ));
+        }
+        "approved" if invalidated.is_none() => {
+            summary["start"] = json!(format!("crane task launch {task} --agent claude"));
+        }
+        "unrelated" | "rejected" | "superseded" => {}
+        _ => summary["recompile"] = json!(format!("crane task contract compile {task}")),
+    }
+    summary
 }
 
 /** Append a history entry to a contract
@@ -511,7 +669,7 @@ pub(crate) fn load(task: &str, version: Option<u64>) -> Result<Option<Value>, St
     };
     let mut record = read(task, version)?;
     refresh(&mut record, agent_environment().is_none())?;
-    Ok(Some(record))
+    Ok(Some(with_summary(record)))
 }
 
 /** Map a planner status to a contract status

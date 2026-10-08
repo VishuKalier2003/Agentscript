@@ -194,11 +194,15 @@ fn intake_command(operation: &str, args: &[String]) -> Result<(), String> {
         "list" => intake::list()?,
         "show" => intake::show(&task()?)?,
         "prepare" => intake::prepare(&task()?, option(args, "--checkpoint"), &by())?,
-        "approve" => intake::approve(
-            &task()?,
-            option(args, "--approver"),
-            option(args, "--confirm"),
-        )?,
+        "approve" => {
+            let value = intake::approve(
+                &task()?,
+                option(args, "--approver"),
+                option(args, "--confirm"),
+            )?;
+            crate::zones::view::refresh();
+            value
+        }
         _ => intake::launch(
             &task()?,
             option(args, "--agent"),
@@ -379,6 +383,14 @@ fn completions_command(args: &[String], json: bool) -> Result<(), String> {
                 .as_str()
                 .map_or(String::new(), |error| format!(" ({error})"))
         );
+        let summary = &event["summary"];
+        println!("      {}", text(&summary["state"]));
+        if let Some(attention) = summary["needs_attention"].as_str() {
+            println!("      {attention}");
+        }
+        if let Some(send) = summary["send"].as_str() {
+            println!("      next: {send}");
+        }
     }
     if !value["event_id"].is_null() {
         println!(
@@ -455,11 +467,15 @@ fn contract_command(args: &[String]) -> Result<(), String> {
             })?
         }
         "list" => task_contracts::list()?,
-        "approve" => task_contracts::approve(
-            &task()?,
-            option(args, "--approver"),
-            option(args, "--confirm"),
-        )?,
+        "approve" => {
+            let value = task_contracts::approve(
+                &task()?,
+                option(args, "--approver"),
+                option(args, "--confirm"),
+            )?;
+            crate::zones::view::refresh();
+            value
+        }
         "reject" => task_contracts::reject(
             &task()?,
             option(args, "--approver"),
@@ -473,6 +489,11 @@ fn contract_command(args: &[String]) -> Result<(), String> {
         }
     };
     if json {
+        let value = if value["task_contract_format"].is_u64() {
+            task_contracts::with_summary(value.clone())
+        } else {
+            value.clone()
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
@@ -487,6 +508,20 @@ fn contract_command(args: &[String]) -> Result<(), String> {
                     );
                 }
                 for item in contracts {
+                    if let Some(record) = item["task_id"]
+                        .as_str()
+                        .and_then(|task| task_contracts::load(task, None).ok().flatten())
+                    {
+                        let summary = task_contracts::summarize(&record);
+                        println!("  {}", text(&summary["task"]));
+                        println!("      {}", text(&summary["decision_needed"]));
+                        if let Some(next) = ["approve", "start", "recompile"]
+                            .iter()
+                            .find_map(|key| summary[*key].as_str())
+                        {
+                            println!("      next: {next}");
+                        }
+                    }
                     println!(
                         "  {:<24} {:<24} {} {} must change, modules [{}]",
                         text(&item["contract_id"]),
@@ -574,7 +609,26 @@ fn render_contract(record: &Value) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let summary = crate::task_contracts::summarize(record);
+    let field = |key: &str| text(&summary[key]);
+    let lines = |key: &str| {
+        let list = crate::human::strings(&summary[key]);
+        if list.is_empty() {
+            "none".to_string()
+        } else {
+            list.join("; ")
+        }
+    };
     let mut out = format!(
+        "Task {}\nStatus           {}\nDecision needed  {}\nMust change      {}\nNeeds a human    {}\nTests            {}\n\nDetails\n",
+        field("task"),
+        field("status"),
+        field("decision_needed"),
+        lines("must_change"),
+        lines("needs_human_approval"),
+        lines("tests")
+    );
+    out.push_str(&format!(
         "Task contract {} ({}): {}
 Digest: {}
 Authority: {}
@@ -584,7 +638,7 @@ Authority: {}
         text(&record["task"]["title"]),
         text(&record["digest"]),
         text(&record["authority"]["reason"])
-    );
+    ));
     if record["unchanged"] == true {
         out.push_str(
             "Unchanged: the task, repository, and configuration compile to the same contract.\n",
@@ -696,11 +750,22 @@ Authority: {}
             out.push_str(&format!("  {line}\n"));
         }
     }
-    if record["status"] == "proposed" {
+    let next = [
+        ("approve", "approve"),
+        ("reject", "reject"),
+        ("start", "start an agent"),
+        ("recompile", "recompile"),
+    ]
+    .iter()
+    .filter_map(|(key, label)| {
+        summary[*key]
+            .as_str()
+            .map(|command| format!("  {:<15} {command}\n", format!("{label}:")))
+    })
+    .collect::<String>();
+    if !next.is_empty() {
         out.push_str(&format!(
-            "To approve after review (a human): crane task contract approve {} --approver NAME --confirm {}\n",
-            text(&record["task_id"]),
-            short(&record["digest"])
+            "\nNext step, for a human (replace YOUR_NAME):\n{next}"
         ));
     }
     out

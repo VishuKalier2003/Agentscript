@@ -180,3 +180,58 @@ fn documented_example_parses() {
     assert_eq!(zones[0].policy_reference.as_deref(), Some("payments"));
     assert_eq!(zones[0].safety_state, SafetyState::Active);
 }
+
+/** Test that a file whose zones select some of its symbols restricts only changes to those
+ * symbols, keeps its whole-file zones for every change, and falls back to everything when the
+ * changed symbols are unknown or the file is new
+ * Input
+    - None
+ * Output
+    - None (panics on assertion failure)
+*/
+#[test]
+fn symbol_constraints_fail_closed() {
+    use crate::agent_session::{FileConstraint, Governance};
+    use std::collections::{BTreeMap, BTreeSet};
+    let constraint = |zone: &str, criticality, autonomy| FileConstraint {
+        zones: vec![zone.into()],
+        criticality,
+        autonomy,
+        state: SafetyState::Active,
+        grant: None,
+        symbols: BTreeMap::new(),
+        whole: None,
+    };
+    let whole = constraint("folder", Criticality::Sensitive, Autonomy::Delegated);
+    let charge = constraint("money", Criticality::Critical, Autonomy::Assisted);
+    let mut file = whole.clone().merge(charge.clone());
+    file.symbols.insert("Pay.charge".into(), charge);
+    file.whole = Some(Box::new(whole));
+    let mut governance = Governance::plain();
+    governance.files.insert("pay/service.py".into(), file);
+    let names = |list: &[&str]| {
+        list.iter()
+            .map(|name| name.to_string())
+            .collect::<BTreeSet<_>>()
+    };
+    let (other, on) = governance
+        .constraint_for("pay/service.py", Some(&names(&["Pay.fee"])))
+        .unwrap();
+    assert_eq!(
+        (other.autonomy, on.as_str()),
+        (Autonomy::Delegated, "pay/service.py")
+    );
+    let (touched, on) = governance
+        .constraint_for("pay/service.py", Some(&names(&["Pay", "Pay.charge"])))
+        .unwrap();
+    assert_eq!(touched.autonomy, Autonomy::Assisted);
+    assert_eq!(on, "pay/service.py::Pay.charge");
+    assert_eq!(touched.zones, ["folder", "money"]);
+    let (unknown, _) = governance.constraint_for("pay/service.py", None).unwrap();
+    assert_eq!(unknown.autonomy, Autonomy::Assisted);
+    let (new_file, _) = governance
+        .constraint_for("pay/new.py", Some(&BTreeSet::new()))
+        .unwrap();
+    assert_eq!(new_file.autonomy, Autonomy::Assisted);
+    assert!(governance.constraint_for("docs/readme.md", None).is_none());
+}

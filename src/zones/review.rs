@@ -24,7 +24,7 @@ use crate::util::{io_error, now_unix, sha256, validate_identifier};
 pub(crate) const REVIEW_FORMAT: u64 = 1;
 
 /** Characters of the digest a reviewer must quote to approve */
-const CONFIRM_LENGTH: usize = 12;
+pub(super) const CONFIRM_LENGTH: usize = 12;
 
 /** Return the proposals directory
  * Input
@@ -32,7 +32,7 @@ const CONFIRM_LENGTH: usize = 12;
  * Output
     - Result<PathBuf, String>
 */
-fn directory() -> Result<PathBuf, String> {
+pub(super) fn directory() -> Result<PathBuf, String> {
     Ok(root()?.join("zone-proposals"))
 }
 
@@ -43,15 +43,265 @@ fn directory() -> Result<PathBuf, String> {
  * Output
     - Result<(), String>
 */
-fn write(path: PathBuf, value: &Value) -> Result<(), String> {
+pub(super) fn write(path: PathBuf, value: &Value) -> Result<(), String> {
     fs::create_dir_all(path.parent().ok_or("invalid path")?).map_err(io_error)?;
     let temporary = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(
-        &temporary,
-        serde_json::to_string_pretty(value).map_err(io_error)? + "\n",
-    )
-    .map_err(io_error)?;
+    // A recommendation is written with its human summary first
+    let text = if value.get("review_format").is_some() {
+        crate::human::pretty(&with_summary(value.clone()))?
+    } else {
+        serde_json::to_string_pretty(value).map_err(io_error)? + "\n"
+    };
+    fs::write(&temporary, text).map_err(io_error)?;
     fs::rename(&temporary, &path).map_err(io_error)
+}
+
+/** Attach the human summary to a recommendation (derived from its own fields, never used for
+ * decisions)
+ * Input
+    - record: Value - recommendation
+ * Output
+    - Value
+*/
+pub(crate) fn with_summary(mut record: Value) -> Value {
+    record["summary"] = summarize(&record);
+    record
+}
+
+/** Summarize a recommendation for people: the decision it needs, what it covers, what approval
+ * would mean for AI agents, why it was proposed, who proposed it and when, and the commands that
+ * act on it
+ * Input
+    - record: &Value - recommendation
+ * Output
+    - Value
+*/
+pub(crate) fn summarize(record: &Value) -> Value {
+    use crate::human;
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let id = text(&record["id"]);
+    let zone = text(&record["zone_id"]);
+    let recommendation = &record["recommendation"];
+    let criticality = text(&recommendation["criticality"]);
+    let autonomy = text(&recommendation["autonomy"]);
+    let files = human::strings(&recommendation["affected"]["files"]);
+    let mut names = human::strings(&recommendation["affected"]["entity_names"]);
+    if names.is_empty() {
+        names = human::strings(&recommendation["affected"]["entity_examples"])
+            .iter()
+            .map(|name| human::symbol(name))
+            .collect();
+    }
+    let total = recommendation["affected"]["entities"]
+        .as_u64()
+        .unwrap_or(names.len() as u64);
+    let shown = names.iter().take(5).cloned().collect::<Vec<_>>();
+    let more = (total as usize).saturating_sub(shown.len());
+    let covers = format!(
+        "{}{}{} ({} code item{} in {} file{})",
+        human::list(&files.iter().take(3).cloned().collect::<Vec<_>>()),
+        if files.len() > 3 {
+            format!(" and {} more files", files.len() - 3)
+        } else {
+            String::new()
+        },
+        if shown.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {}{}",
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        },
+        total,
+        if total == 1 { "" } else { "s" },
+        files.len(),
+        if files.len() == 1 { "" } else { "s" }
+    );
+    let signals = recommendation["signals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|signal| signal["signal"].as_str().map(human::signal))
+        .collect::<Vec<_>>();
+    let sources = human::strings(&recommendation["sources"])
+        .iter()
+        .map(|source| human::source(source))
+        .collect::<Vec<_>>();
+    let rationale = human::strings(&recommendation["rationale"]).join(" ");
+    let why = format!(
+        "{}{}{} Confidence {} ({} {} {}).",
+        rationale,
+        if rationale.is_empty() || rationale.ends_with('.') {
+            ""
+        } else {
+            "."
+        },
+        if signals.is_empty() {
+            String::new()
+        } else {
+            format!(" Evidence: {}.", signals.join("; "))
+        },
+        text(&recommendation["confidence"]),
+        sources.len(),
+        if sources.len() == 1 {
+            "source:"
+        } else {
+            "sources agree:"
+        },
+        human::list(&sources)
+    );
+    let code = human::code(record["digest"].as_str().unwrap_or_default());
+    let open = matches!(record["status"].as_str(), Some("proposed" | "in_review"));
+    let decision = match record["status"].as_str().unwrap_or_default() {
+        "proposed" | "in_review" if record["active"] == true => format!(
+            "Approve or reject revision {} of the active zone \"{zone}\" (the evidence changed)",
+            record["revision"]
+        ),
+        "proposed" | "in_review" => format!(
+            "Approve or reject: protect {} as a {} zone \"{zone}\"",
+            human::list(
+                &human::strings(&recommendation["selectors"])
+                    .iter()
+                    .map(|selector| human::selector(selector))
+                    .collect::<Vec<_>>()
+            ),
+            human::criticality(&criticality)
+                .split(':')
+                .next()
+                .unwrap_or_default()
+        ),
+        "approved" => format!(
+            "None: approved by {} on {}; the zone is active",
+            text(&record["activation"]["approver"]),
+            human::when_value(&record["activation"]["at"]).unwrap_or_default()
+        ),
+        "rejected" => format!(
+            "None: rejected by {} on {}{}",
+            text(&record["rejection"]["by"]),
+            human::when_value(&record["rejection"]["at"]).unwrap_or_default(),
+            record["rejection"]["reason"]
+                .as_str()
+                .map_or(String::new(), |reason| format!(" ({reason})"))
+        ),
+        "withdrawn" => "None: withdrawn because its evidence disappeared from the code".into(),
+        other => format!("Unknown status {other}"),
+    };
+    let status = match record["status"].as_str().unwrap_or_default() {
+        "proposed" => "waiting for review",
+        "in_review" => "being reviewed",
+        "approved" => "approved: the zone is active",
+        "rejected" => "rejected",
+        "withdrawn" => "withdrawn",
+        _ => "unknown",
+    };
+    let history = record["history"].as_array().cloned().unwrap_or_default();
+    let mut summary = serde_json::json!({
+        "decision_needed": decision,
+        "status": status,
+        "covers": covers,
+        "selects": human::strings(&recommendation["selectors"]).iter().map(|selector| human::selector(selector)).collect::<Vec<_>>(),
+        "if_approved": format!("{}. {}.", human::criticality(&criticality), human::autonomy(&autonomy)),
+        "why": why,
+        "already_protected": recommendation["covered_by_active_zones"] == true,
+        "matches_real_code": recommendation["selector_status"].as_array().is_some_and(|selectors| !selectors.is_empty() && selectors.iter().all(|selector| selector["status"] == "resolved")),
+        "writes_file": format!(".crane/zones/{zone}.zone"),
+        "approval_code": code,
+        "proposed_by": history.first().map(|entry| entry["by"].clone()),
+        "proposed_at": history.first().and_then(|entry| human::when_value(&entry["at"])),
+        "last_change": history.last().map(|entry| format!("{} on {}", text(&entry["action"]).replace('_', " "), human::when_value(&entry["at"]).unwrap_or_default())),
+        "review": format!("crane zones review {id}"),
+    });
+    if open {
+        summary["approve"] = json!(format!(
+            "crane zones approve {id} --approver YOUR_NAME --confirm {code}"
+        ));
+        summary["reject"] = json!(format!(
+            "crane zones reject {id} --approver YOUR_NAME --reason \"WHY\""
+        ));
+    }
+    summary
+}
+
+/** Render a recommendation for a terminal: its summary first, then the zone file it writes
+ * Input
+    - record: &Value - recommendation (with or without a summary)
+ * Output
+    - String
+*/
+pub(crate) fn render(record: &Value) -> String {
+    let summary = summarize(record);
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .map_or_else(|| value.to_string(), String::from)
+    };
+    let mut out = format!(
+        "Zone recommendation \"{}\" (revision {}): {}\n\n",
+        text(&record["id"]),
+        record["revision"],
+        text(&summary["status"])
+    );
+    if record["already_approved"] == true {
+        out.push_str("Already approved; nothing changed.\n\n");
+    }
+    if record["already_rejected"] == true {
+        out.push_str("Already rejected; nothing changed.\n\n");
+    }
+    for (label, key) in [
+        ("Decision needed", "decision_needed"),
+        ("Covers", "covers"),
+        ("If approved", "if_approved"),
+        ("Why", "why"),
+    ] {
+        out.push_str(&format!("{label:<19}{}\n", text(&summary[key])));
+    }
+    out.push_str(&format!(
+        "{:<19}{}\n",
+        "Selects",
+        summary["selects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("; ")
+    ));
+    out.push_str(&format!(
+        "{:<19}{}\n{:<19}{}\n{:<19}{} on {}\n",
+        "Already protected",
+        if summary["already_protected"] == true {
+            "yes, by active zones"
+        } else {
+            "no"
+        },
+        "Matches code",
+        if summary["matches_real_code"] == true {
+            "yes"
+        } else {
+            "NO: a selector matches nothing"
+        },
+        "Proposed by",
+        text(&summary["proposed_by"]),
+        text(&summary["proposed_at"])
+    ));
+    out.push_str(&format!("\nIt writes {}:\n", text(&summary["writes_file"])));
+    for line in text(&record["zone_text"]).lines() {
+        out.push_str(&format!("    {line}\n"));
+    }
+    if summary["approve"].is_string() {
+        out.push_str(&format!(
+            "\nNext step (replace YOUR_NAME):\n  approve:  {}\n  reject:   {}\n",
+            text(&summary["approve"]),
+            text(&summary["reject"])
+        ));
+    }
+    out
 }
 
 /** Load one recommendation
@@ -67,6 +317,7 @@ pub(crate) fn load(id: &str) -> Result<Value, String> {
         _ => io_error(error),
     })?;
     serde_json::from_str(&text)
+        .map(with_summary)
         .map_err(|error| format!("zone recommendation {id} is invalid: {error}"))
 }
 
@@ -102,7 +353,7 @@ pub(crate) fn all() -> Result<Vec<Value>, String> {
  * Output
     - String
 */
-fn actor(given: Option<String>) -> String {
+pub(super) fn actor(given: Option<String>) -> String {
     given
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| git(&["config", "user.email"]).unwrap_or_else(|_| "unknown".into()))
@@ -117,7 +368,7 @@ fn actor(given: Option<String>) -> String {
  * Output
     - None
 */
-fn log(record: &mut Value, action: &str, by: &str, detail: Value) {
+pub(super) fn log(record: &mut Value, action: &str, by: &str, detail: Value) {
     let entry = json!({"action": action, "by": by, "at": now_unix(), "revision": record["revision"], "digest": record["digest"], "detail": detail});
     if let Some(history) = record["history"].as_array_mut() {
         history.push(entry);
@@ -130,7 +381,7 @@ fn log(record: &mut Value, action: &str, by: &str, detail: Value) {
  * Output
     - Result<(), String>
 */
-fn audit(mut event: Value) -> Result<(), String> {
+pub(super) fn audit(mut event: Value) -> Result<(), String> {
     let path = directory()?.join("audit.jsonl");
     let events = audit_events()?;
     let previous = events
@@ -186,7 +437,7 @@ pub(crate) fn audit_log() -> Result<Value, String> {
  * Output
     - Result<(), String>
 */
-fn require_human(what: &str) -> Result<(), String> {
+pub(super) fn require_human(what: &str) -> Result<(), String> {
     match agent_environment() {
         Some(marker) => Err(format!("crane zones {what} refuses to run in an agent environment ({marker} is set); only a human decides zone authority")),
         None => Ok(()),
@@ -545,6 +796,9 @@ pub(crate) fn summary() -> Result<Value, String> {
             "confidence": record["recommendation"]["confidence"],
             "sources": record["recommendation"]["sources"],
             "files": record["recommendation"]["affected"]["files"].as_array().map_or(0, Vec::len),
+            "decision_needed": record["summary"]["decision_needed"],
+            "if_approved": record["summary"]["if_approved"],
+            "approve": record["summary"]["approve"],
         })).collect::<Vec<_>>(),
     }))
 }

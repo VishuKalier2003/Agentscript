@@ -390,6 +390,8 @@ pub(crate) fn records(binding: &Value, events: &[Value]) -> Result<Vec<Value>, S
             "action_summary": or_null(&event["summary"]),
             "decision": or_null(&event["decision"]),
             "reasons": or_null(&event["reasons"]),
+            "policies": or_null(&event["policies"]),
+            "zones": or_null(&event["zones"]),
             "violations": violations,
             "repair": repair,
             "tests": tests,

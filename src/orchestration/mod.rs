@@ -223,7 +223,18 @@ impl Drop for Lock {
     }
 }
 
-/** Return the task records directory, .crane/runtime/tasks
+/** Return the task records directory, .crane/runtime/tasks, without creating anything (for reads)
+ * Input
+    - None
+ * Output
+    - Result<PathBuf, String>
+*/
+fn tasks_path() -> Result<PathBuf, String> {
+    Ok(root()?.join("runtime").join("tasks"))
+}
+
+/** Return the task records directory, .crane/runtime/tasks, making sure the runtime directory
+ * exists and is kept out of Git (for writes)
  * Input
     - None
  * Output
@@ -327,7 +338,7 @@ impl TaskRecord {
         - Result<PathBuf, String>
     */
     fn path(id: &str) -> Result<PathBuf, String> {
-        Ok(tasks_directory()?.join(id).join("state.json"))
+        Ok(tasks_path()?.join(id).join("state.json"))
     }
 
     /** Load a record
@@ -355,7 +366,7 @@ impl TaskRecord {
         - Result<Vec<TaskRecord>, String>
     */
     pub(crate) fn all() -> Result<Vec<Self>, String> {
-        let mut ids = match fs::read_dir(tasks_directory()?) {
+        let mut ids = match fs::read_dir(tasks_path()?) {
             Ok(entries) => entries
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| entry.path().join("state.json").is_file())
@@ -515,6 +526,7 @@ impl TaskRecord {
         - Result<(), String>
     */
     fn save(&self) -> Result<(), String> {
+        tasks_directory()?;
         let path = Self::path(&self.id)?;
         fs::create_dir_all(path.parent().ok_or("invalid task record path")?).map_err(io_error)?;
         let temporary = path.with_extension(format!("tmp{}", std::process::id()));
@@ -1196,7 +1208,7 @@ fn start_session(record: &mut TaskRecord, config: &SourceConfig) -> Result<Strin
     };
     let (session, created) = agent_session::open(profile, &provider, &options)?;
     if created {
-        session.record(json!({"event": "session_start", "source": "task orchestration", "model": null, "resumed": false}))?;
+        session.record(json!({"event": "session_start", "source": "task orchestration", "crane_version": env!("CARGO_PKG_VERSION"), "model": null, "resumed": false}))?;
     }
     let id = session.describe()["session_id"]
         .as_str()

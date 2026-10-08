@@ -509,6 +509,8 @@ pub(crate) fn decide(
                         decision: Decision::Deny,
                         reasons: vec![reason],
                         resources: Vec::new(),
+                        policies: Vec::new(),
+                        zones: Vec::new(),
                     },
                 ));
             }

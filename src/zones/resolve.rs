@@ -93,13 +93,21 @@ pub(crate) struct Conflict {
  * Fields
     - zones: Vec<ZoneResult> - zones in definition order
     - entities: BTreeMap<usize, Effective> - constraints per covered entity
-    - files: BTreeMap<usize, Effective> - constraints per covered file
+    - files: BTreeMap<usize, Effective> - constraints per file a zone touches (the most
+      restrictive of every zone touching it, including zones that select only some of its
+      symbols)
+    - whole: BTreeMap<usize, Effective> - constraints on every change to a file, from zones that
+      select the whole file (every selector kind except symbol)
+    - symbols: BTreeMap<usize, Effective> - constraints that apply only when that entity changes,
+      from symbol selectors
     - conflicts: Vec<Conflict> - conflicts found
 */
 pub(crate) struct Resolution {
     pub(crate) zones: Vec<ZoneResult>,
     pub(crate) entities: BTreeMap<usize, Effective>,
     pub(crate) files: BTreeMap<usize, Effective>,
+    pub(crate) whole: BTreeMap<usize, Effective>,
+    pub(crate) symbols: BTreeMap<usize, Effective>,
     pub(crate) conflicts: Vec<Conflict>,
 }
 
@@ -145,7 +153,7 @@ fn segments(name: &str) -> Vec<String> {
  * Output
     - (Vec<String>, BTreeSet<usize>, BTreeSet<usize>) matched target ids, entities, and files
 */
-fn select(
+pub(crate) fn select(
     inventory: &Inventory,
     selector: &Selector,
 ) -> (Vec<String>, BTreeSet<usize>, BTreeSet<usize>) {
@@ -166,13 +174,22 @@ fn select(
     };
     match selector.kind {
         SelectorKind::Symbol => {
+            // "FILE::Qualified.name" names a symbol in one file (either part may be a pattern);
+            // "language:id" names it by inventory id; otherwise it is a qualified name
+            let in_file = value.split_once("::");
             for (index, entity) in graph.entities.iter().enumerate() {
-                let subject = if value.contains(':') {
-                    entity.id.strip_prefix("symbol:").unwrap_or(&entity.id)
-                } else {
-                    Graph::symbol(snapshot, entity).qualified.as_str()
+                let found = match in_file {
+                    Some((file, name)) => {
+                        matches(file, &snapshot.files[entity.file].path)
+                            && matches(name, &Graph::symbol(snapshot, entity).qualified)
+                    }
+                    None if value.contains(':') => matches(
+                        value,
+                        entity.id.strip_prefix("symbol:").unwrap_or(&entity.id),
+                    ),
+                    None => matches(value, &Graph::symbol(snapshot, entity).qualified),
                 };
-                if matches(value, subject) {
+                if found {
                     targets.insert(entity.id.clone());
                     entities.insert(index);
                     files.insert(entity.file);
@@ -631,6 +648,8 @@ pub(crate) fn resolve(
     save_state(state_path, stored)?;
     let mut entities: BTreeMap<usize, Effective> = BTreeMap::new();
     let mut files: BTreeMap<usize, Effective> = BTreeMap::new();
+    let mut whole: BTreeMap<usize, Effective> = BTreeMap::new();
+    let mut symbols: BTreeMap<usize, Effective> = BTreeMap::new();
     for (index, result) in results.iter().enumerate() {
         let combine = |map: &mut BTreeMap<usize, Effective>, key: usize| {
             let entry = map.entry(key).or_insert(Effective {
@@ -650,12 +669,36 @@ pub(crate) fn resolve(
         for file in &result.files {
             combine(&mut files, *file);
         }
+        // Symbol selectors restrict only the symbols they name; every other kind the whole file
+        for selector in &result.selectors {
+            if selector.selector.kind == SelectorKind::Symbol {
+                for entity in &selector.entities {
+                    if !symbols
+                        .get(entity)
+                        .is_some_and(|known| known.zones.contains(&index))
+                    {
+                        combine(&mut symbols, *entity);
+                    }
+                }
+            } else {
+                for file in &selector.files {
+                    if !whole
+                        .get(file)
+                        .is_some_and(|known| known.zones.contains(&index))
+                    {
+                        combine(&mut whole, *file);
+                    }
+                }
+            }
+        }
     }
     let conflicts = conflicts(inventory, &results, &entities, &files);
     Ok(Resolution {
         zones: results,
         entities,
         files,
+        whole,
+        symbols,
         conflicts,
     })
 }

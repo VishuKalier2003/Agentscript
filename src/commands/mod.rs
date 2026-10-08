@@ -11,6 +11,7 @@ mod deliver;
 mod discover;
 mod flow;
 pub(crate) mod init;
+pub(crate) mod observe;
 mod parse;
 mod policy;
 mod protect;
@@ -72,6 +73,7 @@ pub(crate) fn run() -> Result<(), String> {
         "repo" => repo::run(&rest), // the repository connection: connect, status, inspect, disconnect
         "flow" => flow::run(&rest), // the golden path: one lifecycle from connection to completion
         "dashboard" => dashboard::run(&rest), // the semantic control plane and its API
+        "observe" => observe::run(&rest), // the read-only observability API
         "packs" => dashboard::packs_command(&rest), // Payments and Testing policy packs
         "agent" => agent::run(&rest), // agent adapters, hooks, and contract sessions
         _ => Err(format!("unknown command '{command}'. Run 'crane help'.")),
@@ -192,11 +194,13 @@ Commands:
   connect [--refresh] [--json]   (same as repo connect)
   dashboard [serve] [--addr HOST:PORT] [--once]
   dashboard api GET|POST PATH [--body JSON]
+  observe [PATH] | observe serve [--addr HOST:PORT] [--once]   (read-only observability API)
   packs [list] | packs show payments|testing [--json] | packs propose payments [--name NAME]
   zones [ZONE_ID] [--json]
   zones recommend [--by NAME] [--json] | zones recommendations [--json]
-  zones review ID [--claim] [--by NAME] [--json]
-  zones approve ID --approver NAME --confirm DIGEST_PREFIX | zones reject ID --approver NAME [--reason TEXT]
+  zones review ID|map [--claim] [--by NAME] [--json]
+  zones approve ID|map --approver NAME --confirm DIGEST_PREFIX | zones reject ID|map --approver NAME [--reason TEXT]
+  zones map [--file PATH] [--session ID] [--json]
   zones audit [--json]
   session run TASK_ID --agent claude|codex|generic [--actions FILE] [--approve] [--autonomy MODE] [--detach] [--json] [-- AGENT_COMMAND...]
   session finish SESSION_ID [--json] | session lifecycle SESSION_ID [--json]

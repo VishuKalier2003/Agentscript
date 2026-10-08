@@ -94,7 +94,7 @@ pub(crate) fn load(id: &str) -> Result<Option<Value>, String> {
     }
     match fs::read_to_string(directory()?.join(format!("{id}.json"))) {
         Ok(text) => serde_json::from_str(&text)
-            .map(Some)
+            .map(|event| Some(with_summary(event)))
             .map_err(|error| format!("completion event {id} is invalid: {error}")),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error(error)),
@@ -115,12 +115,95 @@ fn save(event: &Value) -> Result<(), String> {
         event["event_id"].as_str().unwrap_or_default()
     ));
     let temporary = path.with_extension(format!("tmp{}", std::process::id()));
+    // The event is written with its human summary first
     fs::write(
         &temporary,
-        serde_json::to_string_pretty(event).map_err(io_error)? + "\n",
+        crate::human::pretty(&with_summary(event.clone()))?,
     )
     .map_err(io_error)?;
     fs::rename(&temporary, &path).map_err(io_error)
+}
+
+/** Attach the human summary to a completion event (derived from its own fields, never used for
+ * decisions)
+ * Input
+    - event: Value - event
+ * Output
+    - Value
+*/
+pub(crate) fn with_summary(mut event: Value) -> Value {
+    event["summary"] = describe(&event);
+    event
+}
+
+/** Describe a completion event for people: where the task stands, what completing it does in the
+ * tracker, and the command that moves it on
+ * Input
+    - event: &Value - event
+ * Output
+    - Value
+*/
+pub(crate) fn describe(event: &Value) -> Value {
+    use crate::human;
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let task = text(&event["task_id"]);
+    let tracker = match event["tracker"].as_str() {
+        Some("jira") => "Jira",
+        Some("asana") => "Asana",
+        _ => "tracker",
+    };
+    let issue = format!("{tracker} issue {}", text(&event["external_id"]));
+    let when = |value: &Value| human::when_value(value).unwrap_or_default();
+    let error = event["last_error"].as_str();
+    let state = match event["status"].as_str().unwrap_or_default() {
+        "completed" => format!(
+            "Done: Crane closed the {issue} on {}",
+            when(&event["completed_at"])
+        ),
+        "completed_externally" => format!("Done: someone closed the {issue} in the tracker"),
+        "retry_pending" => format!(
+            "Waiting to retry at {}: the last attempt failed ({})",
+            when(&event["next_attempt_at"]),
+            error.unwrap_or("no error recorded")
+        ),
+        "sending" => format!("Being sent to the {issue} now"),
+        "queued" => "Waiting for the tracker's forwarder to send the prepared requests".into(),
+        _ if event["tracker"].is_null() => "Nothing to send: the task has no tracker issue".into(),
+        _ => format!("Ready to close the {issue}"),
+    };
+    let does = match event["tracker"].as_str() {
+        Some("jira") => format!(
+            "Comment on {} with the delivery evidence, then move it to Done",
+            text(&event["external_id"])
+        ),
+        Some("asana") => format!(
+            "Comment on {} with the delivery evidence, then mark it complete",
+            text(&event["external_id"])
+        ),
+        _ => "Nothing in a tracker".into(),
+    };
+    let done = lifecycle_state(event) == "COMPLETED";
+    let mut summary = json!({
+        "task": format!("{task} ({issue})"),
+        "state": state,
+        "needs_attention": event["needs_attention"].as_bool().unwrap_or(false).then(|| format!("A person must look at this: {}", error.unwrap_or("see the history"))),
+        "completing_it_does": does,
+        "merged": format!("merge commit {}{}", text(&event["merge_sha"]).chars().take(12).collect::<String>(), event["pull_request"].as_str().map_or(String::new(), |url| format!(" ({url})"))),
+        "attempts": event["attempts"],
+        "created_at": when(&event["created_at"]),
+        "review": format!("crane task completions show {}", text(&event["event_id"])),
+    });
+    if !done && event["status"] != "queued" && !event["tracker"].is_null() {
+        summary["send"] = json!(format!(
+            "crane task completions send --task {task}{}",
+            if event["status"] == "retry_pending" {
+                " --now"
+            } else {
+                ""
+            }
+        ));
+    }
+    summary
 }
 
 /** List every completion event, oldest first
@@ -788,6 +871,7 @@ pub(crate) fn summary(event: &Value) -> Value {
         "next_attempt_at": event["next_attempt_at"],
         "last_error": event["last_error"],
         "needs_attention": event["needs_attention"],
+        "summary": describe(event),
     })
 }
 

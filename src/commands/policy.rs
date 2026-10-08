@@ -95,7 +95,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 minimum,
             )?;
             if json {
-                println!("{}", pretty(&proposal.document)?);
+                println!("{}", pretty(&crate::proposals::store::with_summary(proposal.document.clone()))?);
             } else {
                 print!("{}", render(&proposal));
             }
@@ -112,6 +112,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                             "status": proposal.status(),
                             "revision": proposal.document["revision"],
                             "policy_digest": proposal.digest(),
+                            "summary": crate::proposals::store::summarize(&proposal.document),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -127,6 +128,11 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                         proposal.document["revision"],
                         proposal.digest()
                     );
+                    let summary = crate::proposals::store::summarize(&proposal.document);
+                    println!("    {}", summary["decision_needed"].as_str().unwrap_or_default());
+                    if let Some(approve) = summary["approve"].as_str() {
+                        println!("    next: {approve}");
+                    }
                 }
             }
             Ok(())
@@ -171,6 +177,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "approve" => {
             let mut proposal = Proposal::load(&name()?)?;
             let path = proposal.approve(option(args, "--approver"), option(args, "--confirm"))?;
+            crate::zones::view::refresh();
             println!(
                 "Approved proposal {} and activated {}; running agent sessions keep their bound contract and report the drift.",
                 proposal.name,
@@ -203,7 +210,34 @@ fn pretty(value: &serde_json::Value) -> Result<String, String> {
 */
 fn render(proposal: &Proposal) -> String {
     let document = &proposal.document;
+    let summary = crate::proposals::store::summarize(document);
+    let field = |key: &str| summary[key].as_str().unwrap_or_default().to_string();
     let mut out = format!(
+        "Policy proposal \"{}\": {}\n\n{:<19}{}\n{:<19}{}\n{:<19}{}\n{:<19}{}\n{:<19}{}\n{:<19}by {} on {}\n\nDetails\n",
+        proposal.name,
+        field("status"),
+        "Decision needed",
+        field("decision_needed"),
+        "Keeps",
+        field("protects"),
+        "Agents may change",
+        {
+            let list = crate::human::strings(&summary["agents_may_change"]);
+            if list.is_empty() {
+                "nothing named".to_string()
+            } else {
+                crate::human::list(&list)
+            }
+        },
+        "If approved",
+        field("if_approved"),
+        "Came from",
+        field("origin"),
+        "Proposed",
+        summary["proposed_by"].as_str().unwrap_or("unknown"),
+        field("proposed_at")
+    );
+    out.push_str(&format!(
         "Proposal {} ({}, revision {}){}\nPolicy digest: {}\n",
         proposal.name,
         proposal.status(),
@@ -214,7 +248,7 @@ fn render(proposal: &Proposal) -> String {
             " - not active"
         },
         proposal.digest()
-    );
+    ));
     if let Some(marker) = document["source"]["generated_in_agent_environment"].as_str() {
         out.push_str(&format!(
             "Generated in an agent environment ({marker}); review it with extra care.\n"
@@ -267,12 +301,12 @@ fn render(proposal: &Proposal) -> String {
             entry["actor"].as_str().unwrap_or_default()
         ));
     }
-    if proposal.status() == "pending" {
-        let digest = proposal.digest().trim_start_matches("sha256:");
+    if summary["approve"].is_string() {
         out.push_str(&format!(
-            "To activate after review (a human or trusted process): crane policy approve {} --approver NAME --confirm {}\n",
-            proposal.name,
-            &digest[..digest.len().min(12)]
+            "\nNext step, for a human or trusted process (replace YOUR_NAME):\n  approve:  {}\n  reject:   {}\n  edit:     {}\n",
+            field("approve"),
+            field("reject"),
+            field("edit")
         ));
     }
     out

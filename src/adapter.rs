@@ -868,6 +868,11 @@ fn claude_action(payload: &Value) -> AgentAction {
         digest: sha256(input.to_string().as_bytes()),
     };
     match (tool.as_str(), path) {
+        // A file read keeps its path, so the journal can say what was read (observability)
+        ("Read" | "NotebookRead", Some(path)) => {
+            action.operation = Operation::Read;
+            action.arguments = vec![path];
+        }
         (
             "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch"
             | "TodoWrite" | "Task" | "Agent",

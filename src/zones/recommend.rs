@@ -545,7 +545,15 @@ pub(crate) fn recommend(
                 "category": draft.id,
                 "selectors": draft.selectors,
                 "selector_status": result.selectors.iter().map(|selector| json!({"selector": selector.selector.text(), "status": selector.status})).collect::<Vec<_>>(),
-                "affected": {"files": files, "entities": entities.len(), "entity_examples": entities.iter().take(8).collect::<Vec<_>>()},
+                "affected": {
+                    "files": files,
+                    "entities": entities.len(),
+                    "entity_examples": entities.iter().take(8).collect::<Vec<_>>(),
+                    "entity_names": result.entities.iter().take(8).map(|entity| {
+                        let entry = &graph.entities[*entity];
+                        crate::inventory::graph::Graph::symbol(snapshot, entry).qualified.clone()
+                    }).collect::<Vec<_>>(),
+                },
                 "criticality": draft.criticality.name(),
                 "autonomy": draft.autonomy.name(),
                 "safety_state": SafetyState::Active.name(),

@@ -1,6 +1,8 @@
-// The dashboard's local web server: GET / serves the single-page dashboard, and /api/* answers
-// through the same route the CLI uses. API requests need the token printed at start (the page
-// itself carries no data), one request is served at a time, and only on the given address.
+// The local web server of the dashboard and of the read-only observability API: GET / serves the
+// single-page dashboard (when the site has one), and /api/* answers through the same route the CLI
+// uses. API requests need the site's token printed at start (the page itself carries no data), one
+// request is served at a time, and only on the given address. A read-only site refuses every
+// method but GET before reading anything else of the request.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -35,6 +37,59 @@ fn same(left: &str, right: &str) -> bool {
             == 0
 }
 
+/** One API request as the router sees it
+ * Fields
+    - method: &'a str - HTTP method
+    - target: &'a str - path and query
+    - body: &'a Value - JSON body (empty on a read-only site)
+    - credential: &'a str - the X-Crane-Token presented
+    - operator: bool - whether the credential is the site's own token
+*/
+pub(crate) struct Request<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) body: &'a Value,
+    pub(crate) credential: &'a str,
+    pub(crate) operator: bool,
+}
+
+/** A site the server can serve
+ * Fields
+    - name: &'static str - name printed at start
+    - token_variable: &'static str - environment variable that may set the API token
+    - page: Option<&'static str> - the page served at /, None for an API-only site
+    - router: fn(&Request) -> (u16, Value) - answers a request
+    - read_only: bool - refuse every method but GET, and any request body
+    - routes: &'static [&'static str] - path prefixes that also serve the page, so deep links such
+      as /runs/ID open it (the page routes them itself)
+    - viewers: bool - credentials other than the site's token reach the router, which authorizes
+      them itself (scoped read access); otherwise only the site's token is accepted
+*/
+pub(crate) struct Site {
+    pub(crate) name: &'static str,
+    pub(crate) token_variable: &'static str,
+    pub(crate) page: Option<&'static str>,
+    pub(crate) router: fn(&Request) -> (u16, Value),
+    pub(crate) read_only: bool,
+    pub(crate) routes: &'static [&'static str],
+    pub(crate) viewers: bool,
+}
+
+/** Route a dashboard request (the control plane's router ignores the query string; the server
+ * has already required the site's own token)
+ * Input
+    - request: &Request - the request
+ * Output
+    - (u16, Value)
+*/
+fn dashboard_route(request: &Request) -> (u16, Value) {
+    route(
+        request.method,
+        request.target.split('?').next().unwrap_or_default(),
+        request.body,
+    )
+}
+
 /** Serve the dashboard until stopped (or for one request)
  * Input
     - address: &str - address to bind
@@ -43,8 +98,33 @@ fn same(left: &str, right: &str) -> bool {
     - Result<(), String>
 */
 pub(crate) fn serve(address: &str, once: bool) -> Result<(), String> {
-    require_human("serve the dashboard")?;
-    let token = std::env::var("CRANE_DASHBOARD_TOKEN")
+    run(
+        &Site {
+            name: "Crane dashboard",
+            token_variable: "CRANE_DASHBOARD_TOKEN",
+            page: Some(PAGE),
+            router: dashboard_route,
+            read_only: false,
+            routes: &[],
+            viewers: false,
+        },
+        address,
+        once,
+    )
+}
+
+/** Serve a site until stopped (or for one request): human-only, with the site's token from its
+ * environment variable (at least 16 characters) or a random one
+ * Input
+    - site: &Site - what to serve
+    - address: &str - address to bind
+    - once: bool - stop after one request
+ * Output
+    - Result<(), String>
+*/
+pub(crate) fn run(site: &Site, address: &str, once: bool) -> Result<(), String> {
+    require_human(&format!("serve the {}", site.name))?;
+    let token = std::env::var(site.token_variable)
         .ok()
         .filter(|token| token.len() >= 16)
         .unwrap_or_else(|| {
@@ -65,13 +145,13 @@ pub(crate) fn serve(address: &str, once: bool) -> Result<(), String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("cannot listen on {address}: {error}"))?;
     let bound = listener.local_addr().map_err(|error| error.to_string())?;
-    println!("Crane dashboard: http://{bound}/?token={token}");
+    println!("{}: http://{bound}/?token={token}", site.name);
     std::io::stdout().flush().ok();
     for stream in listener.incoming() {
         let Ok(stream) = stream else {
             continue;
         };
-        handle(stream, &token);
+        handle(stream, &token, site);
         if once {
             break;
         }
@@ -83,12 +163,13 @@ pub(crate) fn serve(address: &str, once: bool) -> Result<(), String> {
  * Input
     - stream: TcpStream - connection
     - token: &str - API token
+    - site: &Site - what is served
  * Output
     - None
 */
-fn handle(mut stream: TcpStream, token: &str) {
+fn handle(mut stream: TcpStream, token: &str, site: &Site) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let (status, content_type, body) = match read(&mut stream, token) {
+    let (status, content_type, body) = match read(&mut stream, token, site) {
         Ok(answer) => answer,
         Err((status, message)) => (
             status,
@@ -102,9 +183,11 @@ fn handle(mut stream: TcpStream, token: &str) {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
+        500 => "Internal Server Error",
         _ => "Bad Request",
     };
     let _ = write!(
@@ -118,10 +201,15 @@ fn handle(mut stream: TcpStream, token: &str) {
  * Input
     - stream: &mut TcpStream - connection
     - token: &str - API token
+    - site: &Site - what is served
  * Output
     - Result<(u16, &'static str, String), (u16, String)> status, content type, and body
 */
-fn read(stream: &mut TcpStream, token: &str) -> Result<(u16, &'static str, String), (u16, String)> {
+fn read(
+    stream: &mut TcpStream,
+    token: &str,
+    site: &Site,
+) -> Result<(u16, &'static str, String), (u16, String)> {
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -135,6 +223,13 @@ fn read(stream: &mut TcpStream, token: &str) -> Result<(u16, &'static str, Strin
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
     let path = target.split('?').next().unwrap_or_default().to_string();
+    if site.read_only && method != "GET" {
+        return Err((
+            405,
+            "this API is read-only; changes are made with the Crane CLI and its control-plane API"
+                .into(),
+        ));
+    }
     let mut headers = HashMap::new();
     loop {
         let mut header = String::new();
@@ -152,16 +247,24 @@ fn read(stream: &mut TcpStream, token: &str) -> Result<(u16, &'static str, Strin
             return Err((400, "too many headers".into()));
         }
     }
-    if method == "GET" && (path == "/" || path == "/index.html") {
-        return Ok((200, "text/html", PAGE.to_string()));
+    let deep_link = site.routes.iter().any(|route| {
+        path == *route
+            || path
+                .strip_prefix(route)
+                .is_some_and(|rest| rest.starts_with('/') && !rest.contains(".."))
+    });
+    if let Some(page) = site
+        .page
+        .filter(|_| method == "GET" && (path == "/" || path == "/index.html" || deep_link))
+    {
+        return Ok((200, "text/html", page.to_string()));
     }
     if !path.starts_with("/api/") {
         return Err((404, "use / for the dashboard and /api/ for its API".into()));
     }
-    if !headers
-        .get("x-crane-token")
-        .is_some_and(|given| same(given, token))
-    {
+    let credential = headers.get("x-crane-token").cloned().unwrap_or_default();
+    let operator = same(&credential, token);
+    if !operator && !(site.viewers && !credential.is_empty()) {
         return Err((
             401,
             "missing or wrong X-Crane-Token (it is printed when the dashboard starts)".into(),
@@ -174,6 +277,9 @@ fn read(stream: &mut TcpStream, token: &str) -> Result<(u16, &'static str, Strin
     if length > MAX_BODY {
         return Err((413, "request body is larger than 1 MB".into()));
     }
+    if site.read_only && length > 0 {
+        return Err((400, "a read-only request takes no body".into()));
+    }
     let mut body = vec![0; length];
     reader
         .read_exact(&mut body)
@@ -183,6 +289,12 @@ fn read(stream: &mut TcpStream, token: &str) -> Result<(u16, &'static str, Strin
     } else {
         serde_json::from_slice(&body).map_err(|error| (400, format!("invalid JSON: {error}")))?
     };
-    let (status, answer) = route(&method, &path, &value);
+    let (status, answer) = (site.router)(&Request {
+        method: &method,
+        target: &target,
+        body: &value,
+        credential: &credential,
+        operator,
+    });
     Ok((status, "application/json", answer.to_string()))
 }

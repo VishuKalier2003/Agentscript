@@ -7,6 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+/** Environment variables that mark an agent environment */
+const AGENT_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "CRANE_AGENT",
+];
+
 /** Counter that keeps fixture directory names unique when tests run in parallel */
 static REPOSITORIES: AtomicUsize = AtomicUsize::new(0);
 
@@ -60,6 +69,19 @@ impl Repository {
         - Repository
     */
     fn new(zones: &str) -> Self {
+        Self::create(FILES, Some(zones), Some(POLICY))
+    }
+
+    /** Create a fixture repository with a unique root commit, Crane initialized, and a baseline
+     * checkpoint
+     * Input
+        - files: &[(&str, &str)] - repository files
+        - zones: Option<&str> - content of .crane/zones/org.zone, if any
+        - policy: Option<&str> - content of .crane/policies/payments.crane, if any
+     * Output
+        - Repository
+    */
+    fn create(files: &[(&str, &str)], zones: Option<&str>, policy: Option<&str>) -> Self {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
@@ -70,7 +92,7 @@ impl Repository {
         ));
         fs::create_dir_all(&root).unwrap();
         let repository = Self { root };
-        for (path, content) in FILES {
+        for (path, content) in files {
             repository.write(path, content);
         }
         repository.git(&["init", "-q"]);
@@ -78,14 +100,18 @@ impl Repository {
         repository.git(&["config", "user.name", "Crane Zones Test"]);
         repository.git(&["config", "core.autocrlf", "false"]);
         repository.git(&["add", "."]);
-        repository.git(&["commit", "-qm", "baseline"]);
+        repository.git(&["commit", "-qm", &format!("baseline {suffix}")]);
         assert!(repository.crane(&["init"], "").status.success());
         assert!(repository
             .crane(&["checkpoint", "--name", "baseline"], "")
             .status
             .success());
-        repository.write(".crane/policies/payments.crane", POLICY);
-        repository.write(".crane/zones/org.zone", zones);
+        if let Some(policy) = policy {
+            repository.write(".crane/policies/payments.crane", policy);
+        }
+        if let Some(zones) = zones {
+            repository.write(".crane/zones/org.zone", zones);
+        }
         repository
     }
 
@@ -139,14 +165,18 @@ impl Repository {
         - Output of the finished process
     */
     fn crane(&self, args: &[&str], stdin: &str) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_crane"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_crane"));
+        command
             .args(args)
             .current_dir(&self.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("crane should execute");
+            .stderr(Stdio::piped());
+        // The test acts as a human unless an agent marker is set on purpose
+        for marker in AGENT_MARKERS {
+            command.env_remove(marker);
+        }
+        let mut child = command.spawn().expect("crane should execute");
         child
             .stdin
             .take()
@@ -643,4 +673,325 @@ fn zones_never_grant_and_are_protected() {
     let empty = repository.crane(&["zones"], "");
     assert!(empty.status.success());
     assert!(String::from_utf8_lossy(&empty.stdout).contains("No zones defined"));
+}
+
+/** Python payment service: charge is critical, the rest of the class ordinary */
+const PY_SERVICE: &str = "class PaymentService:\n    def charge(self, amount):\n        return amount + self.fee(amount)\n\n    def fee(self, amount):\n        return amount // 10\n\n    def refund(self, amount):\n        return -amount\n";
+
+/** Files of the zone map fixture */
+const MAP_FILES: &[(&str, &str)] = &[
+    ("README.md", "# Shop\n"),
+    ("payments/service.py", PY_SERVICE),
+    (
+        "payments/models.py",
+        "class Ledger:\n    def post(self, entry):\n        return entry\n",
+    ),
+    (
+        "catalog/labels.py",
+        "def label(name):\n    return name.strip()\n",
+    ),
+];
+
+/** A zone map exercising every target form: a folder, a file, a symbol, a class glob, a line a
+ * stricter rule fully shadows, and a target that matches nothing */
+const MAP: &str = "# Payments\npayments/** routine autonomous   # the whole service\npayments/service.py::PaymentService.charge critical assisted   # money moves here\npayments/service.py::PaymentService.* sensitive delegated\npayments/models.py critical assisted\npayments/models.py::Ledger.post sensitive delegated\npayments/missing.py::Gone.away critical assisted\n";
+
+impl Repository {
+    /** Run a Claude Code pre-tool-use hook for an Edit
+     * Input
+        - path: &str - file to edit
+        - old: &str - text replaced
+        - new: &str - replacement
+     * Output
+        - &'static str "OK", "ASK", or "DENY", as the adapter answered
+    */
+    fn edit_decision(&self, path: &str, old: &str, new: &str) -> &'static str {
+        let event = json!({
+            "session_id": "map-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": path, "old_string": old, "new_string": new},
+        });
+        let output = self.crane(
+            &[
+                "agent",
+                "hook",
+                "--event",
+                "pre-tool-use",
+                "--profile",
+                "claude",
+            ],
+            &event.to_string(),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        match output.status.code() {
+            Some(2) => "DENY",
+            Some(0) if stdout.contains("\"ask\"") => "ASK",
+            Some(0) if stdout.trim().is_empty() => "OK",
+            other => panic!(
+                "unexpected hook result {other:?}: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    /** Run crane with --json, require success, and parse the output
+     * Input
+        - args: &[&str] - crane arguments
+     * Output
+        - Value
+    */
+    fn json(&self, args: &[&str]) -> Value {
+        let mut full = args.to_vec();
+        full.push("--json");
+        let output = self.crane(&full, "");
+        assert!(
+            output.status.success(),
+            "crane {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+}
+
+/** Find the view row of one symbol (None for the rest-of-file row)
+ * Input
+    - view: &'a Value - zones map JSON
+    - path: &str - file
+    - symbol: Option<&str> - qualified name
+ * Output
+    - &'a Value row
+*/
+fn row<'a>(view: &'a Value, path: &str, symbol: Option<&str>) -> &'a Value {
+    let file = find(&view["files"], "path", path);
+    file["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["symbol"].as_str() == symbol)
+        .unwrap_or_else(|| panic!("no row {symbol:?} in {file}"))
+}
+
+/** The compact zone map: parse errors carry line numbers; folder, file, symbol, and class-glob
+ * targets compile into ordinary zones once a human approves; overlaps resolve to the most
+ * restrictive values, fully shadowed and unresolved lines are reported, an unresolved target
+ * degrades its zone, reformatting changes no version; an agent edit to a critical symbol needs
+ * approval while its neighbours and other files stay open; the map itself is protected; and the
+ * generated agent view predicts exactly what the authority engine decides */
+#[test]
+fn zone_map_governs_symbols() {
+    let repository = Repository::create(MAP_FILES, None, None);
+    repository.write(
+        ".crane/zones.map",
+        "payments/** routine\ncatalog/ routine observe\npayments/service.py::Charge.x red assisted\n",
+    );
+    let invalid = repository.crane(&["zones", "review", "map"], "");
+    assert!(!invalid.status.success());
+    let errors = String::from_utf8_lossy(&invalid.stderr).to_string();
+    for expected in [
+        "zones.map: line 1: expected '<target> <criticality> <autonomy>",
+        "zones.map: line 2: target 'catalog/' names a folder",
+        "zones.map: line 3: invalid criticality 'red'",
+    ] {
+        assert!(errors.contains(expected), "{expected} missing:\n{errors}");
+    }
+
+    // Nothing governs until a human approves the reviewed map
+    repository.write(".crane/zones.map", MAP);
+    let reviewed = repository.json(&["zones", "review", "map"]);
+    assert_eq!(reviewed["state"], "not approved");
+    assert_eq!(
+        reviewed["zones"],
+        json!([
+            "map_routine_autonomous",
+            "map_sensitive_delegated",
+            "map_critical_assisted"
+        ])
+    );
+    assert_eq!(
+        reviewed["shadowed"].as_array().unwrap().len(),
+        1,
+        "{reviewed}"
+    );
+    assert_eq!(reviewed["shadowed"][0]["line"], 6);
+    assert_eq!(reviewed["shadowed"][0]["by"], json!([5]));
+    assert_eq!(reviewed["unresolved"][0]["line"], 7);
+    assert!(repository.zones()["zones"].as_array().unwrap().is_empty());
+    let digest = reviewed["digest"].as_str().unwrap().to_string();
+    let refused = repository.crane(
+        &[
+            "zones",
+            "approve",
+            "map",
+            "--approver",
+            "lead",
+            "--confirm",
+            "0123456789ab",
+        ],
+        "",
+    );
+    assert!(!refused.status.success());
+    let approved = repository.json(&[
+        "zones",
+        "approve",
+        "map",
+        "--approver",
+        "lead",
+        "--confirm",
+        &digest[7..19],
+    ]);
+    assert_eq!(approved["status"], "approved");
+    assert!(repository
+        .read(".crane/zones/zones-map.zone")
+        .starts_with("# Generated by 'crane zones approve map'"));
+
+    let zones = repository.zones();
+    assert_eq!(zones["map"]["state"], "active");
+    let critical = find(&zones["zones"], "zone_id", "map_critical_assisted");
+    assert_eq!(critical["effective_safety_state"], "degraded");
+    assert_eq!(
+        selector(
+            &zones,
+            "map_critical_assisted",
+            "symbol payments/missing.py::Gone.away"
+        )["status"],
+        "unresolved"
+    );
+    assert_eq!(
+        selector(
+            &zones,
+            "map_critical_assisted",
+            "symbol payments/service.py::PaymentService.charge"
+        )["targets"],
+        json!(["symbol:python:payments.service.PaymentService.charge"])
+    );
+    assert_eq!(
+        selector(
+            &zones,
+            "map_sensitive_delegated",
+            "symbol payments/service.py::PaymentService.*"
+        )["targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    // Overlapping zones combine to the most restrictive values
+    assert_eq!(
+        find(
+            &zones["entities"],
+            "id",
+            "symbol:python:payments.service.PaymentService.charge"
+        )["criticality"],
+        "critical"
+    );
+    let text = String::from_utf8_lossy(&repository.crane(&["zones"], "").stdout).to_string();
+    assert!(
+        text.contains("line 6 (payments/models.py::Ledger.post sensitive delegated) is fully shadowed by line 5 (payments/models.py critical assisted)"),
+        "{text}"
+    );
+
+    // Reordering, spacing, and notes change neither the digest nor the zone set version
+    let version = zones["zone_set_version"].clone();
+    repository.write(
+        ".crane/zones.map",
+        "payments/missing.py::Gone.away   critical assisted\n\n# reformatted\npayments/models.py::Ledger.post sensitive delegated # still shadowed\npayments/models.py critical   assisted\npayments/service.py::PaymentService.*  sensitive delegated\npayments/service.py::PaymentService.charge critical assisted\npayments/** routine autonomous\n",
+    );
+    let again = repository.zones();
+    assert_eq!(again["map"]["state"], "active");
+    assert_eq!(again["map"]["digest"], digest.as_str());
+    assert_eq!(again["zone_set_version"], version);
+
+    // The generated view for new sessions, and the authority's decisions for the same edits
+    let view = repository.json(&["zones", "map"]);
+    assert_eq!(view["advisory"], true);
+    let expected = [
+        ("payments/service.py", Some("PaymentService.charge"), "ASK"),
+        ("payments/service.py", Some("PaymentService.fee"), "OK"),
+        ("payments/service.py", None, "OK"),
+        ("payments/models.py", Some("Ledger.post"), "ASK"),
+    ];
+    for (path, symbol, decision) in expected {
+        assert_eq!(
+            row(&view, path, symbol)["decision"],
+            decision,
+            "{path} {symbol:?}"
+        );
+    }
+    assert_eq!(
+        row(&view, "payments/service.py", Some("PaymentService.charge"))["criticality"],
+        "critical"
+    );
+    let labels = repository.json(&["zones", "map", "--file", "catalog/labels.py"]);
+    assert_eq!(
+        row(&labels, "catalog/labels.py", Some("label"))["decision"],
+        "OK"
+    );
+    let written = repository.read(".crane/runtime/zones.agent.md");
+    assert!(
+        written.contains("| PaymentService.charge | critical | assisted | ASK |"),
+        "{written}"
+    );
+
+    let start = repository.crane(
+        &[
+            "agent",
+            "hook",
+            "--event",
+            "session-start",
+            "--profile",
+            "claude",
+        ],
+        &json!({"session_id": "map-1", "hook_event_name": "SessionStart", "source": "startup"})
+            .to_string(),
+    );
+    let context = String::from_utf8_lossy(&start.stdout).to_string();
+    assert!(
+        context.contains("- payments/service.py: OK (routine/delegated); PaymentService.charge: ASK (critical/assisted)"),
+        "{context}"
+    );
+
+    assert_eq!(
+        repository.edit_decision(
+            "payments/service.py",
+            "return amount + self.fee(amount)",
+            "return amount"
+        ),
+        "ASK"
+    );
+    assert_eq!(
+        repository.edit_decision(
+            "payments/service.py",
+            "return amount // 10",
+            "return amount // 20"
+        ),
+        "OK"
+    );
+    assert_eq!(
+        repository.edit_decision("payments/models.py", "return entry", "return [entry]"),
+        "ASK"
+    );
+    assert_eq!(
+        repository.edit_decision("catalog/labels.py", "return name.strip()", "return name"),
+        "OK"
+    );
+    let write = json!({
+        "session_id": "map-1",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "tool_input": {"file_path": ".crane/zones.map", "content": "payments/** routine autonomous\n"},
+    });
+    let guarded = repository.crane(
+        &[
+            "agent",
+            "hook",
+            "--event",
+            "pre-tool-use",
+            "--profile",
+            "claude",
+        ],
+        &write.to_string(),
+    );
+    assert_eq!(guarded.status.code(), Some(2));
+    assert!(repository.read(".crane/zones.map").contains("Gone.away"));
 }

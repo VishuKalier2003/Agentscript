@@ -147,6 +147,8 @@ pub(crate) fn baseline(session: &ContractSession) -> Result<(), String> {
     - autonomy: Autonomy - the session's current autonomy mode
     - path: &str - repository-relative path
     - exists: bool - whether the file exists now
+    - changed: Option<&BTreeSet<String>> - qualified names of the symbols that changed in it, None
+      when unknown (then every zone touching the file applies)
  * Output
     - (Autonomy, Vec<String>) the level and why it is restricted
 */
@@ -155,11 +157,12 @@ fn required_level(
     autonomy: Autonomy,
     path: &str,
     exists: bool,
+    changed: Option<&BTreeSet<String>>,
 ) -> (Autonomy, Vec<String>) {
     let governance = session.governance();
     let mut level = autonomy;
     let mut reasons = Vec::new();
-    if let Some(constraint) = governance.constraint(path) {
+    if let Some((constraint, _)) = governance.constraint_for(path, changed) {
         let cap = constraint.autonomy.min(constraint.state.autonomy_cap());
         if cap <= Autonomy::Assisted {
             reasons.push(format!(
@@ -326,6 +329,32 @@ fn keyed(symbols: Vec<Symbol>) -> BTreeMap<String, (String, String)> {
     - Vec<Value> one entry per changed symbol: {symbol, kind, change}
 */
 fn symbol_changes(root: &Path, before: &Files, difference: &Difference) -> Vec<Value> {
+    let mut changes = every_symbol_change(root, before, difference);
+    // A type changes whenever one of its members does; report the innermost symbols only
+    let names = changes
+        .iter()
+        .filter_map(|change| change["symbol"].as_str().map(String::from))
+        .collect::<Vec<_>>();
+    changes.retain(|change| {
+        let symbol = change["symbol"].as_str().unwrap_or_default();
+        change["change"] != "modified"
+            || !names
+                .iter()
+                .any(|other| other.starts_with(&format!("{symbol}.")))
+    });
+    changes
+}
+
+/** List every symbol-level change of a difference, enclosing types included (see
+ * symbol_changes)
+ * Input
+    - root: &Path - worktree root
+    - before: &Files - earlier observation
+    - difference: &Difference - file-level changes
+ * Output
+    - Vec<Value> one entry per changed symbol: {symbol, kind, change}
+*/
+fn every_symbol_change(root: &Path, before: &Files, difference: &Difference) -> Vec<Value> {
     let mut changes = Vec::new();
     let mut push = |path: &str, key: &str, kind: &str, change: &str| {
         changes.push(json!({"symbol": format!("{path}#{key}"), "kind": kind, "change": change}));
@@ -361,19 +390,49 @@ fn symbol_changes(root: &Path, before: &Files, difference: &Difference) -> Vec<V
             changes.push(json!({"symbol": format!("{new}#{key}"), "kind": kind, "change": "moved", "from": format!("{old}#{key}")}));
         }
     }
-    // A type changes whenever one of its members does; report the innermost symbols only
-    let names = changes
-        .iter()
-        .filter_map(|change| change["symbol"].as_str().map(String::from))
-        .collect::<Vec<_>>();
-    changes.retain(|change| {
-        let symbol = change["symbol"].as_str().unwrap_or_default();
-        change["change"] != "modified"
-            || !names
-                .iter()
-                .any(|other| other.starts_with(&format!("{symbol}.")))
-    });
     changes
+}
+
+/** Group the changed symbols of a difference by path, as qualified names (occurrence suffixes
+ * removed); a path in a language without symbols, or a renamed path, is left out, so its changes
+ * count as unknown
+ * Input
+    - root: &Path - worktree root
+    - before: &Files - earlier observation
+    - difference: &Difference - file-level changes
+ * Output
+    - BTreeMap<String, BTreeSet<String>> path to changed qualified names
+*/
+fn changed_symbols(
+    root: &Path,
+    before: &Files,
+    difference: &Difference,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut changed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Renamed paths are left out: a move counts as unknown, so every zone of the file applies
+    for path in difference
+        .added
+        .iter()
+        .chain(&difference.modified)
+        .chain(&difference.deleted)
+    {
+        if language_of(path).is_some() {
+            changed.entry(path.clone()).or_default();
+        }
+    }
+    for change in every_symbol_change(root, before, difference) {
+        let Some((path, key)) = change["symbol"]
+            .as_str()
+            .and_then(|symbol| symbol.split_once('#'))
+        else {
+            continue;
+        };
+        let name = key.split_once('~').map_or(key, |(name, _)| name);
+        if let Some(names) = changed.get_mut(path) {
+            names.insert(name.to_string());
+        }
+    }
+    changed
 }
 
 /** Describe an effect and judge it against the session's authority: the zones it touched, and
@@ -398,12 +457,19 @@ fn describe(
     let governance = session.governance();
     let mut zones = BTreeSet::new();
     let mut violations = Vec::new();
+    let symbols = changed_symbols(root, before, difference);
     for path in difference.touched() {
         if let Some(constraint) = governance.constraint(&path) {
             zones.extend(constraint.zones.iter().cloned());
         }
         let exists = root.join(&path).exists();
-        let (level, reasons) = required_level(session, activity.state.autonomy, &path, exists);
+        let (level, reasons) = required_level(
+            session,
+            activity.state.autonomy,
+            &path,
+            exists,
+            symbols.get(&path),
+        );
         if level <= Autonomy::Assisted
             && (level == Autonomy::Observe || !authorized.contains(&path))
         {

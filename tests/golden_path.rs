@@ -472,6 +472,31 @@ fn one_task_from_connection_to_completion() {
                 .as_str()
                 .unwrap()
                 .to_string();
+            // People read the summary first and get the command to run
+            let record = repository.read(&format!(".crane/zone-proposals/{id}.json"));
+            assert!(
+                record.starts_with(
+                    "{
+  \"summary\": {"
+                ),
+                "{record}"
+            );
+            let approve = format!(
+                "crane zones approve {id} --approver YOUR_NAME --confirm {}",
+                &digest[7..19]
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&record).unwrap()["summary"]["approve"],
+                approve
+            );
+            let readable = repository.crane(&["zones", "review", id]);
+            assert!(
+                readable.contains("Decision needed") && readable.contains(&approve),
+                "{readable}"
+            );
+            assert!(repository
+                .crane(&["zones", "recommendations"])
+                .contains(&approve));
             repository.crane(&[
                 "zones",
                 "approve",
@@ -505,6 +530,20 @@ fn one_task_from_connection_to_completion() {
         .as_str()
         .unwrap()
         .to_string();
+    let readable = repository.crane(&["policy", "show", "payments_core"]);
+    assert!(
+        readable.contains(&format!(
+            "crane policy approve payments_core --approver YOUR_NAME --confirm {}",
+            &digest[7..19]
+        )),
+        "{readable}"
+    );
+    assert!(repository
+        .read(".crane/proposals/payments_core.json")
+        .starts_with(
+            "{
+  \"summary\": {"
+        ));
     repository.crane(&[
         "policy",
         "approve",
@@ -538,6 +577,20 @@ fn one_task_from_connection_to_completion() {
         .as_str()
         .unwrap()
         .to_string();
+    let readable = repository.crane(&["task", "contract", "show", "PAY-1830"]);
+    assert!(
+        readable.contains(&format!(
+            "crane task contract approve PAY-1830 --approver YOUR_NAME --confirm {}",
+            &contract[7..19]
+        )),
+        "{readable}"
+    );
+    assert!(repository
+        .read(".crane/task-contracts/PAY-1830/v1.json")
+        .starts_with(
+            "{
+  \"summary\": {"
+        ));
     repository.crane(&[
         "task",
         "approve",
@@ -786,6 +839,18 @@ fn one_task_from_connection_to_completion() {
         task["task_completion"]["event_id"].as_str().unwrap()
     ));
     let original = fs::read_to_string(&event_path).unwrap();
+    assert!(
+        original.starts_with(
+            "{
+  \"summary\": {"
+        ),
+        "{original}"
+    );
+    let summary = &serde_json::from_str::<Value>(&original).unwrap()["summary"];
+    assert!(
+        summary["state"].as_str().unwrap().starts_with("Done:"),
+        "{summary}"
+    );
     let mut tampered: Value = serde_json::from_str(&original).unwrap();
     tampered["merge_sha"] = json!(repository.git(&["rev-parse", "main~1"]));
     fs::write(&event_path, tampered.to_string()).unwrap();

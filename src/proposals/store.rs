@@ -212,6 +212,7 @@ impl Proposal {
                 _ => io_error(error),
             })?;
         let document: Value = serde_json::from_str(&content)
+            .map(with_summary)
             .map_err(|error| format!("proposal {name} is invalid: {error}"))?;
         if document["proposal_format"].as_u64() != Some(PROPOSAL_FORMAT) {
             return Err(format!("proposal {name} has an unsupported format"));
@@ -283,7 +284,8 @@ impl Proposal {
         if let Some(policy) = policy {
             write(Self::candidate_file(&self.name)?, policy)?;
         }
-        let text = serde_json::to_string_pretty(&self.document).map_err(io_error)? + "\n";
+        // The record is written with its human summary first
+        let text = crate::human::pretty(&with_summary(self.document.clone()))?;
         write(Self::record(&self.name)?, &text)
     }
 
@@ -680,5 +682,214 @@ impl Proposal {
         self.log("approved", &approver, json!({}));
         self.save(None)?;
         Ok(target)
+    }
+}
+
+/** Attach the human summary to a proposal record (derived from its own fields, never used for
+ * decisions)
+ * Input
+    - document: Value - proposal record
+ * Output
+    - Value
+*/
+pub(crate) fn with_summary(mut document: Value) -> Value {
+    document["summary"] = summarize(&document);
+    document
+}
+
+/** Summarize a proposal for people: the decision it needs, what the policy protects, what
+ * approving it does, where it came from, and the commands that act on it
+ * Input
+    - document: &Value - proposal record
+ * Output
+    - Value
+*/
+pub(crate) fn summarize(document: &Value) -> Value {
+    use crate::human;
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+    let name = text(&document["proposal_id"]);
+    let candidates = document["candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    // The rules of the policy text, read as words: preserve keeps code unchanged, target lets
+    // agents change it
+    let rules = |keyword: &str| {
+        document["policy"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.trim().trim_end_matches(';').split_whitespace();
+                (words.next() == Some(keyword)).then(|| {
+                    let rest = words.collect::<Vec<_>>();
+                    let kind = rest
+                        .iter()
+                        .find_map(|word| word.strip_prefix("--"))
+                        .unwrap_or("code");
+                    let target = rest
+                        .iter()
+                        .skip_while(|word| !word.starts_with("--"))
+                        .nth(1)
+                        .unwrap_or(&"");
+                    format!("{target} ({kind})")
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let kept = rules("preserve");
+    let changeable = rules("target");
+    let protected = candidates
+        .iter()
+        .filter(|candidate| candidate["included"] == true)
+        .map(|candidate| human::symbol(candidate["candidate"].as_str().unwrap_or_default()))
+        .collect::<Vec<_>>();
+    let shown = protected.iter().take(6).cloned().collect::<Vec<_>>();
+    let protects = if !kept.is_empty() {
+        format!("{} unchanged", human::list(&kept))
+    } else {
+        match protected.len() {
+            0 => "no code item protected yet".to_string(),
+            count if count > shown.len() => format!(
+                "{} and {} more ({count} code items)",
+                shown.join(", "),
+                count - shown.len()
+            ),
+            count => format!(
+                "{} ({count} code item{})",
+                human::list(&shown),
+                if count == 1 { "" } else { "s" }
+            ),
+        }
+    };
+    let history = document["history"].as_array().cloned().unwrap_or_default();
+    let event = |action: &str| {
+        history
+            .iter()
+            .rev()
+            .find(|entry| entry["action"] == action)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let decided = |action: &str| {
+        let entry = event(action);
+        format!(
+            "{} on {}",
+            text(&entry["actor"]),
+            human::when_value(&entry["at"]).unwrap_or_default()
+        )
+    };
+    let status = text(&document["status"]);
+    let decision = match status.as_str() {
+        "pending" => {
+            format!("Approve or reject: enforce policy \"{name}\", which keeps {protects}")
+        }
+        "approved" => format!(
+            "None: approved by {}; the policy is enforced",
+            decided("approved")
+        ),
+        "rejected" => format!(
+            "None: rejected by {}{}",
+            decided("rejected"),
+            document["rejection"]["reason"]
+                .as_str()
+                .map_or(String::new(), |reason| format!(" ({reason})"))
+        ),
+        "superseded" => "None: a newer version replaced it".into(),
+        "retired" => "None: its task finished, so the policy is no longer enforced".into(),
+        other => format!("Unknown status {other}"),
+    };
+    let origin = match document["origin"]["kind"].as_str() {
+        Some("task") => format!(
+            "compiled from task {}",
+            text(&document["origin"]["task_id"])
+        ),
+        Some("editor") => format!(
+            "drafted in the dashboard policy editor by {}",
+            document["origin"]["by"]
+                .as_str()
+                .unwrap_or("an unnamed author")
+        ),
+        _ => format!(
+            "found by the discovery engine (candidates of {} confidence or higher)",
+            document["min_confidence"].as_str().unwrap_or("medium")
+        ),
+    };
+    let code = human::code(document["policy_digest"].as_str().unwrap_or_default());
+    let mut summary = json!({
+        "decision_needed": decision,
+        "status": match status.as_str() {
+            "pending" => "waiting for review",
+            "approved" => "approved: enforced",
+            "rejected" => "rejected",
+            "superseded" => "replaced by a newer version",
+            "retired" => "retired: kept as evidence, not enforced",
+            _ => "unknown",
+        },
+        "protects": protects,
+        "agents_may_change": changeable,
+        "left_out": format!("{} candidate{} the discovery engine found but did not put in the policy", candidates.len() - protected.len(), if candidates.len() - protected.len() == 1 { "" } else { "s" }),
+        "if_approved": format!("Crane writes .crane/policies/{name}.crane and enforces its rules for every AI agent session started afterwards; sessions already running keep the contract they started with and report the change."),
+        "origin": origin,
+        "review_with_care": document["source"]["generated_in_agent_environment"].as_str().map(|marker| format!("generated while an AI agent was running ({marker}); read the policy before approving")),
+        "candidate_file": format!(".crane/{}", text(&document["policy_file"])),
+        "revision": document["revision"],
+        "approval_code": code,
+        "proposed_at": history.first().and_then(|entry| human::when_value(&entry["at"])),
+        "proposed_by": history.first().map(|entry| entry["actor"].clone()),
+        "review": format!("crane policy show {name}"),
+    });
+    if status == "pending" {
+        summary["approve"] = json!(format!(
+            "crane policy approve {name} --approver YOUR_NAME --confirm {code}"
+        ));
+        summary["reject"] = json!(format!(
+            "crane policy reject {name} --approver YOUR_NAME --reason \"WHY\""
+        ));
+        summary["edit"] = json!(format!(
+            "crane policy edit {name} --file .crane/{} --by YOUR_NAME",
+            text(&document["policy_file"])
+        ));
+    }
+    summary
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    /** A pending proposal reads as a decision with the commands that act on it */
+    #[test]
+    fn summary_reads_rules_and_offers_commands() {
+        let document = json!({
+            "proposal_id": "payments_core",
+            "status": "pending",
+            "policy": "policy payments_core {\n    checkpoint baseline;\n    preserve --function PaymentService.charge;\n    target --function PaymentService.refund;\n}\n",
+            "policy_digest": "sha256:0a05cbef9e8f62442f158e33f7ea5797",
+            "policy_file": "proposals/payments_core.crane",
+            "origin": {"kind": "editor", "by": "payments-lead"},
+            "candidates": [],
+            "history": [{"actor": "payments-lead", "at": 0, "action": "generated"}],
+        });
+        let summary = super::summarize(&document);
+        assert_eq!(
+            summary["protects"],
+            "PaymentService.charge (function) unchanged"
+        );
+        assert_eq!(
+            summary["agents_may_change"],
+            json!(["PaymentService.refund (function)"])
+        );
+        assert_eq!(
+            summary["approve"],
+            "crane policy approve payments_core --approver YOUR_NAME --confirm 0a05cbef9e8f"
+        );
+        assert_eq!(
+            summary["origin"],
+            "drafted in the dashboard policy editor by payments-lead"
+        );
+        let approved =
+            super::summarize(&json!({"proposal_id": "p", "status": "approved", "history": []}));
+        assert!(approved["approve"].is_null());
     }
 }

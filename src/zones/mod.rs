@@ -2,10 +2,12 @@
 // safety state) re-resolved against the inventory on every run. Zones are an input to
 // authorization that can only restrict; they never grant anything and never relax a contract.
 
+pub(crate) mod map;
 pub(crate) mod model;
 pub(crate) mod recommend;
 pub(crate) mod resolve;
 pub(crate) mod review;
+pub(crate) mod view;
 
 #[cfg(test)]
 mod tests;
@@ -75,8 +77,8 @@ impl Zones {
         })
     }
 
-    /** Serialize the zones, the machine-readable form of crane zones; with a zone id, only that
-     * zone (and the constraints on its entities and files) is included
+    /** Serialize the zones, the machine-readable form of crane zones, with the zone map's state;
+     * with a zone id, only that zone (and the constraints on its entities and files) is included
      * Input
         - only: Option<&str> - zone id to restrict the output to
      * Output
@@ -189,6 +191,8 @@ impl Zones {
             .collect::<Vec<_>>();
         json!({
             "zones_format": ZONES_FORMAT,
+            // The compact zone map's state: approved or changed, shadowed and unresolved lines
+            "map": map::status(&self.inventory).unwrap_or_else(|error| json!({"state": "unreadable", "errors": [error]})),
             "grants_permissions": false,
             "zone_set_version": self.version,
             "contract_version": self.inventory.contract_version,

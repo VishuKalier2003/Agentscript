@@ -358,6 +358,7 @@ criticality, the lowest autonomy, and the worst state.
 | Selector | Matches |
 |---|---|
 | `symbol LANG:ID` or `symbol Type.name` | a symbol by inventory id (without `symbol:`) or by qualified name |
+| `symbol FILE::Type.name` or `symbol FILE::Type.*` | a symbol, or every member of a type, in one file (either part may be a pattern) |
 | `module LANG:NAME` or `module NAME` | every symbol and file in a module |
 | `service PATH` or `service NAME` | every file of a service |
 | `subsystem NAME` | every service, module, and folder with a name segment matching `NAME` (case-insensitive) |
@@ -409,6 +410,77 @@ Conflicts that `crane zones` reports:
 
 Malformed zone files and duplicate zone ids are reported, and `crane zones`
 then exits with code 1.
+
+### Symbol granularity
+
+A `symbol` selector restricts only changes to the symbols it selects. Every
+other selector kind restricts every change to the files it covers. When an
+agent writes a file, Crane works out which symbols the change adds, removes,
+or modifies (a member's change also changes its enclosing types). It then
+applies the file's whole-file zones plus the zones of those symbols. When the
+changed symbols cannot be determined (an unsupported language, a new text
+that does not parse, a new or renamed file), every zone touching the file
+applies. The same rule holds for the effects Crane verifies after a tool runs.
+
+Delivery approval and the autonomy budget's risk cost still use every zone
+touching a changed file.
+
+### The zone map
+
+`.crane/zones.map` is a compact, one-line-per-target alternative to zone
+files:
+
+```
+# target                                     criticality autonomy   # note
+payments/**                                  routine     autonomous # the whole service
+payments/service.py::PaymentService.charge   critical    assisted   # money moves here
+payments/service.py::PaymentService.*        sensitive   delegated
+payments/models.py                           critical    assisted
+```
+
+A target is a folder (`DIR/**`), a file or file pattern, `FILE::Symbol`, or
+`FILE::Class.*`. Blank lines and `#` comments are allowed; a note follows
+`#` after whitespace. Errors are reported with their line numbers.
+
+The map is a draft until a human approves it:
+
+```
+crane zones review map
+crane zones approve map --approver NAME --confirm D12
+```
+
+Approval compiles each distinct (criticality, autonomy) pair into one ordinary
+zone, `map_CRITICALITY_AUTONOMY`, and writes them to
+`.crane/zones/zones-map.zone`. That file holds ordinary zones, so the
+authority engine reads no new format. The digest covers the compiled zones,
+so reordering, reformatting, or editing notes changes neither the digest nor
+the zone set version. A changed map is reported as "changed since approval"
+until it is reviewed and approved again. Approving a changed map changes the
+zone set version, which invalidates contracts bound to the old version.
+
+Overlaps resolve as for any zones: the most restrictive values win. `crane
+zones` and `crane zones review map` list each line that stricter lines fully
+shadow (it changes no decision) and each line that matches nothing (its zone
+is degraded). Agents may never write the map: it is `.crane` metadata.
+
+### The agent's zone view
+
+`crane zones map [--file PATH] [--session ID] [--json]` prints, per file,
+every symbol with its effective criticality and autonomy, the decision an
+edit to it would get (`OK`, `ASK` for human approval, or `DENY`), and the
+contract markers on it (`preserve(POLICY)`, `TARGET(POLICY)`). It lists the
+files that zones touch, the task scope's files, and files with
+contract-covered symbols. The decisions come from the same calculation the
+authority engine uses. The view is advisory: enforcement stays in the
+authority engine.
+
+The whole-repository view is written to `.crane/runtime/zones.agent.md`. It is
+regenerated when a session starts (for that session's governance) and after
+zone, map, policy, and task contract approvals (for new sessions). A
+session's start context stays short: a pointer to the file plus one line
+for each file (at most 15) whose edits need approval, are denied, or touch
+contract markers, naming only the symbols that differ from the rest of the
+file (of the task scope's files when a task is bound).
 
 ## Policy discovery and proposals
 
