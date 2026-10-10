@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Smoke test of a built crane binary: connect a clone to its (local mirror) remote, initialize,
+# checkpoint, protect a region, pass the policy tests, break the protected code, and fail them.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${CRANE_BIN:-$ROOT/target/debug/crane}"
@@ -8,12 +10,17 @@ if [[ ! -x "$BIN" ]]; then
 fi
 DEMO="$(mktemp -d)"
 trap 'rm -rf "$DEMO"' EXIT
-cd "$DEMO"
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CRANE_AGENT
+export CRANE_HOME="$DEMO/trust" CRANE_ALLOW_LOCAL_REMOTE=1 CRANE_ALERTS_DRY_RUN=1
+
 "$BIN" --version | grep -Eq '^crane [0-9]+\.[0-9]+\.[0-9]+$'
-git init -q
+
+git init -q --bare -b main "$DEMO/remote.git"
+git clone -q "$DEMO/remote.git" "$DEMO/work" 2>/dev/null
+cd "$DEMO/work"
 git config user.email crane@example.com
 git config user.name "Crane Demo"
-"$BIN" init
+git config core.autocrlf false
 cat > GatewayService.java <<'JAVA'
 class GatewayService {
     public void call() {
@@ -23,21 +30,24 @@ class GatewayService {
 JAVA
 git add GatewayService.java
 git commit -qm "trusted baseline"
-"$BIN" status >/tmp/crane_status.txt
-grep -q "Crane status" /tmp/crane_status.txt
-"$BIN" checkpoint --name baseline
-"$BIN" protect --function GatewayService.call --policy payment_gateway
-"$BIN" check >/tmp/crane_pass.txt
-grep -q "Crane check: PASS" /tmp/crane_pass.txt
-python3 - <<'PY'
-from pathlib import Path
-p=Path("GatewayService.java")
-p.write_text('''class GatewayService {\n    public void call() {\n        System.out.println("modified");\n    }\n}\n''')
-PY
-if "$BIN" check >/tmp/crane_fail.txt 2>&1; then
-  echo "expected check to fail"
+git push -q origin HEAD:main
+
+"$BIN" repo --https "$DEMO/remote.git" rf | grep -q "CONNECTED"
+"$BIN" repo status | grep -q "^CONNECTED"
+"$BIN" init | grep -q "Initialized"
+"$BIN" checkpoint baseline | grep -q "Created checkpoint 'baseline'"
+"$BIN" create policy payment_gateway gateway | grep -q "Created policy payment_gateway"
+"$BIN" protect GatewayService.java policy payment_gateway start-line 2 end-line 4 | grep -q "as selection"
+grep -q "// @crane:selection:" GatewayService.java
+"$BIN" validate | grep -q "Crane validate: PASS"
+"$BIN" test . | grep -q "Crane test: PASS"
+"$BIN" policy payment_gateway status >/dev/null
+
+sed -i.bak 's/"payment"/"modified"/' GatewayService.java && rm -f GatewayService.java.bak
+if "$BIN" test . >"$DEMO/fail.txt" 2>&1; then
+  echo "expected crane test to fail after the protected code changed" >&2
   exit 1
 fi
-grep -q "FAIL payment_gateway" /tmp/crane_fail.txt
-grep -q "Crane check: FAIL" /tmp/crane_fail.txt
+grep -q "FAIL policy payment_gateway" "$DEMO/fail.txt"
+grep -q "Crane test: FAIL" "$DEMO/fail.txt"
 echo "Smoke test passed."

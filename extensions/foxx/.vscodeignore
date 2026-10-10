@@ -1,0 +1,4 @@
+src/**
+out/test/**
+**/*.map
+tsconfig.json

@@ -1,997 +1,219 @@
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+// Zones, Flows, and Context Packs (.crane/governance.yaml): validation, flow discovery, autonomy
+// ceilings enforced at the hook, fail-closed handling of invalid configuration, and context packs
+// supplied to agents.
 
+mod common;
+
+use common::{text, Fixture};
 use serde_json::{json, Value};
 
-/** Environment variables that mark an agent environment */
-const AGENT_MARKERS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CRANE_AGENT",
-];
-
-/** Counter that keeps fixture directory names unique when tests run in parallel */
-static REPOSITORIES: AtomicUsize = AtomicUsize::new(0);
-
-/** Path of the Java payment service in the fixture */
-const SERVICE: &str = "services/payments/src/main/java/com/acme/payments/PaymentService.java";
-
-/** Java payment service source */
-const PAYMENT: &str = "package com.acme.payments;\n\npublic class PaymentService {\n    public int charge(int amount) {\n        return fee(amount) + amount;\n    }\n\n    public int refund(int amount) {\n        return charge(-amount);\n    }\n\n    int fee(int amount) {\n        return amount / 10;\n    }\n}\n";
-
-/** Repository files: a payments service with tests, an auth package, and analytics */
-const FILES: &[(&str, &str)] = &[
-    ("README.md", "# Demo\n"),
-    ("services/payments/pom.xml", "<project/>\n"),
-    (SERVICE, PAYMENT),
-    (
-        "services/payments/src/test/java/com/acme/payments/PaymentServiceTest.java",
-        "package com.acme.payments;\n\nclass PaymentServiceTest {\n    @Test\n    void charges() {\n        new PaymentService().charge(5);\n    }\n}\n",
-    ),
-    (
-        "auth/login.py",
-        "def authenticate(user):\n    return hash_password(user)\n\n\ndef hash_password(value):\n    return value\n",
-    ),
-    (
-        "analytics/report.py",
-        "def charge(rows):\n    return len(rows)\n",
-    ),
-    ("web/pay.js", "export function charge(card) { return card; }\n"),
-];
-
-/** The organization's zones: "Payments is Critical", "Authentication is Restricted", "Tests
- * are Routine" */
-const ZONES: &str = "zone payments {\n    criticality critical;\n    autonomy assisted;\n    policy payments;\n    select subsystem payments;\n    select symbol java:com.acme.payments.PaymentService.charge;\n}\n\nzone authentication {\n    criticality restricted;\n    autonomy observe;\n    select subsystem auth*;\n}\n\nzone tests {\n    criticality routine;\n    autonomy autonomous;\n    select tests;\n}\n";
-
-/** Policy preserving charge and requiring a change to refund */
-const POLICY: &str = "policy payments {\n    checkpoint baseline;\n    preserve --function PaymentService.charge;\n    target --function PaymentService.refund;\n}\n";
-
-/** A temporary repository with Crane initialized, a baseline checkpoint, a policy, and zones,
- * removed on drop
- * Fields
-    - root: PathBuf - repository root
-*/
-struct Repository {
-    root: PathBuf,
-}
-
-impl Repository {
-    /** Create the fixture repository with the given zone file
-     * Input
-        - zones: &str - content of .crane/zones/org.zone
-     * Output
-        - Repository
-    */
-    fn new(zones: &str) -> Self {
-        Self::create(FILES, Some(zones), Some(POLICY))
-    }
-
-    /** Create a fixture repository with a unique root commit, Crane initialized, and a baseline
-     * checkpoint
-     * Input
-        - files: &[(&str, &str)] - repository files
-        - zones: Option<&str> - content of .crane/zones/org.zone, if any
-        - policy: Option<&str> - content of .crane/policies/payments.crane, if any
-     * Output
-        - Repository
-    */
-    fn create(files: &[(&str, &str)], zones: Option<&str>, policy: Option<&str>) -> Self {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "crane-zones-{suffix}-{}",
-            REPOSITORIES.fetch_add(1, Ordering::SeqCst)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let repository = Self { root };
-        for (path, content) in files {
-            repository.write(path, content);
-        }
-        repository.git(&["init", "-q"]);
-        repository.git(&["config", "user.email", "crane@example.com"]);
-        repository.git(&["config", "user.name", "Crane Zones Test"]);
-        repository.git(&["config", "core.autocrlf", "false"]);
-        repository.git(&["add", "."]);
-        repository.git(&["commit", "-qm", &format!("baseline {suffix}")]);
-        assert!(repository.crane(&["init"], "").status.success());
-        assert!(repository
-            .crane(&["checkpoint", "--name", "baseline"], "")
-            .status
-            .success());
-        if let Some(policy) = policy {
-            repository.write(".crane/policies/payments.crane", policy);
-        }
-        if let Some(zones) = zones {
-            repository.write(".crane/zones/org.zone", zones);
-        }
-        repository
-    }
-
-    /** Write a file relative to the root, creating parent folders
-     * Input
-        - path: &str - relative path
-        - content: &str - file content
-     * Output
-        - None
-    */
-    fn write(&self, path: &str, content: &str) {
-        let path = self.root.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, content).unwrap();
-    }
-
-    /** Read a file relative to the root
-     * Input
-        - path: &str - relative path
-     * Output
-        - String
-    */
-    fn read(&self, path: &str) -> String {
-        fs::read_to_string(self.root.join(path)).unwrap()
-    }
-
-    /** Run git in the repository and require success
-     * Input
-        - args: &[&str] - git arguments
-     * Output
-        - None
-    */
-    fn git(&self, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.root)
-            .output()
-            .expect("git should execute");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    /** Run crane in the repository with the given stdin
-     * Input
-        - args: &[&str] - crane arguments
-        - stdin: &str - text written to stdin
-     * Output
-        - Output of the finished process
-    */
-    fn crane(&self, args: &[&str], stdin: &str) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_crane"));
-        command
-            .args(args)
-            .current_dir(&self.root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // The test acts as a human unless an agent marker is set on purpose
-        for marker in AGENT_MARKERS {
-            command.env_remove(marker);
-        }
-        let mut child = command.spawn().expect("crane should execute");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    }
-
-    /** Run crane zones --json and parse it, requiring success
-     * Input
-        - None
-     * Output
-        - Value zones JSON
-    */
-    fn zones(&self) -> Value {
-        let output = self.crane(&["zones", "--json"], "");
-        assert!(
-            output.status.success(),
-            "zones failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).expect("zones --json prints JSON")
-    }
-}
-
-impl Drop for Repository {
-    /** Remove the temporary repository
-     * Input
-        - None (uses self)
-     * Output
-        - None
-    */
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-/** Find an element of an array by a field value
+/** The service module that calls into payments
  * Input
-    - array: &'a Value - JSON array
-    - key: &str - field name
-    - value: &str - wanted value
+    - None
  * Output
-    - &'a Value element
+    - &'static str
 */
-fn find<'a>(array: &'a Value, key: &str, value: &str) -> &'a Value {
-    array
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|item| item[key] == value)
-        .unwrap_or_else(|| panic!("no {key} = {value} in {array}"))
-}
+const SERVICE: &str = "from app.payments import charge\n\n\ndef submit(order):\n    total = charge(order)\n    return audit(total)\n\n\ndef audit(total):\n    return total\n";
 
-/** Find the result of one selector of one zone
+/** A fixture with a service module committed and checkpointed
  * Input
-    - zones: &'a Value - zones JSON
-    - zone: &str - zone id
-    - selector: &str - selector text
+    - None
  * Output
-    - &'a Value selector result
+    - Fixture
 */
-fn selector<'a>(zones: &'a Value, zone: &str, selector: &str) -> &'a Value {
-    find(
-        &find(&zones["zones"], "zone_id", zone)["selectors"],
-        "selector",
-        selector,
-    )
+fn fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write("app/service.py", SERVICE);
+    fixture.commit("service");
+    common::git(&fixture.work, &["push", "-q", "origin", "HEAD:main"]);
+    fixture.ok(&["repo", "--https", fixture.remote_url().as_str()]);
+    fixture.ok(&["init"]);
+    fixture.ok(&["checkpoint", "baseline"]);
+    fixture
 }
 
-/** Check that a JSON array of strings contains a value
+/** Ask the hook about a Claude Code write
  * Input
-    - array: &Value - JSON array
-    - value: &str - wanted value
- * Output
-    - bool
-*/
-fn has(array: &Value, value: &str) -> bool {
-    array
-        .as_array()
-        .is_some_and(|items| items.iter().any(|item| item == value))
-}
-
-/** Id of the charge method */
-const CHARGE: &str = "symbol:java:com.acme.payments.PaymentService.charge";
-
-/** Semantic resolution: subsystems resolve to services, modules, and folders by name; zones say
- * "Payments is Critical", "Authentication is Restricted", and "Tests are Routine"; overlapping
- * zones combine to the most restrictive values and are reported; zones grant nothing
- */
-#[test]
-fn zones_resolve_semantic_selectors() {
-    let repository = Repository::new(ZONES);
-    let zones = repository.zones();
-    assert_eq!(zones["grants_permissions"], false);
-    assert!(zones["zone_set_version"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
-    assert_eq!(zones["problems"], json!([]));
-
-    let payments = selector(&zones, "payments", "subsystem payments");
-    assert_eq!(payments["status"], "resolved");
-    for target in [
-        "service:services/payments",
-        "module:java:com.acme.payments",
-        "folder:services/payments",
-    ] {
-        assert!(has(&payments["targets"], target), "{target}: {payments}");
-    }
-    let auth = selector(&zones, "authentication", "subsystem auth*");
-    assert!(has(&auth["targets"], "module:python:auth.login"), "{auth}");
-    assert!(has(&auth["targets"], "folder:auth"), "{auth}");
-    assert!(!has(&auth["targets"], "module:python:analytics.report"));
-
-    let charge = find(&zones["entities"], "id", CHARGE);
-    assert_eq!(charge["criticality"], "critical");
-    assert_eq!(charge["autonomy"], "assisted");
-    assert_eq!(charge["safety_state"], "active");
-    assert_eq!(charge["contracts"], json!(["payments:preserve"]));
-    let login = find(
-        &zones["entities"],
-        "id",
-        "symbol:python:auth.login.authenticate",
-    );
-    assert_eq!(
-        (login["criticality"].as_str(), login["autonomy"].as_str()),
-        (Some("restricted"), Some("observe"))
-    );
-    let report = zones["entities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entity| entity["id"] == "symbol:python:analytics.report.charge");
-    assert!(report.is_none(), "analytics is in no zone");
-
-    // A payments test is both Critical (payments) and Routine (tests): most restrictive wins
-    let test = find(
-        &zones["entities"],
-        "id",
-        "symbol:java:com.acme.payments.PaymentServiceTest.charges",
-    );
-    assert_eq!(test["zones"], json!(["payments", "tests"]));
-    assert_eq!(
-        (test["criticality"].as_str(), test["autonomy"].as_str()),
-        (Some("critical"), Some("assisted"))
-    );
-    let overlap = find(&zones["conflicts"], "kind", "overlap");
-    assert_eq!(overlap["zones"], json!(["payments", "tests"]));
-    assert!(overlap["message"]
-        .as_str()
-        .unwrap()
-        .contains("most restrictive values apply: critical, assisted, active"));
-    let readme = zones["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|file| file["path"] == "README.md");
-    assert!(readme.is_none());
-
-    let summary = String::from_utf8_lossy(&repository.crane(&["zones"], "").stdout).into_owned();
-    for text in [
-        "zones only restrict, they never grant",
-        "zone payments [zones/org.zone]",
-        "criticality critical, autonomy assisted, state active, policy payments",
-        "select subsystem payments: resolved -> ",
-        "Unresolved selectors (0):",
-        "Conflicts (",
-    ] {
-        assert!(summary.contains(text), "{text}\n{summary}");
-    }
-    let one = String::from_utf8_lossy(&repository.crane(&["zones", "authentication"], "").stdout)
-        .into_owned();
-    assert!(
-        one.contains("symbol:python:auth.login.hash_password (restricted, observe, active)"),
-        "{one}"
-    );
-    assert!(one.contains("file auth/login.py"), "{one}");
-    assert!(!one.contains("zone payments"), "{one}");
-    assert!(!repository.crane(&["zones", "nope"], "").status.success());
-}
-
-/** Rename and move handling: moving a Java class to another folder of the same package keeps
- * semantic selectors resolved while a folder selector reports where the content went, and
- * renaming a method reports the selector missing with the new name as a candidate, never
- * re-binding it silently
- */
-#[test]
-fn zones_survive_moves_and_report_renames() {
-    let zones_file = format!(
-        "{ZONES}\nzone ledger {{\n    criticality sensitive;\n    autonomy delegated;\n    select folder services/payments/src/main/java/com/acme/payments;\n}}\n"
-    );
-    let repository = Repository::new(&zones_file);
-    let before = repository.zones();
-    assert_eq!(
-        selector(
-            &before,
-            "ledger",
-            "folder services/payments/src/main/java/com/acme/payments"
-        )["status"],
-        "resolved"
-    );
-
-    let moved = "services/payments/src/main/java/com/acme/core/PaymentService.java";
-    fs::create_dir_all(
-        repository
-            .root
-            .join("services/payments/src/main/java/com/acme/core"),
-    )
-    .unwrap();
-    repository.git(&["mv", SERVICE, moved]);
-    let after_move = repository.zones();
-    let symbol = selector(
-        &after_move,
-        "payments",
-        "symbol java:com.acme.payments.PaymentService.charge",
-    );
-    assert_eq!(symbol["status"], "resolved");
-    assert_eq!(symbol["targets"], json!([CHARGE]));
-    assert_eq!(
-        selector(&after_move, "payments", "subsystem payments")["status"],
-        "resolved"
-    );
-    assert_eq!(find(&after_move["entities"], "id", CHARGE)["file"], moved);
-    let folder = selector(
-        &after_move,
-        "ledger",
-        "folder services/payments/src/main/java/com/acme/payments",
-    );
-    assert_eq!(folder["status"], "missing");
-    assert_eq!(
-        folder["rename_candidates"],
-        json!(["folder:services/payments/src/main/java/com/acme/core"])
-    );
-    assert_eq!(
-        find(&after_move["zones"], "zone_id", "ledger")["effective_safety_state"],
-        "degraded"
-    );
-
-    // Renaming charge to collect: the zone does not follow silently, it suggests the new name
-    repository.write(moved, &PAYMENT.replace("charge(", "collect("));
-    let renamed = repository.zones();
-    let symbol = selector(
-        &renamed,
-        "payments",
-        "symbol java:com.acme.payments.PaymentService.charge",
-    );
-    assert_eq!(symbol["status"], "missing");
-    assert_eq!(symbol["previous_targets"], json!([CHARGE]));
-    assert_eq!(
-        symbol["rename_candidates"],
-        json!(["symbol:java:com.acme.payments.PaymentService.collect"])
-    );
-    let payments = find(&renamed["zones"], "zone_id", "payments");
-    assert_eq!(payments["effective_safety_state"], "degraded");
-    assert!(has(
-        &payments["entities"],
-        "symbol:java:com.acme.payments.PaymentService.collect"
-    ));
-    assert!(has(
-        &find(&renamed["unresolved"], "zone_id", "payments")["rename_candidates"],
-        "symbol:java:com.acme.payments.PaymentService.collect"
-    ));
-    let summary =
-        String::from_utf8_lossy(&repository.crane(&["zones", "payments"], "").stdout).into_owned();
-    assert!(
-        summary.contains(
-            "possibly renamed or moved to symbol:java:com.acme.payments.PaymentService.collect"
-        ),
-        "{summary}"
-    );
-
-    // Undoing the rename resolves the selector again
-    repository.write(moved, PAYMENT);
-    assert_eq!(
-        selector(
-            &repository.zones(),
-            "payments",
-            "symbol java:com.acme.payments.PaymentService.charge"
-        )["status"],
-        "resolved"
-    );
-}
-
-/** Deleted targets: a selector whose target was deleted is reported missing with what it used
- * to cover and no candidate, a selector that never resolved is unresolved, and both degrade
- * their zone, capping its autonomy
- */
-#[test]
-fn deleted_targets_degrade_their_zone() {
-    let zones_file = "zone tooling {\n    criticality routine;\n    autonomy autonomous;\n    select symbol java:com.acme.payments.PaymentService.fee;\n    select symbol Ghost.run;\n}\n";
-    let repository = Repository::new(zones_file);
-    let before = repository.zones();
-    let tooling = find(&before["zones"], "zone_id", "tooling");
-    assert_eq!(tooling["effective_autonomy"], "assisted");
-    assert_eq!(
-        selector(&before, "tooling", "symbol Ghost.run")["status"],
-        "unresolved"
-    );
-    assert_eq!(
-        selector(
-            &before,
-            "tooling",
-            "symbol java:com.acme.payments.PaymentService.fee"
-        )["status"],
-        "resolved"
-    );
-
-    repository.write(
-        SERVICE,
-        &PAYMENT.replace(
-            "    int fee(int amount) {\n        return amount / 10;\n    }\n",
-            "",
-        ),
-    );
-    let after = repository.zones();
-    let fee = selector(
-        &after,
-        "tooling",
-        "symbol java:com.acme.payments.PaymentService.fee",
-    );
-    assert_eq!(fee["status"], "missing");
-    assert_eq!(
-        fee["previous_targets"],
-        json!(["symbol:java:com.acme.payments.PaymentService.fee"])
-    );
-    assert_eq!(fee["rename_candidates"], json!([]));
-    let tooling = find(&after["zones"], "zone_id", "tooling");
-    assert_eq!(tooling["entities"], json!([]));
-    assert_eq!(tooling["effective_safety_state"], "degraded");
-    assert_eq!(after["unresolved"].as_array().unwrap().len(), 2);
-}
-
-/** Ambiguous selectors: an exact symbol name matching several symbols is reported ambiguous,
- * covers every match (restricting more, never less), and degrades the zone; a wildcard is not
- * ambiguous
- */
-#[test]
-fn ambiguous_selectors_are_reported() {
-    let zones_file = "zone billing {\n    criticality sensitive;\n    autonomy delegated;\n    select symbol charge;\n}\n\nzone everything {\n    criticality routine;\n    autonomy autonomous;\n    select symbol python:*;\n}\n";
-    let repository = Repository::new(zones_file);
-    let zones = repository.zones();
-    let charge = selector(&zones, "billing", "symbol charge");
-    assert_eq!(charge["status"], "ambiguous");
-    assert_eq!(
-        charge["targets"],
-        json!([
-            "symbol:javascript:web/pay.charge",
-            "symbol:python:analytics.report.charge"
-        ])
-    );
-    let billing = find(&zones["zones"], "zone_id", "billing");
-    assert_eq!(billing["effective_safety_state"], "degraded");
-    assert_eq!(billing["effective_autonomy"], "assisted");
-    assert_eq!(
-        selector(&zones, "everything", "symbol python:*")["status"],
-        "resolved"
-    );
-    assert_eq!(
-        find(&zones["unresolved"], "zone_id", "billing")["status"],
-        "ambiguous"
-    );
-}
-
-/** Policy conflicts: a zone declaring more autonomy than its criticality allows, a zone
- * referencing a policy that does not exist or covers nothing in it, and a target rule requiring a
- * change in code its zones only let agents observe
- */
-#[test]
-fn policy_conflicts_are_reported() {
-    let zones_file = "zone lockdown {\n    criticality restricted;\n    autonomy autonomous;\n    policy missing;\n    select symbol java:com.acme.payments.PaymentService.refund;\n}\n\nzone analytics {\n    criticality sensitive;\n    autonomy delegated;\n    policy payments;\n    select subsystem analytics;\n}\n";
-    let repository = Repository::new(zones_file);
-    let zones = repository.zones();
-    let kinds = zones["conflicts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|conflict| conflict["kind"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    for kind in [
-        "autonomy_exceeds_criticality",
-        "policy_reference_missing",
-        "policy_reference_outside_zone",
-        "policy_requires_change",
-    ] {
-        assert!(kinds.contains(&kind.to_string()), "{kind}: {kinds:?}");
-    }
-    let lockdown = find(&zones["zones"], "zone_id", "lockdown");
-    assert_eq!(lockdown["effective_autonomy"], "observe");
-    let requires = find(&zones["conflicts"], "kind", "policy_requires_change");
-    assert_eq!(requires["zones"], json!(["lockdown"]));
-    assert_eq!(
-        requires["entities"],
-        json!(["symbol:java:com.acme.payments.PaymentService.refund"])
-    );
-    let outside = find(&zones["conflicts"], "kind", "policy_reference_outside_zone");
-    assert_eq!(outside["zones"], json!(["analytics"]));
-}
-
-/** Persistence: zone definitions and versions do not depend on checkpoints or file layout, so
- * committing changes, re-baselining the checkpoint, and editing policies leave the zones and
- * their resolution unchanged while the contract version moves on
- */
-#[test]
-fn zones_persist_across_checkpoint_changes() {
-    let repository = Repository::new(ZONES);
-    let before = repository.zones();
-    repository.write(SERVICE, &PAYMENT.replace("amount / 10", "amount / 20"));
-    repository.git(&["commit", "-qam", "new fee"]);
-    assert!(repository
-        .crane(&["checkpoint", "--name", "baseline"], "")
-        .status
-        .success());
-    repository.write(".crane/policies/payments.crane", &format!("{POLICY}\n"));
-    let after = repository.zones();
-    assert_ne!(after["contract_version"], before["contract_version"]);
-    assert_eq!(after["zone_set_version"], before["zone_set_version"]);
-    for zone in before["zones"].as_array().unwrap() {
-        let id = zone["zone_id"].as_str().unwrap();
-        let now = find(&after["zones"], "zone_id", id);
-        assert_eq!(now["version"], zone["version"], "{id}");
-        assert_eq!(now["entities"], zone["entities"], "{id}");
-        assert_eq!(now["effective_safety_state"], "active", "{id}");
-    }
-    assert_eq!(repository.read(".crane/zones/org.zone"), ZONES);
-}
-
-/** Zones never grant: a Routine, Autonomous zone over preserved code does not let an agent change
- * it, agents cannot edit zone files, a malformed zone file is reported without hiding valid
- * zones, and a repository without zones lists none
- */
-#[test]
-fn zones_never_grant_and_are_protected() {
-    let open = "zone open {\n    criticality routine;\n    autonomy autonomous;\n    select symbol java:com.acme.payments.PaymentService.charge;\n}\n";
-    let repository = Repository::new(open);
-    assert_eq!(
-        find(&repository.zones()["entities"], "id", CHARGE)["autonomy"],
-        "autonomous"
-    );
-    let edit = json!({
-        "session_id": "z1",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Edit",
-        "tool_input": {"file_path": SERVICE, "old_string": "return fee(amount) + amount;", "new_string": "return amount;"},
-    });
-    let denied = repository.crane(
-        &[
-            "agent",
-            "hook",
-            "--event",
-            "pre-tool-use",
-            "--profile",
-            "claude",
-        ],
-        &edit.to_string(),
-    );
-    assert_eq!(denied.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&denied.stderr)
-        .contains("protected by preserve function PaymentService.charge"));
-    let write = json!({
-        "session_id": "z1",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": ".crane/zones/open.zone", "content": "zone x {}"},
-    });
-    let zone_edit = repository.crane(
-        &[
-            "agent",
-            "hook",
-            "--event",
-            "pre-tool-use",
-            "--profile",
-            "claude",
-        ],
-        &write.to_string(),
-    );
-    assert_eq!(zone_edit.status.code(), Some(2));
-
-    repository.write(
-        ".crane/zones/broken.zone",
-        "zone broken {\n    criticality red;\n}\n",
-    );
-    let output = repository.crane(&["zones", "--json"], "");
-    assert!(!output.status.success());
-    let zones: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(zones["problems"][0]
-        .as_str()
-        .unwrap()
-        .contains("zones/broken.zone: line 2: invalid criticality 'red'"));
-    find(&zones["zones"], "zone_id", "open");
-
-    fs::remove_dir_all(repository.root.join(".crane/zones")).unwrap();
-    let empty = repository.crane(&["zones"], "");
-    assert!(empty.status.success());
-    assert!(String::from_utf8_lossy(&empty.stdout).contains("No zones defined"));
-}
-
-/** Python payment service: charge is critical, the rest of the class ordinary */
-const PY_SERVICE: &str = "class PaymentService:\n    def charge(self, amount):\n        return amount + self.fee(amount)\n\n    def fee(self, amount):\n        return amount // 10\n\n    def refund(self, amount):\n        return -amount\n";
-
-/** Files of the zone map fixture */
-const MAP_FILES: &[(&str, &str)] = &[
-    ("README.md", "# Shop\n"),
-    ("payments/service.py", PY_SERVICE),
-    (
-        "payments/models.py",
-        "class Ledger:\n    def post(self, entry):\n        return entry\n",
-    ),
-    (
-        "catalog/labels.py",
-        "def label(name):\n    return name.strip()\n",
-    ),
-];
-
-/** A zone map exercising every target form: a folder, a file, a symbol, a class glob, a line a
- * stricter rule fully shadows, and a target that matches nothing */
-const MAP: &str = "# Payments\npayments/** routine autonomous   # the whole service\npayments/service.py::PaymentService.charge critical assisted   # money moves here\npayments/service.py::PaymentService.* sensitive delegated\npayments/models.py critical assisted\npayments/models.py::Ledger.post sensitive delegated\npayments/missing.py::Gone.away critical assisted\n";
-
-impl Repository {
-    /** Run a Claude Code pre-tool-use hook for an Edit
-     * Input
-        - path: &str - file to edit
-        - old: &str - text replaced
-        - new: &str - replacement
-     * Output
-        - &'static str "OK", "ASK", or "DENY", as the adapter answered
-    */
-    fn edit_decision(&self, path: &str, old: &str, new: &str) -> &'static str {
-        let event = json!({
-            "session_id": "map-1",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "Edit",
-            "tool_input": {"file_path": path, "old_string": old, "new_string": new},
-        });
-        let output = self.crane(
-            &[
-                "agent",
-                "hook",
-                "--event",
-                "pre-tool-use",
-                "--profile",
-                "claude",
-            ],
-            &event.to_string(),
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        match output.status.code() {
-            Some(2) => "DENY",
-            Some(0) if stdout.contains("\"ask\"") => "ASK",
-            Some(0) if stdout.trim().is_empty() => "OK",
-            other => panic!(
-                "unexpected hook result {other:?}: {stdout}{}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        }
-    }
-
-    /** Run crane with --json, require success, and parse the output
-     * Input
-        - args: &[&str] - crane arguments
-     * Output
-        - Value
-    */
-    fn json(&self, args: &[&str]) -> Value {
-        let mut full = args.to_vec();
-        full.push("--json");
-        let output = self.crane(&full, "");
-        assert!(
-            output.status.success(),
-            "crane {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
-    }
-}
-
-/** Find the view row of one symbol (None for the rest-of-file row)
- * Input
-    - view: &'a Value - zones map JSON
+    - fixture: &Fixture - repository
+    - session: &str - session id
+    - call: &str - tool_use_id
     - path: &str - file
-    - symbol: Option<&str> - qualified name
+    - content: &str - new content
  * Output
-    - &'a Value row
+    - std::process::Output
 */
-fn row<'a>(view: &'a Value, path: &str, symbol: Option<&str>) -> &'a Value {
-    let file = find(&view["files"], "path", path);
-    file["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["symbol"].as_str() == symbol)
-        .unwrap_or_else(|| panic!("no row {symbol:?} in {file}"))
+fn write(
+    fixture: &Fixture,
+    session: &str,
+    call: &str,
+    path: &str,
+    content: &str,
+) -> std::process::Output {
+    fixture.hook(
+        "claude",
+        "pre-tool-use",
+        &json!({"session_id": session, "tool_use_id": call, "cwd": fixture.work.to_string_lossy(), "tool_name": "Write", "tool_input": {"file_path": fixture.work.join(path).to_string_lossy(), "content": content}}),
+    )
 }
 
-/** The compact zone map: parse errors carry line numbers; folder, file, symbol, and class-glob
- * targets compile into ordinary zones once a human approves; overlaps resolve to the most
- * restrictive values, fully shadowed and unresolved lines are reported, an unresolved target
- * degrades its zone, reformatting changes no version; an agent edit to a critical symbol needs
- * approval while its neighbours and other files stay open; the map itself is protected; and the
- * generated agent view predicts exactly what the authority engine decides */
+/** Zone ceilings restrict agent writes: observe denies, assisted asks, other files are allowed
+ * Input
+    - None
+ * Output
+    - None (panics on failure)
+*/
 #[test]
-fn zone_map_governs_symbols() {
-    let repository = Repository::create(MAP_FILES, None, None);
-    repository.write(
-        ".crane/zones.map",
-        "payments/** routine\ncatalog/ routine observe\npayments/service.py::Charge.x red assisted\n",
+fn zone_ceilings_restrict_writes() {
+    let fixture = fixture();
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nzones:\n  - id: ledger-core\n    description: Ledger postings\n    selectors:\n      files: [app/ledger.py]\n    criticality: critical\n    autonomy_ceiling: observe\n  - id: payments\n    description: Payment logic\n    selectors:\n      paths: [\"app/pay*.py\"]\n    criticality: sensitive\n    autonomy_ceiling: assisted\n",
     );
-    let invalid = repository.crane(&["zones", "review", "map"], "");
-    assert!(!invalid.status.success());
-    let errors = String::from_utf8_lossy(&invalid.stderr).to_string();
-    for expected in [
-        "zones.map: line 1: expected '<target> <criticality> <autonomy>",
-        "zones.map: line 2: target 'catalog/' names a folder",
-        "zones.map: line 3: invalid criticality 'red'",
-    ] {
-        assert!(errors.contains(expected), "{expected} missing:\n{errors}");
-    }
-
-    // Nothing governs until a human approves the reviewed map
-    repository.write(".crane/zones.map", MAP);
-    let reviewed = repository.json(&["zones", "review", "map"]);
-    assert_eq!(reviewed["state"], "not approved");
-    assert_eq!(
-        reviewed["zones"],
-        json!([
-            "map_routine_autonomous",
-            "map_sensitive_delegated",
-            "map_critical_assisted"
-        ])
-    );
-    assert_eq!(
-        reviewed["shadowed"].as_array().unwrap().len(),
-        1,
-        "{reviewed}"
-    );
-    assert_eq!(reviewed["shadowed"][0]["line"], 6);
-    assert_eq!(reviewed["shadowed"][0]["by"], json!([5]));
-    assert_eq!(reviewed["unresolved"][0]["line"], 7);
-    assert!(repository.zones()["zones"].as_array().unwrap().is_empty());
-    let digest = reviewed["digest"].as_str().unwrap().to_string();
-    let refused = repository.crane(
-        &[
-            "zones",
-            "approve",
-            "map",
-            "--approver",
-            "lead",
-            "--confirm",
-            "0123456789ab",
-        ],
-        "",
-    );
-    assert!(!refused.status.success());
-    let approved = repository.json(&[
-        "zones",
-        "approve",
-        "map",
-        "--approver",
-        "lead",
-        "--confirm",
-        &digest[7..19],
-    ]);
-    assert_eq!(approved["status"], "approved");
-    assert!(repository
-        .read(".crane/zones/zones-map.zone")
-        .starts_with("# Generated by 'crane zones approve map'"));
-
-    let zones = repository.zones();
-    assert_eq!(zones["map"]["state"], "active");
-    let critical = find(&zones["zones"], "zone_id", "map_critical_assisted");
-    assert_eq!(critical["effective_safety_state"], "degraded");
-    assert_eq!(
-        selector(
-            &zones,
-            "map_critical_assisted",
-            "symbol payments/missing.py::Gone.away"
-        )["status"],
-        "unresolved"
-    );
-    assert_eq!(
-        selector(
-            &zones,
-            "map_critical_assisted",
-            "symbol payments/service.py::PaymentService.charge"
-        )["targets"],
-        json!(["symbol:python:payments.service.PaymentService.charge"])
-    );
-    assert_eq!(
-        selector(
-            &zones,
-            "map_sensitive_delegated",
-            "symbol payments/service.py::PaymentService.*"
-        )["targets"]
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
-    // Overlapping zones combine to the most restrictive values
-    assert_eq!(
-        find(
-            &zones["entities"],
-            "id",
-            "symbol:python:payments.service.PaymentService.charge"
-        )["criticality"],
-        "critical"
-    );
-    let text = String::from_utf8_lossy(&repository.crane(&["zones"], "").stdout).to_string();
+    assert!(fixture.ok(&["validate"]).contains("PASS"));
+    fixture.hook("claude", "SessionStart", &json!({"session_id": "z1"}));
+    let ledger = write(&fixture, "z1", "w1", "app/ledger.py", "x = 1\n");
+    assert_eq!(ledger.status.code(), Some(2), "{}", text(&ledger));
     assert!(
-        text.contains("line 6 (payments/models.py::Ledger.post sensitive delegated) is fully shadowed by line 5 (payments/models.py critical assisted)"),
+        text(&ledger).contains("zone:ledger-core") && text(&ledger).contains("observe"),
+        "{}",
+        text(&ledger)
+    );
+    let payments = write(&fixture, "z1", "w2", "app/payments.py", "x = 2\n");
+    assert!(payments.status.success(), "{}", text(&payments));
+    let answer: Value = serde_json::from_slice(&payments.stdout).unwrap();
+    assert_eq!(
+        answer["hookSpecificOutput"]["permissionDecision"], "ask",
+        "{answer}"
+    );
+    let other = write(&fixture, "z1", "w3", "web/app.js", "x\n");
+    assert!(
+        other.status.success() && other.stdout.is_empty(),
+        "{}",
+        text(&other)
+    );
+    fixture.write(".crane/governance.yaml", "version: 1\nzones:\n  - id: ledger-core\n    status: proposed\n    selectors:\n      files: [app/ledger.py]\n    autonomy_ceiling: observe\n");
+    let proposed = write(&fixture, "z1", "w4", "app/ledger.py", "x = 3\n");
+    assert!(
+        proposed.status.success(),
+        "proposed zones are not enforced: {}",
+        text(&proposed)
+    );
+}
+
+/** Flows are discovered from their entry points across files; ambiguous or missing entry points
+ * are UNRESOLVED; a flow's ceiling applies to every file it reaches
+ * Input
+    - None
+ * Output
+    - None (panics on failure)
+*/
+#[test]
+fn flows_are_discovered_and_enforced() {
+    let fixture = fixture();
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nflows:\n  - id: order-submission\n    description: Order submission and charging\n    entry_points: [\"app/service.py:submit\"]\n    criticality: critical\n    autonomy_ceiling: assisted\n",
+    );
+    assert!(fixture.ok(&["validate"]).contains("PASS"));
+    fixture.hook("claude", "SessionStart", &json!({"session_id": "f1"}));
+    let reached = write(
+        &fixture,
+        "f1",
+        "f-1",
+        "app/payments.py",
+        "def charge(o):\n    return o\n",
+    );
+    let answer: Value = serde_json::from_slice(&reached.stdout).unwrap_or(Value::Null);
+    assert_eq!(
+        answer["hookSpecificOutput"]["permissionDecision"],
+        "ask",
+        "the flow reaches charge() in app/payments.py: {}",
+        text(&reached)
+    );
+    assert!(
+        answer.to_string().contains("flow:order-submission"),
+        "{answer}"
+    );
+    let unrelated = write(&fixture, "f1", "f-2", "src/lib.rs", "pub fn x() {}\n");
+    assert!(unrelated.stdout.is_empty(), "{}", text(&unrelated));
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nflows:\n  - id: broken\n    entry_points: [\"doesNotExist\"]\n",
+    );
+    let output = fixture.fails(&["validate"]);
+    assert!(output.contains("flow_unresolved"), "{output}");
+}
+
+/** Stale selectors warn, unknown references and invalid YAML fail validation, and invalid
+ * configuration makes the hook deny changes (fail closed)
+ * Input
+    - None
+ * Output
+    - None (panics on failure)
+*/
+#[test]
+fn configuration_problems_are_reported() {
+    let fixture = fixture();
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nzones:\n  - id: gone\n    selectors:\n      paths: [\"old/**\"]\n",
+    );
+    let stale = fixture.ok(&["validate"]);
+    assert!(stale.contains("selector_stale"), "{stale}");
+    fixture.write(".crane/governance.yaml", "version: 1\nzones:\n  - id: z\n    selectors:\n      paths: [\"app/**\"]\n    policies: [nope]\n    context_packs: [missing]\n");
+    let unknown = fixture.fails(&["validate"]);
+    assert!(
+        unknown.contains("governance_unknown_policy")
+            && unknown.contains("governance_unknown_context"),
+        "{unknown}"
+    );
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nzones:\n  - id: z\n  - id: z\n",
+    );
+    assert!(fixture
+        .fails(&["validate"])
+        .contains("governance_duplicate_id"));
+    fixture.write(".crane/governance.yaml", "version: 1\nzonez: []\n");
+    let invalid = fixture.fails(&["validate"]);
+    assert!(invalid.contains("governance_yaml_invalid"), "{invalid}");
+    fixture.hook("claude", "SessionStart", &json!({"session_id": "c1"}));
+    let denied = write(&fixture, "c1", "c-1", "web/app.js", "x\n");
+    assert_eq!(denied.status.code(), Some(2), "{}", text(&denied));
+    assert!(text(&denied).contains("fail closed"), "{}", text(&denied));
+}
+
+/** Context packs referenced by active zones are composed, deduplicated, and supplied at session
+ * start, with the zone descriptions
+ * Input
+    - None
+ * Output
+    - None (panics on failure)
+*/
+#[test]
+fn context_packs_are_supplied() {
+    let fixture = fixture();
+    fixture.write(
+        ".crane/governance.yaml",
+        "version: 1\nzones:\n  - id: payment-core\n    description: Core payment resources\n    selectors:\n      paths: [\"app/**\"]\n    context_packs: [payment-invariants]\nflows:\n  - id: order-submission\n    entry_points: [\"submit\"]\n    context_packs: [payment-invariants]\ncontext_packs:\n  - id: payment-invariants\n    version: 2\n    content:\n      - Payment processing must be idempotent.\n    files: [docs/guide.md]\n  - id: unused\n    version: 1\n    content: [Not referenced]\n",
+    );
+    let output = fixture.hook("claude", "SessionStart", &json!({"session_id": "p1"}));
+    let context: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        text.matches("[payment-invariants v2]").count(),
+        1,
+        "deduplicated: {text}"
+    );
+    assert!(
+        text.contains("Payment processing must be idempotent."),
         "{text}"
     );
-
-    // Reordering, spacing, and notes change neither the digest nor the zone set version
-    let version = zones["zone_set_version"].clone();
-    repository.write(
-        ".crane/zones.map",
-        "payments/missing.py::Gone.away   critical assisted\n\n# reformatted\npayments/models.py::Ledger.post sensitive delegated # still shadowed\npayments/models.py critical   assisted\npayments/service.py::PaymentService.*  sensitive delegated\npayments/service.py::PaymentService.charge critical assisted\npayments/** routine autonomous\n",
-    );
-    let again = repository.zones();
-    assert_eq!(again["map"]["state"], "active");
-    assert_eq!(again["map"]["digest"], digest.as_str());
-    assert_eq!(again["zone_set_version"], version);
-
-    // The generated view for new sessions, and the authority's decisions for the same edits
-    let view = repository.json(&["zones", "map"]);
-    assert_eq!(view["advisory"], true);
-    let expected = [
-        ("payments/service.py", Some("PaymentService.charge"), "ASK"),
-        ("payments/service.py", Some("PaymentService.fee"), "OK"),
-        ("payments/service.py", None, "OK"),
-        ("payments/models.py", Some("Ledger.post"), "ASK"),
-    ];
-    for (path, symbol, decision) in expected {
-        assert_eq!(
-            row(&view, path, symbol)["decision"],
-            decision,
-            "{path} {symbol:?}"
-        );
-    }
-    assert_eq!(
-        row(&view, "payments/service.py", Some("PaymentService.charge"))["criticality"],
-        "critical"
-    );
-    let labels = repository.json(&["zones", "map", "--file", "catalog/labels.py"]);
-    assert_eq!(
-        row(&labels, "catalog/labels.py", Some("label"))["decision"],
-        "OK"
-    );
-    let written = repository.read(".crane/runtime/zones.agent.md");
-    assert!(
-        written.contains("| PaymentService.charge | critical | assisted | ASK |"),
-        "{written}"
-    );
-
-    let start = repository.crane(
-        &[
-            "agent",
-            "hook",
-            "--event",
-            "session-start",
-            "--profile",
-            "claude",
-        ],
-        &json!({"session_id": "map-1", "hook_event_name": "SessionStart", "source": "startup"})
-            .to_string(),
-    );
-    let context = String::from_utf8_lossy(&start.stdout).to_string();
-    assert!(
-        context.contains("- payments/service.py: OK (routine/delegated); PaymentService.charge: ASK (critical/assisted)"),
-        "{context}"
-    );
-
-    assert_eq!(
-        repository.edit_decision(
-            "payments/service.py",
-            "return amount + self.fee(amount)",
-            "return amount"
-        ),
-        "ASK"
-    );
-    assert_eq!(
-        repository.edit_decision(
-            "payments/service.py",
-            "return amount // 10",
-            "return amount // 20"
-        ),
-        "OK"
-    );
-    assert_eq!(
-        repository.edit_decision("payments/models.py", "return entry", "return [entry]"),
-        "ASK"
-    );
-    assert_eq!(
-        repository.edit_decision("catalog/labels.py", "return name.strip()", "return name"),
-        "OK"
-    );
-    let write = json!({
-        "session_id": "map-1",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Write",
-        "tool_input": {"file_path": ".crane/zones.map", "content": "payments/** routine autonomous\n"},
-    });
-    let guarded = repository.crane(
-        &[
-            "agent",
-            "hook",
-            "--event",
-            "pre-tool-use",
-            "--profile",
-            "claude",
-        ],
-        &write.to_string(),
-    );
-    assert_eq!(guarded.status.code(), Some(2));
-    assert!(repository.read(".crane/zones.map").contains("Gone.away"));
+    assert!(text.contains("Use the payment API carefully."), "{text}");
+    assert!(!text.contains("Not referenced"), "{text}");
+    assert!(text.contains("Zone payment-core"), "{text}");
+    let session = fixture.ok(&["session", "current"]);
+    assert!(session.contains("pack:payment-invariants@v2"), "{session}");
 }

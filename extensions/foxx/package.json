@@ -1,0 +1,96 @@
+{
+  "name": "foxx",
+  "displayName": "Foxx",
+  "description": "Create and inspect Crane selection contracts, zones, flows, and context packs from the editor.",
+  "version": "0.4.0",
+  "publisher": "agentscript",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:.crane/registry.json"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Foxx runs the Crane CLI and edits repository governance files, so it is disabled in untrusted workspaces."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "commands": [
+      { "command": "foxx.createSelectionContract", "title": "Create Selection Contract", "category": "Foxx" },
+      { "command": "foxx.protectSelection", "title": "Preserve Selected Lines", "category": "Foxx" },
+      { "command": "foxx.targetSelection", "title": "Target Selected Lines", "category": "Foxx" },
+      { "command": "foxx.createZone", "title": "Create Zone", "category": "Foxx" },
+      { "command": "foxx.createFlow", "title": "Create Flow", "category": "Foxx" },
+      { "command": "foxx.attachToZone", "title": "Attach to Zone", "category": "Foxx" },
+      { "command": "foxx.attachToFlow", "title": "Attach to Flow", "category": "Foxx" },
+      { "command": "foxx.attachContextPack", "title": "Attach Context Pack", "category": "Foxx" },
+      { "command": "foxx.activateEntity", "title": "Activate Zone or Flow", "category": "Foxx" },
+      { "command": "foxx.previewImpact", "title": "Preview Impact", "category": "Foxx" },
+      { "command": "foxx.undoGovernanceChange", "title": "Undo Last Governance Change", "category": "Foxx" },
+      { "command": "foxx.createProposalBranch", "title": "Create Proposal Branch", "category": "Foxx" },
+      { "command": "foxx.attachPolicyContext", "title": "Attach File as Policy Context", "category": "Foxx" },
+      { "command": "foxx.validate", "title": "Validate Governance", "category": "Foxx" },
+      { "command": "foxx.test", "title": "Test Policies", "category": "Foxx" },
+      { "command": "foxx.policyStatus", "title": "Policy Status", "category": "Foxx" },
+      { "command": "foxx.openDashboard", "title": "Open Dashboard", "category": "Foxx" },
+      { "command": "foxx.refresh", "title": "Refresh", "category": "Foxx", "icon": "$(refresh)" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "foxx.createSelectionContract", "when": "editorHasSelection && isWorkspaceTrusted", "group": "foxx@1" },
+        { "command": "foxx.attachToZone", "when": "isWorkspaceTrusted", "group": "foxx@2" },
+        { "command": "foxx.attachToFlow", "when": "isWorkspaceTrusted", "group": "foxx@3" }
+      ],
+      "explorer/context": [
+        { "command": "foxx.createZone", "when": "isWorkspaceTrusted", "group": "foxx@1" },
+        { "command": "foxx.attachToZone", "when": "isWorkspaceTrusted", "group": "foxx@2" },
+        { "command": "foxx.attachPolicyContext", "when": "isWorkspaceTrusted && !explorerResourceIsFolder", "group": "foxx@3" }
+      ],
+      "view/title": [
+        { "command": "foxx.refresh", "when": "view == foxx.governance", "group": "navigation" }
+      ]
+    },
+    "views": {
+      "explorer": [
+        { "id": "foxx.governance", "name": "Foxx Governance" }
+      ]
+    },
+    "configuration": {
+      "title": "Foxx",
+      "properties": {
+        "foxx.cranePath": {
+          "type": "string",
+          "default": "crane",
+          "description": "Path of the Crane executable."
+        },
+        "foxx.validateOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run 'crane validate' after a file is saved and show findings as diagnostics."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "tsc -p . && node --test \"out/test/*.test.js\""
+  },
+  "dependencies": {
+    "yaml": "2.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/vscode": "1.85.0",
+    "typescript": "5.5.4"
+  }
+}

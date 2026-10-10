@@ -1,43 +1,28 @@
-// fetch the necessary modules
-mod adapter;
-mod agent_session;
-mod authority;
-mod autonomy;
-mod budget;
-mod commands;
-mod contract_tests;
-mod dashboard;
-mod delivery;
-mod effects;
-mod evidence;
-mod flow;
-mod human;
-mod intake;
-mod inventory;
-mod ir;
-mod model;
-mod observe;
-mod orchestration;
-mod packs;
-mod policy;
-mod proposals;
-mod repo;
-mod repository;
-mod resolver;
-mod scope;
-mod session;
-mod session_orchestrator;
-mod task_completion;
-mod task_contracts;
-mod tasks;
-mod util;
-mod verify;
-mod zones;
+// Crane: AgentScript security contracts (signed selections, preserve and target policies),
+// runtime enforcement at the agent hook boundary, and Foxx security telemetry.
+//
+// Layers, from the bottom: platform (Git, files, time) -> trust (keys, digests, signatures,
+// rollback anchors) -> selection (anchors, signed registry, location tracker) -> governance
+// (checkpoints, policies, configuration, verification) -> hooks (agent adapters and runtime
+// enforcement) -> telemetry (identity, events, metrics, autonomy ledger, compliance) -> foxx
+// (read-only dashboard) and integrations; cli dispatches the commands.
 
-/** Entry point of the crane binary, dispatches the command line through commands::run and converts
- * any returned error into a printed message and a process exit code, using exit code 2 for errors
- * prefixed with HOOK_BLOCK: (the blocking convention of Claude Code and Codex hooks, with the
- * marker itself left out of the printed message) and exit code 1 for every other error
+mod cli;
+mod foxx;
+mod github;
+mod governance;
+mod hooks;
+mod integrations;
+mod platform;
+mod selection;
+#[cfg(feature = "mongodb")]
+mod store;
+mod telemetry;
+mod trust;
+
+/** Entry point of the crane binary: run the command line and convert an error into a message
+ * and an exit code, 2 for errors prefixed with HOOK_BLOCK: (the blocking convention of Claude Code
+ * and Codex hooks, with the prefix left out of the message) and 1 for every other error
  * Input
     - None (arguments are read from the process environment)
  * Output
@@ -45,8 +30,7 @@ mod zones;
     - Exits the process with code 2 for hook blocks, 1 for other failures
 */
 fn main() {
-    // Keep CLI failures visible to both humans and hook runners
-    if let Err(error) = commands::run() {
+    if let Err(error) = cli::run() {
         eprintln!(
             "crane: {}",
             error.strip_prefix("HOOK_BLOCK:").unwrap_or(&error)

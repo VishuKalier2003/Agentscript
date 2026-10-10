@@ -1,25 +1,37 @@
 [package]
 name = "crane"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
-description = "Crane: a tiny contract language and verifier for AI-assisted code changes."
+description = "Crane: signed selection contracts, runtime enforcement, and security evidence for AI coding agents."
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/VishuKalier2003/Agentscript"
 homepage = "https://github.com/VishuKalier2003/Agentscript"
 
+[features]
+default = []
+# Optional MongoDB persistence for the Foxx control plane (events, ledger, governance snapshots)
+mongodb = ["dep:mongodb"]
+
 [dependencies]
-tree-sitter = "0.20"
-tree-sitter-java = "0.20"
-tree-sitter-javascript = "0.20"
-tree-sitter-python = "0.20"
-tree-sitter-rust = "0.20"
-tree-sitter-go = "0.20"
-tree-sitter-cpp = "0.20"
-tree-sitter-typescript = "0.20"
-tree-sitter-kotlin = "=0.3.1"
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: parsed floats must equal the written ones, or chained digests would not verify
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+ed25519-dalek = "2"
+getrandom = "0.3"
+rpassword = "7"
+mongodb = { version = "3", optional = true, default-features = false, features = ["compat-3-0-0", "rustls-tls", "dns-resolver", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "crane"
 path = "src/main.rs"
+
+[[test]]
+name = "mongodb"
+path = "tests/mongodb.rs"
+required-features = ["mongodb"]

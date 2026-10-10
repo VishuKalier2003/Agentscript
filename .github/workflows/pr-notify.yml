@@ -1,0 +1,68 @@
+name: Pull request notifications
+
+# Posts pull request activity to Slack (incoming webhook) and as a comment on the Jira issue whose
+# key (such as SCRUM-12) appears in the pull request title or branch name.
+# Repository secrets: SLACK_WEBHOOK_URL, JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN.
+# A missing secret skips that channel. Pull requests from forks never receive secrets and are skipped.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, closed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Notify Slack and Jira
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      TITLE: ${{ github.event.pull_request.title }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      URL: ${{ github.event.pull_request.html_url }}
+      NUMBER: ${{ github.event.pull_request.number }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+      ACTION: ${{ github.event.action }}
+      MERGED: ${{ github.event.pull_request.merged }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Describe the event
+        id: describe
+        run: |
+          key=$(printf '%s %s' "$TITLE" "$BRANCH" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n 1 || true)
+          case "$ACTION" in
+            closed) if [ "$MERGED" = "true" ]; then verb="merged"; else verb="closed without merging"; fi ;;
+            ready_for_review) verb="marked ready for review" ;;
+            *) verb="$ACTION" ;;
+          esac
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "verb=$verb" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          KEY: ${{ steps.describe.outputs.key }}
+          VERB: ${{ steps.describe.outputs.verb }}
+        run: |
+          jq -n --arg title "$TITLE" --arg url "$URL" --arg number "$NUMBER" --arg author "$AUTHOR" \
+                --arg verb "$VERB" --arg repository "$REPOSITORY" --arg key "$KEY" \
+            '{text: ("Pull request #" + $number + " " + $verb + " in " + $repository + ": <" + $url + "|" + $title + "> by " + $author + (if $key != "" then " (Jira " + $key + ")" else "" end))}' \
+            | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+
+      - name: Comment on the Jira issue
+        if: steps.describe.outputs.key != '' && env.JIRA_API_TOKEN != '' && env.JIRA_BASE_URL != ''
+        env:
+          KEY: ${{ steps.describe.outputs.key }}
+          VERB: ${{ steps.describe.outputs.verb }}
+        run: |
+          jq -n --arg title "$TITLE" --arg url "$URL" --arg number "$NUMBER" --arg author "$AUTHOR" --arg verb "$VERB" \
+            '{body: {type: "doc", version: 1, content: [{type: "paragraph", content: [
+               {type: "text", text: ("Pull request #" + $number + " " + $verb + " by " + $author + ": ")},
+               {type: "text", text: $title, marks: [{type: "link", attrs: {href: $url}}]}]}]}}' \
+            | curl -sS --fail-with-body -X POST -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+                -H 'Content-Type: application/json' --data @- "${JIRA_BASE_URL%/}/rest/api/3/issue/$KEY/comment"

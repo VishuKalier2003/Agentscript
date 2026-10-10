@@ -1,0 +1,280 @@
+// Editing .crane/governance.yaml (zones, flows, context packs) while keeping its comments and
+// layout. New zones and flows are created with status "proposed", so nothing is enforced until a
+// human activates it; every edit is previewed as a diff and validated by Crane before it is kept.
+
+import { Document, isMap, isSeq, parseDocument, YAMLMap, YAMLSeq } from "yaml";
+
+/** Criticality values. */
+export const CRITICALITY = ["routine", "sensitive", "critical", "restricted"] as const;
+
+/** Autonomy ceiling values, strictest first. */
+export const CEILINGS = ["observe", "assisted", "delegated", "autonomous"] as const;
+
+/** Zone selector kinds. */
+export const SELECTOR_KINDS = ["paths", "files", "directories", "symbols", "selections"] as const;
+
+/** A zone as the editor creates it. */
+export interface ZoneInput {
+  id: string;
+  description: string;
+  owner?: string;
+  criticality: (typeof CRITICALITY)[number];
+  autonomy_ceiling: (typeof CEILINGS)[number];
+  selectors: Partial<Record<(typeof SELECTOR_KINDS)[number], string[]>>;
+}
+
+/** A flow as the editor creates it. */
+export interface FlowInput {
+  id: string;
+  description: string;
+  owner?: string;
+  criticality: (typeof CRITICALITY)[number];
+  autonomy_ceiling: (typeof CEILINGS)[number];
+  entry_points: string[];
+}
+
+/** A summary of one entity for pickers and the tree view. */
+export interface EntitySummary {
+  kind: "zone" | "flow" | "context_pack";
+  id: string;
+  status: string;
+  description: string;
+}
+
+/**
+ * Check an entity identifier: a letter followed by letters, digits, '_' or '-'.
+ * @param id candidate
+ * @returns an error message, or undefined when valid
+ */
+export function checkId(id: string): string | undefined {
+  return /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(id) ? undefined : "use 1-64 letters, digits, '_' or '-', starting with a letter";
+}
+
+/**
+ * Parse governance YAML, creating the version key when the text is empty.
+ * @param text current file content ("" when missing)
+ * @returns the document
+ */
+function load(text: string): Document {
+  const document = parseDocument(text.trim() ? text : "version: 1\n");
+  if (document.errors.length) {
+    throw new Error(`governance.yaml is not valid YAML: ${document.errors[0].message}`);
+  }
+  if (!isMap(document.contents)) {
+    throw new Error("governance.yaml must be a mapping");
+  }
+  return document;
+}
+
+/**
+ * Return the sequence under a top-level key, creating it when missing.
+ * @param document YAML document
+ * @param key zones, flows, or context_packs
+ * @returns the sequence
+ */
+function sequence(document: Document, key: string): YAMLSeq {
+  const existing = document.get(key, true);
+  if (isSeq(existing)) return existing;
+  const created = document.createNode([]) as YAMLSeq;
+  document.set(key, created);
+  return created;
+}
+
+/**
+ * Find an entity mapping by kind and id.
+ * @param document YAML document
+ * @param key zones, flows, or context_packs
+ * @param id entity id
+ * @returns the mapping, or undefined
+ */
+function find(document: Document, key: string, id: string): YAMLMap | undefined {
+  const items = document.get(key, true);
+  if (!isSeq(items)) return undefined;
+  return items.items.find((item): item is YAMLMap => isMap(item) && item.get("id") === id);
+}
+
+/**
+ * Collect every zone, flow, and context pack id.
+ * @param document YAML document
+ * @returns ids
+ */
+function allIds(document: Document): Set<string> {
+  const ids = new Set<string>();
+  for (const key of ["zones", "flows", "context_packs"]) {
+    const items = document.get(key, true);
+    if (isSeq(items)) for (const item of items.items) if (isMap(item)) ids.add(String(item.get("id")));
+  }
+  return ids;
+}
+
+/**
+ * Add a proposed zone.
+ * @param text current content
+ * @param zone zone to add
+ * @returns new content
+ */
+export function addZone(text: string, zone: ZoneInput): string {
+  const error = checkId(zone.id);
+  if (error) throw new Error(`zone id: ${error}`);
+  const document = load(text);
+  if (allIds(document).has(zone.id)) throw new Error(`'${zone.id}' is already used by a zone, flow, or context pack`);
+  const selectors = Object.fromEntries(Object.entries(zone.selectors).filter(([, values]) => values && values.length));
+  sequence(document, "zones").add(
+    document.createNode({
+      id: zone.id,
+      description: zone.description,
+      ...(zone.owner ? { owner: zone.owner } : {}),
+      selectors,
+      criticality: zone.criticality,
+      autonomy_ceiling: zone.autonomy_ceiling,
+      policies: [],
+      context_packs: [],
+      status: "proposed",
+      version: 1,
+    }),
+  );
+  return document.toString();
+}
+
+/**
+ * Add a proposed flow.
+ * @param text current content
+ * @param flow flow to add
+ * @returns new content
+ */
+export function addFlow(text: string, flow: FlowInput): string {
+  const error = checkId(flow.id);
+  if (error) throw new Error(`flow id: ${error}`);
+  if (!flow.entry_points.length) throw new Error("a flow needs at least one entry point");
+  const document = load(text);
+  if (allIds(document).has(flow.id)) throw new Error(`'${flow.id}' is already used by a zone, flow, or context pack`);
+  sequence(document, "flows").add(
+    document.createNode({
+      id: flow.id,
+      description: flow.description,
+      ...(flow.owner ? { owner: flow.owner } : {}),
+      entry_points: flow.entry_points,
+      criticality: flow.criticality,
+      autonomy_ceiling: flow.autonomy_ceiling,
+      policies: [],
+      context_packs: [],
+      status: "proposed",
+      version: 1,
+    }),
+  );
+  return document.toString();
+}
+
+/**
+ * Append a value to a list field of an entity, creating the list, without duplicates, and bump
+ * the entity's version.
+ * @param map entity mapping
+ * @param path field path such as ["selectors", "files"]
+ * @param value value to add
+ * @param document YAML document
+ */
+function appendUnique(map: YAMLMap, path: string[], value: string, document: Document): void {
+  const existing = map.getIn(path, true);
+  if (isSeq(existing)) {
+    if (!existing.items.some((item) => String((item as { value?: unknown }).value ?? item) === value)) existing.add(value);
+  } else {
+    map.setIn(path, document.createNode([value]));
+  }
+  const version = Number(map.get("version") ?? 0);
+  map.set("version", version + 1);
+}
+
+/**
+ * Attach a resource to a zone through a selector.
+ * @param text current content
+ * @param zoneId zone id
+ * @param kind selector kind
+ * @param value path, glob, directory, symbol, or selection id
+ * @returns new content
+ */
+export function attachToZone(text: string, zoneId: string, kind: (typeof SELECTOR_KINDS)[number], value: string): string {
+  const document = load(text);
+  const zone = find(document, "zones", zoneId);
+  if (!zone) throw new Error(`no zone '${zoneId}'`);
+  appendUnique(zone, ["selectors", kind], value, document);
+  return document.toString();
+}
+
+/**
+ * Attach an entry point (a symbol) or an included path to a flow.
+ * @param text current content
+ * @param flowId flow id
+ * @param field entry_points, include, or exclude
+ * @param value symbol or glob
+ * @returns new content
+ */
+export function attachToFlow(text: string, flowId: string, field: "entry_points" | "include" | "exclude", value: string): string {
+  const document = load(text);
+  const flow = find(document, "flows", flowId);
+  if (!flow) throw new Error(`no flow '${flowId}'`);
+  appendUnique(flow, [field], value, document);
+  return document.toString();
+}
+
+/**
+ * Create a context pack (when missing) and attach it to a zone or flow.
+ * @param text current content
+ * @param kind zone or flow
+ * @param id entity id
+ * @param pack context pack id
+ * @param content guidance lines for a new pack
+ * @returns new content
+ */
+export function attachContextPack(text: string, kind: "zone" | "flow", id: string, pack: string, content: string[]): string {
+  const error = checkId(pack);
+  if (error) throw new Error(`context pack id: ${error}`);
+  const document = load(text);
+  const entity = find(document, kind === "zone" ? "zones" : "flows", id);
+  if (!entity) throw new Error(`no ${kind} '${id}'`);
+  if (!find(document, "context_packs", pack)) {
+    if (allIds(document).has(pack)) throw new Error(`'${pack}' is already used by a zone or flow`);
+    sequence(document, "context_packs").add(document.createNode({ id: pack, version: 1, description: "", content }));
+  }
+  appendUnique(entity, ["context_packs"], pack, document);
+  return document.toString();
+}
+
+/**
+ * Activate a proposed zone or flow (an explicit, reviewable authority change).
+ * @param text current content
+ * @param kind zone or flow
+ * @param id entity id
+ * @returns new content
+ */
+export function activate(text: string, kind: "zone" | "flow", id: string): string {
+  const document = load(text);
+  const entity = find(document, kind === "zone" ? "zones" : "flows", id);
+  if (!entity) throw new Error(`no ${kind} '${id}'`);
+  entity.set("status", "active");
+  return document.toString();
+}
+
+/**
+ * List every entity for pickers and the tree view.
+ * @param text current content
+ * @returns summaries
+ */
+export function entities(text: string): EntitySummary[] {
+  if (!text.trim()) return [];
+  const document = load(text);
+  const summaries: EntitySummary[] = [];
+  for (const [key, kind] of [["zones", "zone"], ["flows", "flow"], ["context_packs", "context_pack"]] as const) {
+    const items = document.get(key, true);
+    if (!isSeq(items)) continue;
+    for (const item of items.items) {
+      if (!isMap(item)) continue;
+      summaries.push({
+        kind,
+        id: String(item.get("id")),
+        status: kind === "context_pack" ? `v${item.get("version") ?? 1}` : String(item.get("status") ?? "active"),
+        description: String(item.get("description") ?? ""),
+      });
+    }
+  }
+  return summaries;
+}

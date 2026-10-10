@@ -1,0 +1,48 @@
+// Unit tests of the editor-independent parts of Foxx (node --test).
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { selectionArgs, selectionIdFrom } from "../core/crane";
+import { activate, addFlow, addZone, attachContextPack, attachToFlow, attachToZone, entities } from "../core/governance";
+import { parsePolicies } from "../core/policies";
+
+test("parses policies and commands", () => {
+  const policies = parsePolicies(".crane/policies/p.crane", "# c\npolicy default {\n}\npolicy Payments {\n    preserve K7M2P9RX; // keep\n    target ABCD2345 change_type logical_bn;\n}\n");
+  assert.equal(policies.length, 2);
+  assert.equal(policies[1].name, "Payments");
+  assert.deepEqual(policies[1].commands.map((command) => [command.operation, command.id, command.changeType]), [["preserve", "K7M2P9RX", undefined], ["target", "ABCD2345", "logical_bn"]]);
+});
+
+test("builds protect and target arguments", () => {
+  assert.deepEqual(selectionArgs("preserve", "a.py", 3, 9, { policy: "p" }), ["protect", "a.py", "start-line", "3", "end-line", "9", "policy", "p"]);
+  assert.deepEqual(selectionArgs("target", "a.py", 1, 1, { changeType: "semantic", name: "n" }), ["target", "a.py", "start-line", "1", "end-line", "1", "change_type", "semantic", "name", "n"]);
+  assert.equal(selectionIdFrom("Protected a.py lines 1-4 as selection K7M2P9RX (policy default)"), "K7M2P9RX");
+});
+
+test("creates proposed zones and flows and keeps comments", () => {
+  let text = "# governance\nversion: 1\n";
+  text = addZone(text, { id: "payments", description: "Payments", criticality: "critical", autonomy_ceiling: "assisted", selectors: { paths: ["app/**"] } });
+  text = addFlow(text, { id: "submit", description: "Submission", criticality: "sensitive", autonomy_ceiling: "delegated", entry_points: ["app/service.py:submit"] });
+  assert.match(text, /# governance/);
+  assert.match(text, /status: proposed/);
+  assert.deepEqual(entities(text).map((entity) => [entity.kind, entity.id, entity.status]), [["zone", "payments", "proposed"], ["flow", "submit", "proposed"]]);
+  assert.throws(() => addZone(text, { id: "submit", description: "", criticality: "routine", autonomy_ceiling: "observe", selectors: {} }), /already used/);
+  assert.throws(() => addZone(text, { id: "9bad", description: "", criticality: "routine", autonomy_ceiling: "observe", selectors: {} }), /zone id/);
+});
+
+test("attaches selectors, entry points, and context packs without duplicates", () => {
+  let text = addZone("", { id: "z", description: "", criticality: "routine", autonomy_ceiling: "delegated", selectors: {} });
+  text = attachToZone(text, "z", "files", "app/a.py");
+  text = attachToZone(text, "z", "files", "app/a.py");
+  assert.equal((text.match(/app\/a\.py/g) ?? []).length, 1);
+  text = addFlow(text, { id: "f", description: "", criticality: "routine", autonomy_ceiling: "delegated", entry_points: ["x"] });
+  text = attachToFlow(text, "f", "include", "lib/**");
+  text = attachContextPack(text, "zone", "z", "invariants", ["Be idempotent."]);
+  text = attachContextPack(text, "flow", "f", "invariants", []);
+  assert.equal(entities(text).filter((entity) => entity.kind === "context_pack").length, 1);
+  assert.match(text, /Be idempotent\./);
+  text = activate(text, "zone", "z");
+  assert.equal(entities(text).find((entity) => entity.id === "z")?.status, "active");
+  assert.throws(() => attachToZone(text, "missing", "files", "a"), /no zone/);
+});

@@ -1,4 +1,0 @@
-policy payment_gateway {
-    checkpoint baseline;
-    preserve --function GatewayService.call;
-}
